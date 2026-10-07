@@ -2655,6 +2655,7 @@ dependencies = [
  "lee",
  "logos-blockchain-key-management-system-service",
  "sequencer_core",
+ "sequencer_genesis",
  "sequencer_stake_core",
  "serde_json",
 ]
@@ -11154,6 +11155,7 @@ dependencies = [
  "sequencer_bedrock_actor",
  "sequencer_channel_config_actor",
  "sequencer_core_metrics",
+ "sequencer_genesis",
  "sequencer_slasher_actor",
  "sequencer_stake_core",
  "sequencer_storage_actor",
@@ -11243,6 +11245,27 @@ dependencies = [
  "sequencer_storage_actor",
  "serde_json",
  "tokio",
+]
+
+[[package]]
+name = "sequencer_genesis"
+version = "0.1.0"
+dependencies = [
+ "bridge_core",
+ "chain_state",
+ "common",
+ "cross_zone",
+ "cross_zone_inbox_core",
+ "fee_core",
+ "hex",
+ "lee",
+ "lee_core",
+ "log",
+ "programs",
+ "sequencer_stake_core",
+ "serde",
+ "system_accounts",
+ "testnet_initial_state",
 ]
 
 [[package]]
@@ -11771,6 +11794,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f40ca3c46823713e0d4209592e8d6e826aa57e928f09752619fc696c499637f6"
 dependencies = [
  "lazy_static",
+]
+
+[[package]]
+name = "sharding_pool_actor"
+version = "0.1.0"
+dependencies = [
+ "env_logger",
+ "kameo",
+ "log",
+ "sequencer_actors_common",
+ "tokio",
 ]
 
 [[package]]
@@ -12437,6 +12471,7 @@ dependencies = [
  "programs",
  "sequencer_bedrock_actor",
  "sequencer_core",
+ "sequencer_genesis",
  "sequencer_service",
  "sequencer_service_rpc",
  "sequencer_stake_core",
