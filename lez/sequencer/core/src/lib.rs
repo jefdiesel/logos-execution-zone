@@ -221,6 +221,7 @@ impl<S: StorageActorTrait, B: BedrockActorTrait> SequencerCore<S, B> {
         config: SequencerConfig,
         mempool: MemPool<(TransactionOrigin, LeeTransaction)>,
         chain: ChainState,
+        applied_seq: Option<sequencer_bedrock_actor::protocol::ChannelSeq>,
         bedrock_signing_key: Ed25519Key,
         storage_ref: ActorRef<S>,
         bedrock_pool_ref: ActorRef<ShardingPoolActor<B, ChannelId>>,
@@ -275,7 +276,7 @@ impl<S: StorageActorTrait, B: BedrockActorTrait> SequencerCore<S, B> {
             config_manager,
             config_draft: None,
             finalized_config,
-            applied_seq: None,
+            applied_seq,
             bedrock_signing_key,
             sequencer_config: config,
         };
