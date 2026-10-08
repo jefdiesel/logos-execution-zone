@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use anyhow::anyhow;
 use common::block::Block;
@@ -198,7 +198,7 @@ impl<S: StorageActorTrait> BedrockActor<S> {
                         topic: format!("channel/{}/finalized_block", self.channel_id),
                         message: ChannelEvent {
                             channel_id: self.channel_id,
-                            event: ChannelEventKind::FinalizedBlock(Box::new(FinalizedBlock {
+                            event: ChannelEventKind::FinalizedBlock(Arc::new(FinalizedBlock {
                                 block,
                                 msg_id: zone_block.id,
                                 slot,
