@@ -14,7 +14,7 @@ common.workspace = true
 key_protocol.workspace = true
 sequencer_service_rpc = { workspace = true, features = ["client"] }
 indexer_service_rpc = { workspace = true, features = ["client"] }
-indexer_service_protocol = { workspace = true, features = ["convert"] }
+indexer_service_protocol.workspace = true
 testnet_initial_state.workspace = true
 referral_core.workspace = true
 bridge_core.workspace = true

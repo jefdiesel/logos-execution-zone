@@ -594,7 +594,7 @@ impl WalletCore {
         account_id: AccountId,
         offset: u64,
         limit: u64,
-    ) -> Result<Vec<LeeTransaction>> {
+    ) -> Result<Vec<indexer_service_protocol::Transaction>> {
         let indexer_addr = self
             .config
             .indexer_addr
@@ -603,16 +603,15 @@ impl WalletCore {
         let client = IndexerClientBuilder::default()
             .build(indexer_addr)
             .context("Failed to create indexer client")?;
-        indexer_service_rpc::RpcClient::get_transactions_by_account(
+        Ok(indexer_service_rpc::RpcClient::get_transactions_by_account(
             &client,
-            indexer_service_protocol::AccountId::from(account_id),
+            indexer_service_protocol::AccountId {
+                value: *account_id.value(),
+            },
             offset,
             limit,
         )
-        .await?
-        .into_iter()
-        .map(|transaction| LeeTransaction::try_from(transaction).map_err(Into::into))
-        .collect()
+        .await?)
     }
 
     /// Get public account.
