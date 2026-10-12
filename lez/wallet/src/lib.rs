@@ -32,7 +32,7 @@ use lee_core::{
     program::InstructionData,
 };
 use log::warn;
-use sequencer_service_rpc::{ClientError, RpcClient as _, SequencerClient, SequencerClientBuilder};
+use sequencer_service_rpc::{RpcClient as _, SequencerClient, SequencerClientBuilder};
 use storage::Storage;
 use tokio::io::AsyncWriteExt as _;
 use url::Url;
@@ -124,11 +124,6 @@ pub struct BuiltPrivateTransaction {
     pub transaction: PrivacyPreservingTransaction,
     pub shared_secrets: Vec<SharedSecretKey>,
     pub input_commitments: Vec<(AccountId, Commitment)>,
-}
-
-pub struct ChainView {
-    pub views: Vec<Account>,
-    pub effect_settled: bool,
 }
 
 pub struct WalletCore {
@@ -583,22 +578,15 @@ impl WalletCore {
         Ok(self.sequencer_client.get_transaction(hash).await?)
     }
 
-    pub async fn observe_transaction(
-        &self,
-        views: &[ProgramShardSelector],
-        effects: &[Commitment],
-    ) -> Result<ChainView> {
-        let mut fetched = Vec::with_capacity(views.len());
-        for selector in views {
-            let mut account = self.sequencer_client.get_account_view(*selector).await?;
-            account.data.shards.retain(|_, shard| !shard.is_empty());
-            fetched.push(account);
+    pub async fn commitments_settled(&self, commitments: &[Commitment]) -> Result<bool> {
+        if commitments.is_empty() {
+            return Ok(false);
         }
-
-        Ok(ChainView {
-            views: fetched,
-            effect_settled: effect_settled(&self.sequencer_client, effects).await?,
-        })
+        let (proofs, _root) = self
+            .sequencer_client
+            .get_proofs_and_root(commitments.to_vec())
+            .await?;
+        Ok(proofs.len() == commitments.len() && proofs.iter().all(Option::is_some))
     }
 
     pub async fn get_transactions_by_account(
@@ -1199,17 +1187,6 @@ impl WalletCore {
 )]
 pub const fn max_fee_for(gas_limit: u64) -> u128 {
     (gas_limit as u128 + ASSUMED_DATA_BYTES) * ASSUMED_BASE_FEE
-}
-
-async fn effect_settled(
-    client: &SequencerClient,
-    effects: &[Commitment],
-) -> Result<bool, ClientError> {
-    if effects.is_empty() {
-        return Ok(false);
-    }
-    let (proofs, _root) = client.get_proofs_and_root(effects.to_vec()).await?;
-    Ok(proofs.len() == effects.len() && proofs.iter().all(Option::is_some))
 }
 
 fn decrypt_note_at(
