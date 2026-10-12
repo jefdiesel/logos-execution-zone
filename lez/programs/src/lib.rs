@@ -217,6 +217,7 @@ mod inner {
                 (BRIDGE_LOCK_ELF, BRIDGE_LOCK_ID),
                 (WRAPPED_TOKEN_ELF, WRAPPED_TOKEN_ID),
                 (SEQUENCER_STAKE_ELF, SEQUENCER_STAKE_ID),
+                (REFERRAL_ELF, REFERRAL_ID),
             ];
             for (elf, expected_id) in cases {
                 let program = Program::new((*elf).into()).unwrap();
