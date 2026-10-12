@@ -54,6 +54,9 @@ pub enum Error {
     #[error("Bedrock request failed")]
     BedrockRequestFailed(#[source] SendError<ErasedMessage, sequencer_bedrock_actor::error::Error>),
 
+    #[error("Slasher request failed")]
+    SlasherRequestFailed(#[source] SendError<ErasedMessage, sequencer_slasher_actor::error::Error>),
+
     #[error("Failed to read the cross-zone dead letter")]
     CrossZoneDeadLettersUnavailable(#[source] anyhow::Error),
 
@@ -67,6 +70,12 @@ pub enum Error {
 impl<M> From<SendError<M, sequencer_storage_actor::error::Error>> for Error {
     fn from(err: SendError<M, sequencer_storage_actor::error::Error>) -> Self {
         Self::StorageRequestFailed(err.erase_message())
+    }
+}
+
+impl<M> From<SendError<M, sequencer_slasher_actor::error::Error>> for Error {
+    fn from(err: SendError<M, sequencer_slasher_actor::error::Error>) -> Self {
+        Self::SlasherRequestFailed(err.erase_message())
     }
 }
 

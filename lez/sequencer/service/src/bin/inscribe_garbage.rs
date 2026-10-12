@@ -194,6 +194,7 @@ async fn main() -> Result<()> {
             funding_pk: config.bedrock_config.funding_key,
             priority_fee_percent: config.bedrock_config.priority_fee_percent,
             resubmit_interval: Duration::from_secs(5),
+            replayed_up_to: None,
         })
         .await
         .context("Failed to initialize Bedrock channel publisher")?;
