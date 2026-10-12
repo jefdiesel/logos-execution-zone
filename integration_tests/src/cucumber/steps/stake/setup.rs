@@ -64,7 +64,7 @@ async fn sequencer_key_has_no_entry(world: &mut CucumberWorld, step: &Step) -> S
     Ok(())
 }
 
-#[given("a default-owned, unclaimed ownership account for the sequencer key")]
+#[given("a fresh, unclaimed ownership account for the sequencer key")]
 async fn ownership_account_is_unclaimed(world: &mut CucumberWorld, step: &Step) -> StepResult {
     log_step(step);
     let context = world.lez()?;
