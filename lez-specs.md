@@ -30,7 +30,7 @@ Bedrock is the L1 chain. It acts as the canonical ordering layer and settlement 
 
 ### Clients
 
-- **Wallet.** Talks to the sequencer RPC: it submits transactions, reads account state, and sizes `max_fee` from its configured `gas_limit` (by default against 8× the genesis minimum base fee; `getFeeState` gives the next block's range). It builds and proves privacy-preserving transactions locally, so the sequencer only verifies proofs, and it discovers its private notes by scanning blocks (`getBlockRange`) for matching view tags. Key derivation and note encryption follow LEE's key protocol (see [`lee-specs.md`](lee-specs.md)). The sequencer's block, transaction, and account queries remain until the wallet reads from the indexer.
+- **Wallet.** Talks to the sequencer RPC: it submits transactions, reads account state, and sizes `max_fee` from its configured `gas_limit` (default 2,000,000), as `(gas_limit + 100,000) × 64`: 8× the genesis minimum base fee, over the gas limit plus a 100,000-byte size allowance (`getFeeState` gives the next block's range). It builds and proves privacy-preserving transactions locally, so the sequencer only verifies proofs, and it discovers its private notes by scanning blocks (`getBlockRange`) for matching view tags. Key derivation and note encryption follow LEE's key protocol (see [`lee-specs.md`](lee-specs.md)). The sequencer's block, transaction, and account queries remain until the wallet reads from the indexer.
 - **Explorer.** A web interface over the indexer RPC; it holds no state of its own.
 
 ## LEZ basic types and constants
@@ -87,7 +87,7 @@ const MAX_DEAD_LETTER_CROSS_ZONE_DISPATCHES: usize = 256;   // currently fixed; 
 const APPLY_RETRY_LIMIT: u32 = 3;   // apply attempts before a possibly transient failure parks
 
 // ---- RPC ----
-const REQUEST_BODY_MAX_SIZE: usize = 10 * 1024 * 1024;   // sequencer and indexer (jsonrpsee default)
+const REQUEST_BODY_MAX_SIZE: ByteSize = ByteSize::mib(10);   // 10 MiB; set by the sequencer, the indexer uses the jsonrpsee default
 const MAX_EVENT_QUERY_BLOCK_SPAN: u64 = 1_000;           // indexer getEvents
 const MAX_BLOCK_RANGE_LEN: usize = 1_024;                // sequencer getBlockRange
 ```
@@ -243,12 +243,12 @@ Settings every node on a channel must agree on:
 | --- | --- | --- |
 | `channel_id` | sequencer (`bedrock_config`), indexer | The zone's Bedrock channel. |
 | `cross_zone` (presence and peers) | sequencer, indexer | Presence selects the genesis program set and cannot change on an existing chain; a zone that only sends messages declares `"cross_zone": {}`. The peer list must match between the sequencer and the indexer, and changing it needs a restart of both. |
-| `channel_params` | sequencer (`bedrock_config`) | `ChannelParams` (see [docs/builtin_programs.md](docs/builtin_programs.md), Sequencer Stake program): `minimum_sequencer_stake`, `posting_timeframe`, `posting_timeout`, `exit_delay`; fixed at genesis. |
+| `channel_params` | sequencer (`bedrock_config`) | `ChannelParams` (see [docs/builtin_programs.md](docs/builtin_programs.md), Sequencer Stake program): `minimum_sequencer_stake`, `posting_timeframe`, `posting_timeout`, `exit_delay`; fixed at genesis. Defaults: 149, 300 slots, 25 slots, 100 blocks. |
 | `genesis` | sequencer | `List<GenesisAction>`; used only when creating the channel, after which the genesis block is replayed from Bedrock. |
 
 Everything else is node-local:
 
-- **Sequencer:** `max_block_size`, `max_num_tx_in_block`, `mempool_max_size`, `block_create_timeout` (must be shorter than `posting_timeout`), the signing key, `gossip`, and Bedrock connection settings.
+- **Sequencer:** `home`, `max_block_size`, `max_num_tx_in_block`, `mempool_max_size`, `block_create_timeout` (must be shorter than `posting_timeout`), `retry_pending_blocks_timeout`, `metrics_address`, `gossip`, and the Bedrock connection settings in `bedrock_config` (`node_url`, `auth`, `funding_key`, `priority_fee_percent`). The sequencer's Bedrock key is not in the config: it is read from, or created at, `<home>/bedrock_signing_key`.
 - **Indexer:** `consensus_info_polling_interval`, `event_filter`, `allow_chain_reset`, `cross_zone_accept_unverified`, and `peer_block_cache_window`.
 
 ## Transaction Types
@@ -337,7 +337,7 @@ A transaction's hash, as returned by `sendTransaction` and used by `getTransacti
 
 ## Cryptography
 
-### Block signing
+### Block hash
 
 ```rust
 /// ASCII "/LEE/v0.3/Message/Block/" zero-padded to 32 bytes
@@ -350,21 +350,19 @@ struct HashableBlockData {
     transactions: List<LeeTransaction>,
 }
 
-fn block_hash(data: &HashableBlockData, producer: &PublicKey) -> BlockHash {
-    // borsh(producer) is the raw 32-byte x-only public key
-    sha256(BLOCK_PREFIX || borsh(data) || borsh(producer))
+fn block_hash(data: &HashableBlockData) -> BlockHash {
+    sha256(BLOCK_PREFIX || borsh(data))
 }
 ```
 
-The producing sequencer signs `block_hash` using its **BIP340 Schnorr key** (secp256k1). Its public key is stored in `BlockHeader.producer` and is covered by the hash; the resulting 64-byte signature is stored in `BlockHeader.signature`. As with LEE transaction signatures (see [`lee-specs.md`](lee-specs.md#witness-set)), the signed message is the 32-byte hash itself, not hashed again, and signing uses random auxiliary data, so signatures are not deterministic. A block is valid only if the signature verifies against `producer` *and* `header.hash` equals the hash recomputed from the block contents.
+Blocks are not signed. A block is valid only if `header.hash` equals the hash recomputed from its contents. Who may publish a block is enforced by Bedrock: a channel takes inscriptions only from its scheduled accredited key.
 
 ### Sequencer keys
 
-A sequencer holds four keys:
+A sequencer holds three keys:
 
 | Key | Scheme | Used for |
 | --- | --- | --- |
-| Block-signing key | BIP-340 (secp256k1) | Signing blocks. Peer zones pin it (`expected_block_signing_pubkeys`). |
 | Bedrock key (`SequencerKey`) | Ed25519 | Accreditation on the channel, inscriptions, channel-config approvals, and slash approvals. |
 | Stake ownership key | BIP-340 (a LEE account key) | Owns the ownership account, which is also the reward account; signs `Stake` and `UnstakeRequest`. |
 | Bedrock funding key | Bedrock zk key (`ZkPublicKey`) | Pays the fees of the sequencer's Bedrock transactions. |
@@ -397,10 +395,8 @@ struct Block {
 struct BlockHeader {
     block_id: BlockId,            // sequential from 1
     prev_block_hash: BlockHash,
-    hash: BlockHash,              // see Block signing
+    hash: BlockHash,              // see Block hash
     timestamp: Timestamp,         // milliseconds since Unix epoch
-    producer: PublicKey,          // producer's BIP340 public key
-    signature: Signature,         // producer's BIP340 signature over `hash`
 }
 
 struct BlockBody {
@@ -410,9 +406,9 @@ struct BlockBody {
 enum BedrockStatus { Pending, Safe, Finalized }
 ```
 
-`bedrock_status` is not covered by the block hash or signature. It is published as `Pending` and set locally by each reader: the sequencer promotes a block to `Finalized` when its inscription is finalized, and the indexer marks every block it reads as `Finalized`.
+`bedrock_status` is not covered by the block hash. It is published as `Pending` and set locally by each reader: the sequencer promotes a block to `Finalized` when its inscription is finalized, and the indexer marks every block it reads as `Finalized`.
 
-A block is published as its Borsh encoding, which must fit the sequencer's `max_block_size` (default 1 MiB). The sequencer refuses to start if `max_block_size` exceeds Bedrock's inscription size limit (`MAX_PUBLISHABLE_BLOCK_SIZE`, Bedrock's `inscribe::MAX_BYTES`). The body always ends with the fee invocation followed by the clock invocation (see Block acceptance criteria).
+A block is published as its Borsh encoding. The sequencer sizes each block against `max_block_size` (default 1 MiB), measured without the header's `hash` and the `bedrock_status`, so the published encoding can be up to 33 bytes larger. The sequencer refuses to start if `max_block_size` exceeds Bedrock's inscription size limit (`MAX_PUBLISHABLE_BLOCK_SIZE`, Bedrock's `inscribe::MAX_BYTES`). The body always ends with the fee invocation followed by the clock invocation (see Block acceptance criteria).
 
 The stored `BlockMeta` record is `{ id: BlockId, hash: BlockHash }`.
 
@@ -420,7 +416,7 @@ The stored `BlockMeta` record is `{ id: BlockId, hash: BlockHash }`.
 
 A block is valid on top of the current tip if all of the following hold. The sequencer and the indexer apply the same rules (`chain_state::apply_block`).
 
-- **Integrity:** `header.hash` equals the recomputed block hash, and `signature` verifies against `producer`.
+- **Integrity:** `header.hash` equals the recomputed block hash.
 - **Chaining:** `block_id` is the tip's `block_id + 1`, and `prev_block_hash` is the tip's hash. The first block must have `block_id` 1; its `prev_block_hash` is not checked.
 - **Shape:** The block has at least two transactions, and the last two are public.
 - **Clock tail:** The **last** transaction is exactly `clock_invocation(block_id, timestamp)`.
@@ -443,7 +439,6 @@ struct Tip {
 fn apply_block(tip: Option<Tip>, block: Block, state: &mut V03State) {
     // Integrity and chaining
     assert_eq!(block.recompute_hash(), block.header.hash);
-    assert!(block.header.signature.is_valid_for(block.header.hash, block.header.producer));
     match tip {
         None => assert_eq!(block.header.block_id, GENESIS_BLOCK_ID),
         Some(tip) => {
@@ -687,7 +682,7 @@ HashableBlockData {
 }
 ```
 
-The block is signed with the sequencer's block-signing key. The channel creator publishes it as described above, so the indexer can locate the channel start.
+The channel creator publishes it as described above, so the indexer can locate the channel start.
 
 On a restart the sequencer loads its stored chain instead of rebuilding genesis. It then checks that the store still belongs to the chain the channel serves, and replays any finalized blocks it is missing. If the channel proves a different chain, it refuses to start.
 
@@ -762,10 +757,10 @@ A sequencer produces a block only when Bedrock reports that it holds the channel
     - A store-drained transaction is exempt and applied directly. If it fails it is skipped and drained again next turn; a failed delivery also counts toward its retirement.
     - A mempool transaction is dropped if it is a bridge `Deposit`, then screened for its fee, then settled on a scratch copy of the state exactly as a follower would (see Block acceptance criteria and Fees). One that fails is **silently dropped** (error logged; no error sent to submitter).
 
-    A transaction that would push the block over `max_block_size`, or its declared gas over the block caps, is deferred to the next block, and the block takes no further transactions. A store-drained transaction too large for even an empty block, or any transaction whose declared gas exceeds the caps outright, is dropped instead.
+    A transaction that would push the block over `max_block_size`, or its declared gas over the block caps, is deferred to the next block, and the block takes no further transactions. A mempool transaction whose declared gas exceeds the caps outright is dropped instead. A store-drained transaction too large for even an empty block is skipped, and if it is a cross-zone delivery the turn counts toward its retirement.
 5. Append the fee invocation (with the derived summary and payout, crediting this sequencer's stake ownership account) and the mandatory clock transaction
-6. Compute block hash and sign with the sequencer's block-signing key
-7. Publish block to Bedrock (Borsh-serialized bytes via zone-sdk), pinned to its parent and bundling any bridge withdrawals the block contains (none while `Withdraw` is disabled). If the channel moved while the block was being built, the block is discarded and its mempool transactions are re-queued at the front
+6. Compute the block hash
+7. Publish block to Bedrock (Borsh-serialized bytes via zone-sdk), pinned to its parent. A block containing bridge withdrawals would instead be published unpinned, bundled with them (none while `Withdraw` is disabled). If publishing fails, including because the channel moved while the block was being built, nothing was inscribed: the block is discarded and its mempool transactions are re-queued at the front
 8. Record the block and advance the head
 
 Blocks are produced on every turn tick even if the mempool is empty (fee-and-clock-only block).
@@ -774,13 +769,13 @@ The block timestamp is the sequencer's wall clock (milliseconds) at the time it 
 
 After publishing, the turn holder also submits any pending channel-config update (see Sequencer committee) as a separate Bedrock transaction; a draft still unsigned from an earlier turn is discarded first.
 
-A failed turn costs only that block: the sequencer tries again on its next tick. If the channel moved while it was building, it skips the turn to catch up.
+A failed turn costs only that block: the sequencer tries again on its next tick. If the channel moved while it was building, it skips the turn to catch up. It also skips the turn while its view of the channel has a gap, meaning an unfinalized entry whose parent it does not hold.
 
 `block_create_timeout` must be shorter than the channel's `posting_timeout`, or a healthy sequencer loses its turn between its own blocks.
 
 ### Finality
 
-Each sequencer keeps a two-tier chain state: an irreversible **final** tier, advanced by blocks whose inscriptions Bedrock has finalized, and a **head** derived by applying the channel's unfinalized blocks on top of it. Production always builds on the head.
+Each sequencer keeps a two-tier chain state: an irreversible **final** tier, advanced by blocks whose inscriptions Bedrock has finalized, and a **head** derived by folding the final state over the channel's unfinalized entries in order, its *view* of the channel. An entry whose block extends the tip so far is applied; any other entry is skipped. Every node holding the same entries therefore derives the same head. Production always builds on the head.
 
 Each Bedrock channel update is applied in order: finalized entries first, then the view change.
 
@@ -834,21 +829,21 @@ Withdrawals are disabled: the bridge program refuses `Withdraw { amount, bedrock
 
 ### Sequencer committee
 
-- **Staking.** A key belongs to the *staked set* while its `total_staked - total_pending_unstake` is at least `minimum_sequencer_stake`. At genesis the founding committee is staked by the genesis block (see Genesis). Afterwards an operator stakes with `Stake` transactions signed by a funding account and the ownership account (the `submit_stake` tool sends them from a wallet); the node does not stake itself. `UnstakeRequest` starts an exit that `FinalizeUnstake` completes after `exit_delay` blocks; the sequencer submits the finalizations automatically.
-- **Accreditation.** Whenever the staked set differs from the keys Bedrock accredits on the channel, or the live threshold differs from the one the committee's size calls for, the turn holder proposes a channel-config update as a funded draft transaction, and peers sign that exact transaction over gossip. The update must carry as many signatures as the live channel's threshold, and sets the new threshold to `max(1, min(⌈2n/3⌉, n - 1))` for its new committee of `n` keys. The `n - 1` cap lets the rest of the committee eject a key without its signature, and a single-signer channel's update lands on the proposer's own signature. A newly staked sequencer can produce once an update has accredited its key.
+- **Staking.** A key belongs to the *staked set* while its `total_staked - total_pending_unstake` is at least `minimum_sequencer_stake`. [docs/builtin_programs.md](docs/builtin_programs.md) and the code call this condition being an accredited committee member; here *accredited* is kept for the keys Bedrock lists on the channel, which trail the staked set until a config update lands. At genesis the founding committee is staked by the genesis block (see Genesis). Afterwards an operator stakes with `Stake` transactions signed by a funding account and the ownership account (the `submit_stake` tool sends them from a wallet); the node does not stake itself. `UnstakeRequest` starts an exit that `FinalizeUnstake` completes after `exit_delay` blocks; the sequencer submits the finalizations automatically.
+- **Accreditation.** Whenever the staked set differs from the keys Bedrock accredits on the channel, or the live threshold differs from the one the committee's size calls for, the turn holder proposes a channel-config update as a funded draft transaction, and peers sign that exact transaction over gossip. The update must carry as many signatures as the live channel's threshold, and sets the new threshold to `max(1, min(⌈2n/3⌉, n - 1))` for its new committee of `n` keys. The `n - 1` cap lets the rest of the committee eject a key without its signature, and a single-signer channel's update lands on the proposer's own signature. A newly staked sequencer can produce once an update has accredited its key. The target committee is read from the final state, and no update is proposed while another is in flight. A submitted update that has not landed within 30 channel slots is discarded and funded again. A draft that peers' signatures complete is submitted without waiting for a turn. Each update also carries the channel's posting timeframe and timeout and sets its withdraw threshold to 1.
 - **Turns.** Bedrock runs round robin over the accredited keys: a turn lasts `posting_timeframe` slots and passes on after `posting_timeout` idle slots.
 - **Slashing.** Each sequencer runs a *slasher* that checks every finalized update for slashable offences: a finalized inscription that is not a block (`NotABlock`), or a finalized block that should have extended the final tip but does not validate (`InvalidBlock`) or does not chain onto it (`MisplacedBlock`). For each offence it signs an approval with its Bedrock key and gossips it (see Slash approvals); once enough approvals are collected, it proposes a `Slash` transaction for its next block. The `Slash` burns the offender's whole stake and removes its entry, after which a config update removes it from the channel.
-- **Gossip.** Optional libp2p gossip carries three topics: submitted transactions, slash approvals, and channel-config drafts and signatures. Transaction spreading is a latency optimization that falls back to L1. Without gossip, however, a committee whose config threshold is above one cannot reconfigure, and no sequencer can be slashed.
+- **Gossip.** Optional libp2p gossip carries three topics: submitted transactions, slash approvals, and channel-config drafts and signatures. Transaction spreading is a latency optimization that falls back to L1. Without gossip, however, a committee whose config threshold is above one cannot reconfigure, and no sequencer can be slashed. Peers are found through Kademlia, Identify and the configured bootstrap peers. A gossiped transaction passes the same admission as one submitted over RPC, and a message may be at most `max_block_size` plus 4,096 bytes.
 
 ## Cross-zone messaging
 
-Zones configured with `cross_zone` can exchange messages. On the source zone, an emitter program (`ping_sender`, `bridge_lock`) sends a message through the outbox. Each destination sequencer watches its configured peers' channels, extracts the messages addressed to it from their finalized blocks, and injects a sequencer-only inbox `Dispatch` transaction for each. The destination's indexer re-derives every dispatch from the peer's finalized blocks before applying it, and halts ingestion on a forged one. `bridge_lock` and `wrapped_token` use this channel to move balances between zones, and `ping_sender` / `ping_receiver` are a minimal example pair. The programs themselves are specified in [docs/builtin_programs.md](docs/builtin_programs.md).
+Zones configured with `cross_zone` can exchange messages. On the source zone, an emitter program (`ping_sender`, `bridge_lock`) sends a message through the outbox. Each destination sequencer watches its configured peers' channels and reads their finalized blocks: every top-level transaction to one of those two emitters that names this zone is a message, taken from the transaction's instruction. Messages recorded in the outbox by any other program are not delivered, and a message aimed at a sequencer-only program is dropped. For each remaining message the sequencer injects a sequencer-only inbox `Dispatch` transaction. The destination's indexer re-derives every dispatch from the peer's finalized blocks before applying it, and halts ingestion on a forged one. `bridge_lock` and `wrapped_token` use this channel to move balances between zones, and `ping_sender` / `ping_receiver` are a minimal example pair. The programs themselves are specified in [docs/builtin_programs.md](docs/builtin_programs.md).
 
-- **Peer authentication.** The watcher accepts a peer block only if its hash is intact and it is signed by one of the peer's configured `expected_block_signing_pubkeys`; an empty list skips this check, leaving only the channel-signer authentication zone-sdk provides. If `min_committee_size` is set and the peer's live committee drops below it, the watcher suspends reading that peer until it recovers.
+- **Peer authentication.** The watcher accepts a peer block only if its hash is intact. Who produced it is Bedrock's check: a channel takes inscriptions only from its scheduled accredited key, which zone-sdk authenticates. If `min_committee_size` is set and the peer's live committee drops below it, the watcher suspends reading that peer until it recovers.
 - **Peer chain.** The watcher and the indexer's verifier admit peer blocks through the same policy. Each peer is followed as a hash-linked chain from its genesis: a block is accepted only as the next link on the stored peer tip, blocks off that chain are read past, and a different block at an already-accepted id is reported as equivocation.
-- **Configuration.** `cross_zone.peers` lists each peer's `channel_id` (its zone id), `allowed_routes`, `expected_block_signing_pubkeys`, and `min_committee_size`. Routes are not enforced in transit: they are written into each target program's config at genesis, and the target refuses sources it did not authorize. An optional `source_authority` (with `source_governance` for a PDA authority) may later change those sources; it is set only at genesis, cannot be rotated, and its compromise lets the holder authorize any source. Peers are read at startup, so adding one needs a restart of both the sequencer and the indexer, whose peer lists should match.
+- **Configuration.** `cross_zone.peers` lists each peer's `channel_id` (its zone id), `allowed_routes`, and `min_committee_size`. Unknown fields are refused, so a config still carrying `expected_block_signing_pubkeys` fails at startup. Routes are not enforced in transit: they are written into each target program's config at genesis, and the target refuses sources it did not authorize. A route's target must be `wrapped_token` or `ping_receiver`, a `mint_cap` is allowed only on a `wrapped_token` route with a `source_authority` configured, and the same source may not be listed twice for one target. The sequencer refuses to start on a config that breaks any of these; the indexer does not build genesis, so it starts normally with the same mistake. An optional `source_authority` (with `source_governance` for a PDA authority) may later change those sources; it is set only at genesis, cannot be rotated, and its compromise lets the holder authorize any source. Peers are read at startup, so adding one needs a restart of both the sequencer and the indexer, whose peer lists should match.
 - **Per-block cap.** A block carries at most `MAX_DISPATCHES_PER_BLOCK` (16) dispatches; the rest wait for the next block.
-- **Dead letters.** A delivery that fails `RETIRE_DISPATCH_AFTER_FAILURES` (3) times, or that cannot fit even an empty block, is retired. Up to 256 dead letters are retained, and they can be inspected and requeued over RPC (`getCrossZoneDeadLetters`, `requeueCrossZoneDeadLetter`).
+- **Dead letters.** A delivery that fails `RETIRE_DISPATCH_AFTER_FAILURES` (3) times is retired. A delivery too large to fit even an empty block counts as a failure on each turn it is drained. Up to 256 dead letters are retained, and they can be inspected and requeued over RPC (`getCrossZoneDeadLetters`, `requeueCrossZoneDeadLetter`).
 - **Operator override.** The indexer's `cross_zone_accept_unverified` config lists block hashes it applies without cross-zone verification, to clear a forged verdict or a dead peer.
 
 ## Indexer Flow
@@ -870,7 +865,7 @@ If the Borsh payload fails to deserialize, or a block does not validate or apply
 
 A dispatch that fails cross-zone verification instead **halts** the indexer: it persists a `CrossZoneHalt` record, reports `Halted`, and stops ingesting. The record survives restarts and is cleared only when the named block applies, e.g. after the block is listed in `cross_zone_accept_unverified`. A peer that is merely unreachable holds the cursor and is retried.
 
-On startup the indexer checks that its store still belongs to the chain the channel serves, and refuses to start on a mismatch unless `allow_chain_reset` is set.
+On startup the indexer checks that its store still belongs to the chain the channel serves. On a mismatch it refuses to start, unless `allow_chain_reset` is set, in which case it wipes its store and re-indexes from the start.
 
 ### Events
 
@@ -1032,6 +1027,13 @@ The block, transaction, and account queries are slated for removal once the wall
 | `checkHealth` | — | `()` | Liveness check |
 | `getSchema` | — | `Value` | JSON Schema of `Block` and the event types (via `schemars`). Note: this is a JSON Schema, not an OpenRPC document. An OpenRPC `describe` method is a future TODO in the code. |
 
+**Error codes:**
+
+| Code | Meaning |
+| --- | --- |
+| `-32602` | InvalidParams — a bad block range, an event query the indexer's filter does not cover, an unknown transaction hash in `getEvents`, or a response over the size limit |
+| `-32603` | InternalError — store failure |
+
 **Result types:**
 
 ```rust
@@ -1049,6 +1051,9 @@ struct ShardSummary {
 /// `getEvents`: with `tx_hash` set the lookup is a point query and the block range is ignored;
 /// otherwise `from_block` is required, `to_block` defaults to the indexed tip, and the range
 /// may span at most MAX_EVENT_QUERY_BLOCK_SPAN blocks.
+/// A query is refused if the indexer's event filter did not store every event in the
+/// requested program and selector over the requested blocks, and if the response would
+/// exceed 8 MiB. A `tx_hash` the indexer does not know is an error.
 struct GetEventsFilter {
     from_block: Option<BlockId>,
     to_block: Option<BlockId>,
@@ -1057,7 +1062,8 @@ struct GetEventsFilter {
     selector: Option<Selector>,
 }
 
-/// `subscribeToEvents`: a live stream carries no block range.
+/// `subscribeToEvents`: a live stream carries no block range. A subscription is refused
+/// if the current event filter does not store the requested program and selector.
 struct EventSubscriptionFilter {
     tx_hash: Option<HashType>,
     program_account_id: Option<AccountId>,
@@ -1107,4 +1113,4 @@ struct PeerStatus {
 enum PeerHealth { Live, Lagging, Holed, Suspended, Halted }
 ```
 
-`BlockIngestError` names the failed criterion: `Deserialize`, `UnexpectedBlockId`, `BrokenChainLink`, `HashMismatch`, `EmptyBlock`, `InvalidProducerSignature`, `InvalidClockTransaction`, `InvalidFeeTransaction`, `InvalidRewardTarget`, `InvalidFeeClass`, `MissingFeeDeclaration`, `GasCapExceeded`, `RestrictedAccountModification`, `NonPublicGenesisTransaction`, or `StateTransition` (see Block acceptance criteria).
+`BlockIngestError` names the failed criterion: `Deserialize`, `UnexpectedBlockId`, `BrokenChainLink`, `HashMismatch`, `EmptyBlock`, `InvalidClockTransaction`, `InvalidFeeTransaction`, `InvalidRewardTarget`, `InvalidFeeClass`, `MissingFeeDeclaration`, `GasCapExceeded`, `RestrictedAccountModification`, `NonPublicGenesisTransaction`, or `StateTransition` (see Block acceptance criteria).

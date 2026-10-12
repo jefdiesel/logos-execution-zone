@@ -39,14 +39,15 @@ type Timestamp = u64;
 type Commitment = [u8; 32];
 struct CommitmentSet {
     merkle_tree: MerkleTree,
-    commitments: HashMap<Commitment, usize>,
-    root_history: HashSet<CommitmentSetDigest>,
+    /// Each commitment's leaf index in the tree.
+    commitments: Map<Commitment, usize>,
+    root_history: Set<CommitmentSetDigest>,
 }
 type CommitmentSetDigest = [u8; 32];
 type MembershipProof = (usize, List<[u8; 32]>);
 
 type Nullifier = [u8; 32];
-type NullifierSet = BTreeSet<Nullifier>;
+type NullifierSet = Set<Nullifier>;
 
 // ---- Private-account keys ----
 type AuthorizationSecretKey = [u8; 32];   // ask; derives nsk
@@ -82,7 +83,7 @@ type Proof = List<u8>;
 const DATA_MAX_LENGTH: usize = 100 * 1024;       // per shard
 const MAX_NUMBER_CHAINED_CALLS: usize = 10;      // total calls ≤ this + 1
 const MAX_PROGRAM_SEGMENTS: usize = 20;          // cap on a program's segment chain
-const MAX_SEGMENT_DATA_LEN: usize = 96 * 1024;   // max bytecode bytes per program segment
+const MAX_SEGMENT_DATA_LEN: usize = 96 * 1024;   // bytecode bytes per segment when a program is split
 const MAX_CIPHERTEXT_PADDING: u32 = 8 * 1024;    // cap on requested note padding
 const ML_KEM_768_CIPHERTEXT_LEN: usize = 1088;
 const VIEWING_PUBLIC_KEY_LEN: usize = 1184;
@@ -781,7 +782,7 @@ fn bind_family(
 
 The native token program at `NATIVE_TOKEN_PROGRAM_ID` is protocol code with no ELF. On the private path the circuit recomputes it instead of verifying a receipt.
 
-It keeps each account's balance in the account's **native balance shard**, the shard keyed by `NATIVE_TOKEN_PROGRAM_ID`, as 16 bytes little-endian. A balance of 0 is always stored as an empty shard, which removes the entry from the account. `[16_u8; 8]` is never a valid encoding, and are rejected. Apart from the initial state a host seeds at genesis, only the native token program writes this shard.
+It keeps each account's balance in the account's **native balance shard**, the shard keyed by `NATIVE_TOKEN_PROGRAM_ID`, as 16 bytes little-endian. A balance of 0 is always stored as an empty shard, which removes the entry from the account. Any other encoding is rejected: a shard whose length is neither 0 nor 16 bytes, and 16 zero bytes (`[0_u8; 16]`), since zero is always the empty shard. Apart from the initial state a host seeds at genesis, only the native token program writes this shard.
 
 ```rust
 enum Instruction { Transfer { amount: Balance } }
@@ -835,7 +836,7 @@ struct V03State {
 - `public_state`: A map from each account ID to its `Account`. The entire `AccountId` space is conceptually populated; account IDs not explicitly stored are treated as `Account::default()` (sparse representation). Deployed programs live here too, as loader shards.
 - `private_state`:
   - `CommitmentSet`: An authenticated Merkle tree of all private account commitments.
-  - `NullifierSet`: A `BTreeSet` of all revealed nullifiers.
+  - `NullifierSet`: The set of all revealed nullifiers.
 
 Operations on the commitment set:
 - `extend(commitments)` — append a batch of commitments, then record the new root in `root_history`. The root is recorded once per batch, that is once per transaction, not once per commitment.
@@ -843,7 +844,7 @@ Operations on the commitment set:
 - `compute_digest_for_path(commitment, proof)` — the root that a membership proof resolves to.
 - `root_history.contains(digest)` — whether a digest was ever a root.
 
-The `NullifierSet` is a plain ordered set.
+Which containers hold these maps and sets is an implementation choice and not part of the protocol; only membership and the commitment tree's root matter. The node uses persistent collections so that cloning a state shares structure.
 
 ### Commitment tree
 
@@ -925,7 +926,7 @@ enum Instruction {
 }
 ```
 
-- **`WriteSegment`** — accounts `[target]`, or `[target, next]` when `next_segment` is `Some`. The target's loader shard must be empty and the target must be **authorized**; `next` must already hold a valid segment, so chains are written from the tail to the head. `next` is only read and needs no authorization. A segment's `bytecode` must be at most `MAX_SEGMENT_DATA_LEN` bytes.
+- **`WriteSegment`** — accounts `[target]`, or `[target, next]` when `next_segment` is `Some`. The target's loader shard must be empty; `next` must already hold a valid segment, so chains are written from the tail to the head. `next` is only read. Deployers split bytecode into segments of at most `MAX_SEGMENT_DATA_LEN` bytes; the encoded segment must fit in a shard (`DATA_MAX_LENGTH`).
 - **`CreateHeader`** — accounts `[target, segment_1, …, segment_n]`, the chain in link order. The target's loader shard must be empty and the target must be **authorized**. `first_segment` must equal `segment_1`, the supplied accounts must be exactly the chain (at most `MAX_PROGRAM_SEGMENTS`), and the header's `image_id` is computed from the concatenated bytecode plus the kernel. It is never taken from the caller.
 - **`UpdateHeader`** — same accounts and checks as `CreateHeader`, but the target must already hold a header with `immutable == false`.
 
