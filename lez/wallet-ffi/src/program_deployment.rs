@@ -233,9 +233,10 @@ pub unsafe extern "C" fn wallet_ffi_program_loader_update_header(
 
 /// Deploys a new program from `elf_data`.
 ///
-/// Chunks `elf_data`, uploads one segment per account in `segments`, then creates `header`
-/// pointing at the resulting chain. `segments_len` must exactly match the number of chunks
-/// `elf_data` splits into.
+/// `elf_data` is the full two-part program binary (kernel + user elf); only the user elf is
+/// chunked and uploaded as segments (the kernel must match the protocol's default and is never
+/// stored). `segments_len` must exactly match the number of chunks the user elf splits into, not
+/// `elf_data` as a whole.
 ///
 /// # Safety
 /// - `handle` must be a valid wallet handle from `wallet_ffi_create_new` or `wallet_ffi_open`
@@ -299,9 +300,11 @@ pub unsafe extern "C" fn wallet_ffi_program_loader_deploy(
 
 /// Updates an existing program in place with `elf_data`.
 ///
-/// Chunks `elf_data`, uploads a fresh set of segments (segments are write-once), then rewrites
-/// `header` to point at them. `segments_len` must exactly match the number of chunks `elf_data`
-/// splits into.
+/// `elf_data` is the full two-part program binary (kernel + user elf); only the user elf is
+/// chunked and uploaded as a fresh set of segments (segments are write-once; the kernel must
+/// match the protocol's default and is never stored), then `header` is rewritten to point at
+/// them. `segments_len` must exactly match the number of chunks the user elf splits into, not
+/// `elf_data` as a whole.
 ///
 /// # Safety
 /// - `handle` must be a valid wallet handle from `wallet_ffi_create_new` or `wallet_ffi_open`
@@ -362,146 +365,6 @@ pub unsafe extern "C" fn wallet_ffi_program_loader_update(
             WalletFfiError::NetworkError
         }
     }
-}
-
-/// Writes elf data of authenticated transfer program into buffer.
-///
-/// WARNING: Result is not consisent and change between versions, use for testing purposes only.
-///
-/// # Parameters
-/// - `ffi_program`: Valid pointer to `FfiProgram`
-///
-/// # Returns
-/// - `Success` if deployment was submitted successfully
-/// - Error code on other failures
-///
-/// # Memory
-/// - `FfiProgram` can be freed with corresponding `wallet_ffi_free_ffi_program` function
-///
-/// # Safety
-/// - `ffi_program` must be a non-null pointer
-#[no_mangle]
-pub unsafe extern "C" fn wallet_ffi_transfer_elf(ffi_program: *mut FfiProgram) -> WalletFfiError {
-    if ffi_program.is_null() {
-        print_error("Null pointer argument");
-        return WalletFfiError::NullPointer;
-    }
-
-    let elf = programs::authenticated_transfer().elf().to_vec();
-
-    let (raw_elf_data, raw_elf_size, _) = elf.into_raw_parts();
-
-    unsafe {
-        (*ffi_program).elf_data = raw_elf_data;
-        (*ffi_program).elf_size = raw_elf_size;
-    };
-
-    WalletFfiError::Success
-}
-
-/// Writes elf data of authenticated token program into buffer.
-///
-/// WARNING: Result is not consisent and change between versions, use for testing purposes only.
-///
-/// # Parameters
-/// - `ffi_program`: Valid pointer to `FfiProgram`
-///
-/// # Returns
-/// - `Success` if deployment was submitted successfully
-/// - Error code on other failures
-///
-/// # Memory
-/// - `FfiProgram` can be freed with corresponding `wallet_ffi_free_ffi_program` function
-///
-/// # Safety
-/// - `ffi_program` must be a non-null pointer
-#[no_mangle]
-pub unsafe extern "C" fn wallet_ffi_token_elf(ffi_program: *mut FfiProgram) -> WalletFfiError {
-    if ffi_program.is_null() {
-        print_error("Null pointer argument");
-        return WalletFfiError::NullPointer;
-    }
-
-    let elf = programs::token().elf().to_vec();
-
-    let (raw_elf_data, raw_elf_size, _) = elf.into_raw_parts();
-
-    unsafe {
-        (*ffi_program).elf_data = raw_elf_data;
-        (*ffi_program).elf_size = raw_elf_size;
-    };
-
-    WalletFfiError::Success
-}
-
-/// Writes elf data of amm into buffer.
-///
-/// WARNING: Result is not consisent and change between versions, use for testing purposes only.
-///
-/// # Parameters
-/// - `ffi_program`: Valid pointer to `FfiProgram`
-///
-/// # Returns
-/// - `Success` if deployment was submitted successfully
-/// - Error code on other failures
-///
-/// # Memory
-/// - `FfiProgram` can be freed with corresponding `wallet_ffi_free_ffi_program` function
-///
-/// # Safety
-/// - `ffi_program` must be a non-null pointer
-#[no_mangle]
-pub unsafe extern "C" fn wallet_ffi_amm_elf(ffi_program: *mut FfiProgram) -> WalletFfiError {
-    if ffi_program.is_null() {
-        print_error("Null pointer argument");
-        return WalletFfiError::NullPointer;
-    }
-
-    let elf = programs::amm().elf().to_vec();
-
-    let (raw_elf_data, raw_elf_size, _) = elf.into_raw_parts();
-
-    unsafe {
-        (*ffi_program).elf_data = raw_elf_data;
-        (*ffi_program).elf_size = raw_elf_size;
-    };
-
-    WalletFfiError::Success
-}
-
-/// Writes elf data of ata into buffer.
-///
-/// WARNING: Result is not consisent and change between versions, use for testing purposes only.
-///
-/// # Parameters
-/// - `ffi_program`: Valid pointer to `FfiProgram`
-///
-/// # Returns
-/// - `Success` if deployment was submitted successfully
-/// - Error code on other failures
-///
-/// # Memory
-/// - `FfiProgram` can be freed with corresponding `wallet_ffi_free_ffi_program` function
-///
-/// # Safety
-/// - `ffi_program` must be a non-null pointer
-#[no_mangle]
-pub unsafe extern "C" fn wallet_ffi_ata_elf(ffi_program: *mut FfiProgram) -> WalletFfiError {
-    if ffi_program.is_null() {
-        print_error("Null pointer argument");
-        return WalletFfiError::NullPointer;
-    }
-
-    let elf = programs::ata().elf().to_vec();
-
-    let (raw_elf_data, raw_elf_size, _) = elf.into_raw_parts();
-
-    unsafe {
-        (*ffi_program).elf_data = raw_elf_data;
-        (*ffi_program).elf_size = raw_elf_size;
-    };
-
-    WalletFfiError::Success
 }
 
 /// Free a ffi program returned by functions `wallet_ffi_*_elf`.

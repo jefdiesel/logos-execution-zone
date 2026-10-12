@@ -1,6 +1,8 @@
-use lee_core::program::{
-    AccountStateDiff, ChainedCall, InstructionData, PdaSeed, ProgramCall, ProgramId, ProgramInput,
-    ProgramOutput, read_lee_call, respond_unsupported_call,
+use lee_core::{
+    account::{AccountId, ProgramShardSelector},
+    program::{
+        ChainedCall, InstructionData, PdaSeed, Plan, ProgramCall, ProgramId, read_program_call,
+    },
 };
 
 /// Chain-calls an arbitrary target with caller-supplied instruction data,
@@ -10,38 +12,21 @@ use lee_core::program::{
 type Instruction = (ProgramId, InstructionData, Option<PdaSeed>);
 
 fn main() {
-    let call = read_lee_call::<Instruction>();
-    let ProgramCall::Execute(
-        ProgramInput {
-            self_account_id,
-            caller_account_id,
-            pre_states,
-            instruction: (target_program_id, target_instruction_data, pda_seed),
-        },
-        instruction_data,
-    ) = call
-    else {
-        respond_unsupported_call(call);
+    let ProgramCall::Plan(input, instruction) = read_program_call::<Instruction>() else {
+        panic!("authority_proxy emits no effect to apply")
     };
+    let (target_program_id, target_instruction_data, pda_seed) = instruction;
 
-    let chained_call = ChainedCall {
-        program_account_id: target_program_id.into(),
+    let mut plan = Plan::new(&input);
+    plan.call(ChainedCall {
+        program_account_id: AccountId::from_builtin_program(target_program_id),
         instruction_data: target_instruction_data,
-        pre_state_ids: pre_states.iter().map(|pre| pre.account_id).collect(),
+        shard_selectors: input
+            .accounts
+            .iter()
+            .map(ProgramShardSelector::from)
+            .collect(),
         pda_seeds: pda_seed.into_iter().collect(),
-    };
-
-    let state_diffs = pre_states
-        .iter()
-        .map(|pre| AccountStateDiff::unchanged(pre.clone()))
-        .collect();
-
-    ProgramOutput::new(
-        self_account_id,
-        caller_account_id,
-        instruction_data,
-        state_diffs,
-    )
-    .with_chained_calls(vec![chained_call])
-    .write();
+    });
+    plan.write()
 }

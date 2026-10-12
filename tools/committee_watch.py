@@ -87,6 +87,23 @@ def pda(pid: list[int], seed: bytes) -> str:
     return b58encode(hashlib.sha256(PDA_PREFIX + struct.pack("<8I", *pid) + seed).digest())
 
 
+def program_account_id(pid: list[int]) -> str:
+    """Encode the image ID's little-endian words as a base58 account ID."""
+    return b58encode(struct.pack("<8I", *pid))
+
+
+def stake_config(repo: str, sequencer: str) -> dict:
+    """Read the stake program's config shard."""
+    pid = program_id(repo)
+    program = program_account_id(pid)
+    account = rpc(
+        sequencer,
+        "getAccountView",
+        [{"account_id": pda(pid, CONFIG_SEED), "program_account_id": program}],
+    )
+    return decode_stake_config(bytes(account["data"]["shards"][program]))
+
+
 class Reader:
     def __init__(self, data: bytes):
         self.data, self.pos = data, 0
@@ -113,6 +130,9 @@ def decode_stake_config(data: bytes) -> dict:
         minimum, timeframe, timeout = r.u128(), r.u32(), r.u32()
     else:
         minimum = timeframe = timeout = None
+    # `channel_id: Option<[u8; 32]>`.
+    if r.take(1)[0]:
+        r.take(32)
     entries = {}
     for _ in range(r.u32()):
         key = r.take(32).hex()
@@ -208,11 +228,10 @@ def last_inscribed(node: str, channel: str, slot_from: int, slot_to: int) -> dic
 
 def snapshot(args) -> str:
     pid = program_id(args.repo)
-    config_id = pda(pid, CONFIG_SEED)
     sink_id = pda(pid, SINK_SEED)
 
-    stake = decode_stake_config(bytes(rpc(args.sequencer, "getAccount", [config_id])["data"]))
-    sink = rpc(args.sequencer, "getAccount", [sink_id])["balance"]
+    stake = stake_config(args.repo, args.sequencer)
+    sink = rpc(args.sequencer, "getAccountBalance", [sink_id])
     # Slot first: a slot read after the channel state would be newer than it,
     # inflating `since_tip` and rotating the turn early.
     info = http_get(f"{args.node}/cryptarchia/info")["cryptarchia_info"]

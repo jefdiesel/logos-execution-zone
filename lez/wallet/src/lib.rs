@@ -8,29 +8,30 @@
 )]
 
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, HashSet},
     path::PathBuf,
 };
 
-pub use account_manager::AccountIdentity;
+pub use account_manager::{AccountIdentity, AccountMention, CIPHERTEXT_PAD_SIZE, SelectedShard};
 use anyhow::{Context as _, Result};
 use bip39::Mnemonic;
 use common::{HashType, block::Block, transaction::LeeTransaction};
 use config::WalletConfig;
 use key_protocol::key_management::key_tree::chain_index::ChainIndex;
 use lee::{
-    Account, AccountId, PrivacyPreservingTransaction, ProgramId,
+    Account, AccountId, PrivacyPreservingTransaction, ProgramId, ProvingInput,
     privacy_preserving_transaction::{
         circuit::ProgramWithDependencies,
         message::{EncryptedAccountData, Message},
     },
 };
 use lee_core::{
-    BlockId, Commitment, CommitmentSetDigest, MembershipProof, SharedSecretKey, account::Nonce,
+    BlockId, Commitment, CommitmentSetDigest, MembershipProof, SharedSecretKey,
+    account::{Nonce, ProgramShardSelector},
     program::InstructionData,
 };
 use log::warn;
-use sequencer_service_rpc::{RpcClient as _, SequencerClient};
+use sequencer_service_rpc::{RpcClient as _, SequencerClient, SequencerClientBuilder};
 use storage::Storage;
 use tokio::io::AsyncWriteExt as _;
 use url::Url;
@@ -38,8 +39,7 @@ use url::Url;
 use crate::{
     account::{AccountIdWithPrivacy, Label},
     config::WalletConfigOverrides,
-    multi_client::{MultiSequencerClient, Statistics, extract_statistics_from_path},
-    poller::{TxPoller, multi_poll},
+    poller::TxPoller,
     storage::key_chain::{NullifierIndex, SharedAccountEntry},
 };
 
@@ -48,7 +48,6 @@ mod account_manager;
 pub mod cli;
 pub mod config;
 pub mod helperfunctions;
-pub mod multi_client;
 pub mod poller;
 pub mod program_facades;
 pub mod storage;
@@ -69,12 +68,7 @@ const ASSUMED_BASE_FEE: u128 = 64;
 const ASSUMED_DATA_BYTES: u128 = 100_000;
 
 /// Default cap on the fee reservation for wallet-built public transactions.
-#[expect(
-    clippy::as_conversions,
-    reason = "u128::from is not const; the widening is lossless"
-)]
-pub const DEFAULT_MAX_FEE: u128 =
-    (DEFAULT_GAS_LIMIT as u128 + ASSUMED_DATA_BYTES) * ASSUMED_BASE_FEE;
+pub const DEFAULT_MAX_FEE: u128 = max_fee_for(DEFAULT_GAS_LIMIT);
 
 pub enum AccDecodeData {
     Skip,
@@ -102,8 +96,19 @@ pub enum ExecutionFailureKind {
     InsufficientFundsError,
     #[error("Account {0} data is invalid")]
     AccountDataError(AccountId),
+    #[error("Account {0} is mentioned with conflicting identities")]
+    ConflictingAccountIdentity(AccountId),
+    #[error("Account {0} holds state but has no membership proof to update it")]
+    MissingMembershipProof(AccountId),
     #[error("Program bytecode splits into {expected} segment(s) but {actual} were supplied")]
     SegmentCountMismatch { expected: usize, actual: usize },
+    #[error("Program bytecode is not a valid RISC0 program binary")]
+    InvalidProgramBinary(#[source] anyhow::Error),
+    #[error(
+        "Program uses a non-default kernel ELF; only programs built with the protocol's \
+         default kernel can be deployed"
+    )]
+    UnsupportedKernelElf,
     #[error("Failed to build transaction: {0}")]
     TransactionBuildError(#[from] lee::error::LeeError),
     #[error("Failed to sign transaction: {0}")]
@@ -122,65 +127,44 @@ pub struct WalletCore {
     storage: Storage,
     storage_path: PathBuf,
 
-    statistics_path: PathBuf,
-    statistics: HashMap<Url, Statistics>,
-
-    multi_sequencer_client: MultiSequencerClient,
+    sequencer_client: SequencerClient,
 }
 
 impl WalletCore {
     /// Construct wallet using [`HOME_DIR_ENV_VAR`] env var for paths or user home dir if not set.
-    pub async fn from_env() -> Result<Self> {
+    pub fn from_env() -> Result<Self> {
         let config_path = helperfunctions::fetch_config_path()?;
         let storage_path = helperfunctions::fetch_persistent_storage_path()?;
-        let statistics_path = helperfunctions::fetch_statistics_path()?;
 
-        Self::new_update_chain(config_path, storage_path, statistics_path, None).await
+        Self::new_update_chain(config_path, storage_path, None)
     }
 
-    pub async fn new_update_chain(
+    pub fn new_update_chain(
         config_path: PathBuf,
         storage_path: PathBuf,
-        statistics_path: PathBuf,
         config_overrides: Option<WalletConfigOverrides>,
     ) -> Result<Self> {
         let storage = Storage::from_path(&storage_path)
             .with_context(|| format!("Failed to load storage from {}", storage_path.display()))?;
 
-        Self::new(
-            config_path,
-            storage_path,
-            statistics_path,
-            config_overrides,
-            storage,
-        )
-        .await
+        Self::new(config_path, storage_path, config_overrides, storage)
     }
 
-    pub async fn new_init_storage(
+    pub fn new_init_storage(
         config_path: PathBuf,
         storage_path: PathBuf,
-        statistics_path: PathBuf,
         config_overrides: Option<WalletConfigOverrides>,
         password: &str,
     ) -> Result<(Self, Mnemonic)> {
         let (storage, mnemonic) = Storage::new(password).context("Failed to create storage")?;
-        let wallet = Self::new(
-            config_path,
-            storage_path,
-            statistics_path,
-            config_overrides,
-            storage,
-        )
-        .await?;
+        let wallet = Self::new(config_path, storage_path, config_overrides, storage)?;
 
         Ok((wallet, mnemonic))
     }
 
-    async fn new(
+    fn new(
         config_path: PathBuf,
         storage_path: PathBuf,
-        statistics_path: PathBuf,
         config_overrides: Option<WalletConfigOverrides>,
         storage: Storage,
     ) -> Result<Self> {
@@ -195,14 +179,21 @@ impl WalletCore {
             config.apply_overrides(config_overrides);
         }
 
-        let mut statistics = extract_statistics_from_path(&statistics_path)?;
-
-        let multi_sequencer_client = MultiSequencerClient::new(
-            &config.sequencers,
-            &mut statistics,
-            config.multi_sequencer_client_config.clone(),
-        )
-        .await?;
+        let mut builder = SequencerClientBuilder::default();
+        if let Some(basic_auth) = &config.sequencer.basic_auth {
+            builder = builder.set_headers(
+                std::iter::once((
+                    "Authorization".parse().expect("Header name is valid"),
+                    format!("Basic {basic_auth}")
+                        .parse()
+                        .context("Invalid basic auth format")?,
+                ))
+                .collect(),
+            );
+        }
+        let sequencer_client = builder
+            .build(&config.sequencer.sequencer_addr)
+            .context("Failed to create sequencer client")?;
 
         Ok(Self {
             config_path,
@@ -210,9 +201,7 @@ impl WalletCore {
             config,
             storage,
             storage_path,
-            statistics_path,
-            statistics,
-            multi_sequencer_client,
+            sequencer_client,
         })
     }
 
@@ -227,32 +216,23 @@ impl WalletCore {
     }
 
     #[must_use]
-    pub fn poller_vec(&self) -> Vec<TxPoller> {
-        self.leaders()
-            .iter()
-            .take(self.multi_sequencer_client.config().distribution_limit)
-            .map(|(leader, _)| TxPoller::new(self.config(), leader.clone()))
-            .collect()
+    pub fn poller(&self) -> TxPoller {
+        TxPoller::new(self.config(), self.client_owned())
     }
 
     #[must_use]
-    pub fn poller_helm(&self) -> TxPoller {
-        TxPoller::new(self.config(), self.helm_owned())
+    pub const fn client(&self) -> &SequencerClient {
+        &self.sequencer_client
     }
 
     #[must_use]
-    pub fn helm_owned(&self) -> SequencerClient {
-        self.multi_sequencer_client.helm().0.clone()
+    pub fn client_owned(&self) -> SequencerClient {
+        self.sequencer_client.clone()
     }
 
     #[must_use]
-    pub fn helm_url(&self) -> Url {
-        self.multi_sequencer_client.helm().1.clone()
-    }
-
-    #[must_use]
-    pub fn leaders(&self) -> &[(SequencerClient, Url)] {
-        self.multi_sequencer_client.leaders()
+    pub fn client_url(&self) -> Url {
+        self.config.sequencer.sequencer_addr.clone()
     }
 
     /// Get storage.
@@ -287,34 +267,6 @@ impl WalletCore {
             "Stored persistent accounts at {}",
             self.storage_path.display()
         );
-
-        Ok(())
-    }
-
-    /// Rotates multi-client and stores metrics.
-    pub async fn client_rotation(&mut self) -> Result<()> {
-        self.multi_sequencer_client
-            .update_statistics(&mut self.statistics)
-            .await?;
-
-        self.multi_sequencer_client
-            .rotate(
-                &self.config.sequencers,
-                &mut self.statistics,
-                &self.config.multi_sequencer_client_config,
-            )
-            .await?;
-
-        let statistics_serialized = serde_json::to_vec_pretty(&self.statistics)?;
-        let mut file = tokio::fs::File::create(&self.statistics_path)
-            .await
-            .context("Failed to create file")?;
-        file.write_all(&statistics_serialized)
-            .await
-            .context("Failed to write to file")?;
-        file.sync_all().await.context("Failed to sync file")?;
-
-        println!("Stored statistics at {}", self.statistics_path.display());
 
         Ok(())
     }
@@ -399,9 +351,10 @@ impl WalletCore {
         let vpk = keys.generate_viewing_public_key();
         let identifier = entry.identifier;
 
-        if entry.pda_seed.is_some() {
+        if let Some(seed) = entry.pda_seed {
             Some(AccountIdentity::PrivatePdaShared {
-                account_id,
+                authority: AccountId::from_builtin_program(entry.authority_program_id?),
+                seed,
                 nsk: keys.nullifier_secret_key(),
                 vpk,
                 identifier,
@@ -468,7 +421,7 @@ impl WalletCore {
         let mut index = NullifierIndex::default();
         index.track_initialization(account_id);
 
-        let poller = self.poller_helm();
+        let poller = self.poller();
         let mut blocks = std::pin::pin!(poller.poll_block_range(1..=cursor));
         while let Some(block) = blocks.try_next().await? {
             for tx in block.body.transactions {
@@ -513,7 +466,7 @@ impl WalletCore {
         let npk = keys.generate_nullifier_public_key();
         let vpk = keys.generate_viewing_public_key();
         let account_id = AccountId::for_private_pda(
-            &AccountId::from(program_id),
+            &AccountId::from_builtin_program(program_id),
             &pda_seed,
             &npk,
             &vpk,
@@ -534,15 +487,6 @@ impl WalletCore {
             npk,
             vpk,
         })
-    }
-
-    /// Create a shared regular private account from a group's GMS with a random identifier.
-    pub async fn create_shared_regular_account(
-        &mut self,
-        group_name: Label,
-    ) -> Result<SharedAccountInfo> {
-        self.create_shared_regular_account_with_identifier(group_name, rand::random())
-            .await
     }
 
     /// Create a shared regular private account from a group's GMS under the given `identifier`.
@@ -572,27 +516,31 @@ impl WalletCore {
         })
     }
 
-    #[must_use]
-    pub fn get_statistics(&self, sequencer_url: &Url) -> Option<&Statistics> {
-        self.statistics.get(sequencer_url)
-    }
-
     /// Get account balance.
     pub async fn get_account_balance(&self, acc: AccountId) -> Result<u128> {
-        Ok(self
-            .multi_sequencer_client
-            .metered_get(async |client: &SequencerClient| client.get_account_balance(acc).await)
-            .await?)
+        Ok(self.sequencer_client.get_account_balance(acc).await?)
     }
 
     /// Get accounts nonces.
     pub async fn get_accounts_nonces(&self, accs: &[AccountId]) -> Result<Vec<Nonce>> {
         Ok(self
-            .multi_sequencer_client
-            .metered_get(async |client: &SequencerClient| {
-                client.get_accounts_nonces(accs.to_vec()).await
-            })
+            .sequencer_client
+            .get_accounts_nonces(accs.to_vec())
             .await?)
+    }
+
+    /// Returns the account's nonce and the selected shard; its balance is the shard at the
+    /// native token program.
+    pub async fn get_account_view(&self, shard_selector: ProgramShardSelector) -> Result<Account> {
+        let mut account = self
+            .sequencer_client
+            .get_account_view(shard_selector)
+            .await?;
+
+        // RPC projections include empty shards; the wallet omits them.
+        account.data.shards.retain(|_, shard| !shard.is_empty());
+
+        Ok(account)
     }
 
     pub async fn get_account(&self, account_id: AccountIdWithPrivacy) -> Result<Account> {
@@ -609,35 +557,23 @@ impl WalletCore {
     }
 
     pub async fn get_last_block_id(&self) -> Result<u64> {
-        Ok(self
-            .multi_sequencer_client
-            .metered_get(async |client: &SequencerClient| client.get_last_block_id().await)
-            .await?)
+        Ok(self.sequencer_client.get_last_block_id().await?)
     }
 
     pub async fn get_block(&self, block_id: u64) -> Result<Option<Block>> {
-        Ok(self
-            .multi_sequencer_client
-            .metered_get(async |client: &SequencerClient| client.get_block(block_id).await)
-            .await?)
+        Ok(self.sequencer_client.get_block(block_id).await?)
     }
 
     pub async fn get_transaction(
         &self,
         hash: HashType,
     ) -> Result<Option<(LeeTransaction, BlockId)>> {
-        Ok(self
-            .multi_sequencer_client
-            .metered_get(async |client: &SequencerClient| client.get_transaction(hash).await)
-            .await?)
+        Ok(self.sequencer_client.get_transaction(hash).await?)
     }
 
     /// Get public account.
     pub async fn get_account_public(&self, account_id: AccountId) -> Result<Account> {
-        Ok(self
-            .multi_sequencer_client
-            .metered_get(async |client: &SequencerClient| client.get_account(account_id).await)
-            .await?)
+        Ok(self.sequencer_client.get_account(account_id).await?)
     }
 
     #[must_use]
@@ -657,9 +593,8 @@ impl WalletCore {
     }
 
     #[must_use]
-    pub fn get_private_account_commitment(&self, account_id: AccountId) -> Option<Commitment> {
-        let account = self
-            .storage
+    pub fn private_account_state(&self, account_id: AccountId) -> Option<&Account> {
+        self.storage
             .key_chain()
             .private_account(account_id)
             .map(|acc| acc.account)
@@ -668,20 +603,22 @@ impl WalletCore {
                     .key_chain()
                     .shared_private_account(account_id)
                     .map(|entry| &entry.account)
-            })?;
-        Some(Commitment::new(&account_id, account))
+            })
+    }
+
+    #[must_use]
+    pub fn get_private_account_commitment(&self, account_id: AccountId) -> Option<Commitment> {
+        self.private_account_state(account_id)
+            .map(|account| Commitment::new(&account_id, account))
     }
 
     pub async fn get_program_ids(&self) -> Result<BTreeMap<String, ProgramId>> {
-        Ok(self
-            .multi_sequencer_client
-            .metered_get(async |client: &SequencerClient| client.get_program_ids().await)
-            .await?)
+        Ok(self.sequencer_client.get_program_ids().await?)
     }
 
     /// Poll transactions.
     pub async fn poll_transaction(&self, tx_hash: HashType) -> Result<(LeeTransaction, BlockId)> {
-        multi_poll(self.poller_vec(), tx_hash).await
+        self.poller().poll_tx(tx_hash).await
     }
 
     pub async fn get_proofs_and_root(
@@ -689,10 +626,8 @@ impl WalletCore {
         commitments: &[Commitment],
     ) -> Result<(Vec<Option<MembershipProof>>, CommitmentSetDigest)> {
         Ok(self
-            .multi_sequencer_client
-            .metered_get(async |client: &SequencerClient| {
-                client.get_proofs_and_root(commitments.to_vec()).await
-            })
+            .sequencer_client
+            .get_proofs_and_root(commitments.to_vec())
             .await?)
     }
 
@@ -775,7 +710,7 @@ impl WalletCore {
 
     pub async fn send_privacy_preserving_tx(
         &self,
-        accounts: Vec<AccountIdentity>,
+        accounts: Vec<AccountMention>,
         instruction_data: InstructionData,
         program: &ProgramWithDependencies,
     ) -> Result<(HashType, Vec<SharedSecretKey>), ExecutionFailureKind> {
@@ -787,31 +722,37 @@ impl WalletCore {
 
     pub async fn send_privacy_preserving_tx_with_pre_check(
         &self,
-        accounts: Vec<AccountIdentity>,
+        accounts: Vec<AccountMention>,
         instruction_data: InstructionData,
         program: &ProgramWithDependencies,
-        tx_pre_check: impl FnOnce(&[&Account]) -> Result<(), ExecutionFailureKind>,
+        tx_pre_check: impl FnOnce(&[SelectedShard]) -> Result<(), ExecutionFailureKind>,
     ) -> Result<(HashType, Vec<SharedSecretKey>), ExecutionFailureKind> {
         let acc_manager = account_manager::AccountManager::new(self, accounts).await?;
 
-        let pre_states = acc_manager.pre_states();
+        tx_pre_check(&acc_manager.selected_shards())?;
 
-        tx_pre_check(
-            &pre_states
-                .iter()
-                .map(|pre| &pre.account)
-                .collect::<Vec<_>>(),
-        )?;
+        for account_id in acc_manager.accounts_outgrowing_pad() {
+            warn!(
+                "Account {account_id} exceeds the {CIPHERTEXT_PAD_SIZE}-byte note pad; its note is \
+                 identifiable by length in this transaction"
+            );
+        }
 
         let private_account_keys = acc_manager.private_account_keys();
-        let (output, proof) =
-            lee::privacy_preserving_transaction::circuit::execute_and_prove_with_padded_inputs(
-                pre_states,
-                instruction_data,
-                acc_manager.account_identities(),
-                acc_manager.dummy_inputs_default(),
-                &program.to_owned(),
-            )?;
+        let input = ProvingInput {
+            shard_selectors: acc_manager.shard_selectors(),
+            signers: acc_manager.signers(),
+            private_witnesses: acc_manager.private_witnesses()?,
+            instruction_data,
+            dummy_inputs: acc_manager.dummy_inputs_default(),
+            ciphertext_padding: Some(CIPHERTEXT_PAD_SIZE),
+        };
+
+        let program = program.clone();
+        let (output, proof) = tokio::task::spawn_blocking(move || {
+            lee::privacy_preserving_transaction::circuit::execute_and_prove(input, &program)
+        })
+        .await??;
 
         let message = lee::privacy_preserving_transaction::message::Message::from_circuit_output(
             acc_manager.public_account_nonces(),
@@ -836,18 +777,17 @@ impl WalletCore {
             .map(|keys| keys.ssk)
             .collect();
 
-        let call_res = first_success_or_error(
-            self.multi_sequencer_client
-                .metered_send_transaction(LeeTransaction::PrivacyPreserving(tx))
-                .await,
-        );
+        let call_res = self
+            .sequencer_client
+            .send_transaction(LeeTransaction::PrivacyPreserving(tx))
+            .await;
 
         Ok((call_res?, shared_secrets))
     }
 
     pub async fn send_pub_tx(
         &self,
-        accounts: Vec<AccountIdentity>,
+        accounts: Vec<AccountMention>,
         instruction_data: InstructionData,
         program_account_id: AccountId,
     ) -> Result<HashType, ExecutionFailureKind> {
@@ -859,7 +799,7 @@ impl WalletCore {
     /// self-pay selection. See [`Self::send_pub_tx_with_pre_check`].
     pub async fn send_pub_tx_paid_by(
         &self,
-        accounts: Vec<AccountIdentity>,
+        accounts: Vec<AccountMention>,
         instruction_data: InstructionData,
         program_account_id: AccountId,
         payer: Option<AccountId>,
@@ -886,14 +826,14 @@ impl WalletCore {
     /// and unfunded) can still be paid for.
     pub async fn send_pub_tx_with_pre_check(
         &self,
-        accounts: Vec<AccountIdentity>,
+        accounts: Vec<AccountMention>,
         instruction_data: InstructionData,
         program_account_id: AccountId,
         payer: Option<AccountId>,
-        tx_pre_check: impl FnOnce(&[&Account]) -> Result<(), ExecutionFailureKind>,
+        tx_pre_check: impl FnOnce(&[SelectedShard]) -> Result<(), ExecutionFailureKind>,
     ) -> Result<HashType, ExecutionFailureKind> {
         // Public transaction, all accounts must be public
-        if accounts.iter().any(AccountIdentity::is_private) {
+        if accounts.iter().any(|mention| mention.identity.is_private()) {
             return Err(ExecutionFailureKind::TransactionBuildError(
                 lee::error::LeeError::InvalidInput(
                     "Private accounts are not allowed in public transactions".to_owned(),
@@ -901,16 +841,11 @@ impl WalletCore {
             ));
         }
 
-        let acc_manager = account_manager::AccountManager::new(self, accounts).await?;
+        let mut acc_manager = account_manager::AccountManager::new(self, accounts).await?;
 
-        let pre_states = acc_manager.pre_states();
-        tx_pre_check(
-            &pre_states
-                .iter()
-                .map(|pre| &pre.account)
-                .collect::<Vec<_>>(),
-        )?;
+        tx_pre_check(&acc_manager.selected_shards())?;
 
+        let shard_selectors = acc_manager.shard_selectors();
         let account_ids = acc_manager.public_account_ids();
         let mut nonces = acc_manager.public_account_nonces();
 
@@ -921,9 +856,12 @@ impl WalletCore {
         };
         let (payer, co_signer) = match payer {
             None => (
-                acc_manager.fee_payer_account_id().ok_or_else(|| {
-                    invalid_input("Public transaction has no signing account to pay its fees")
-                })?,
+                acc_manager
+                    .fee_payer_account_id(self)
+                    .await?
+                    .ok_or_else(|| {
+                        invalid_input("Public transaction has no signing account to pay its fees")
+                    })?,
                 None,
             ),
             Some(payer) if acc_manager.signs_for(payer) => (payer, None),
@@ -937,7 +875,7 @@ impl WalletCore {
                     invalid_input("Fee payer's signing key is not held by this wallet")
                 })?;
                 let account = self
-                    .get_account_public(payer)
+                    .get_account_view(ProgramShardSelector::native_balance(payer))
                     .await
                     .map_err(ExecutionFailureKind::SequencerError)?;
                 nonces.push(account.nonce);
@@ -947,14 +885,14 @@ impl WalletCore {
 
         let message = lee::public_transaction::Message::new_preserialized(
             program_account_id,
-            account_ids,
+            shard_selectors,
             nonces,
             instruction_data,
             Some(lee::FeeDeclaration::new(
                 payer,
-                DEFAULT_GAS_LIMIT,
+                self.config.gas_limit,
                 0,
-                DEFAULT_MAX_FEE,
+                max_fee_for(self.config.gas_limit),
             )),
         );
 
@@ -974,11 +912,10 @@ impl WalletCore {
 
         let tx = lee::public_transaction::PublicTransaction::new(message, witness_set);
 
-        first_success_or_error(
-            self.multi_sequencer_client
-                .metered_send_transaction(LeeTransaction::Public(tx))
-                .await,
-        )
+        Ok(self
+            .sequencer_client
+            .send_transaction(LeeTransaction::Public(tx))
+            .await?)
     }
 
     pub async fn sync_to_latest_block(&mut self) -> Result<u64> {
@@ -1004,7 +941,7 @@ impl WalletCore {
 
         println!("Syncing to block {block_id}. Blocks to sync: {num_of_blocks}");
 
-        let poller = self.poller_helm();
+        let poller = self.poller();
         let mut blocks =
             std::pin::pin!(poller.poll_block_range(last_synced_block.saturating_add(1)..=block_id));
 
@@ -1161,26 +1098,20 @@ impl WalletCore {
     }
 }
 
-/// Collapses the per-sequencer send results into one outcome: the first
-/// success, or — when every sequencer refused — the first refusal, so the
-/// caller sees *why* (e.g. a fee-admission `PayerCannotFund`) instead of a
-/// generic failure. Only an empty leader set yields
-/// [`ExecutionFailureKind::MultiSequencerTransactionSendError`].
-fn first_success_or_error(
-    results: Vec<Result<HashType, ExecutionFailureKind>>,
-) -> Result<HashType, ExecutionFailureKind> {
-    let mut first_error = None;
-    for result in results {
-        match result {
-            Ok(hash) => return Ok(hash),
-            Err(error) => {
-                if first_error.is_none() {
-                    first_error = Some(error);
-                }
-            }
-        }
-    }
-    Err(first_error.unwrap_or(ExecutionFailureKind::MultiSequencerTransactionSendError))
+/// Sizes a fee cap for a given gas limit: a wallet that raises its gas limit
+/// must raise its fee cap in step, or the reservation cannot cover the gas.
+#[must_use]
+#[expect(
+    clippy::as_conversions,
+    reason = "u128::from is not const; the widening is lossless"
+)]
+#[expect(
+    clippy::arithmetic_side_effects,
+    reason = "gas_limit and ASSUMED_DATA_BYTES both fit well within u128::MAX, so the widened \
+              sum and product cannot overflow"
+)]
+pub const fn max_fee_for(gas_limit: u64) -> u128 {
+    (gas_limit as u128 + ASSUMED_DATA_BYTES) * ASSUMED_BASE_FEE
 }
 
 fn decrypt_note_at(

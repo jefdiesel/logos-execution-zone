@@ -7,7 +7,7 @@ pub use jsonrpsee::{core::ClientError, http_client::HttpClientBuilder as Sequenc
 use sequencer_service_protocol::{
     Account, AccountId, Block, BlockId, ChannelId, Commitment, CommitmentSetDigest,
     CrossZoneDeadLetterReport, CrossZoneDeadLetterRequeue, FeeStateQuote, HashType, LeeTransaction,
-    MembershipProof, Nonce, ProgramId,
+    MembershipProof, Nonce, ProgramId, ProgramShardSelector,
 };
 
 #[cfg(all(not(feature = "server"), not(feature = "client")))]
@@ -80,6 +80,14 @@ pub trait Rpc {
         &self,
         account_ids: Vec<AccountId>,
     ) -> Result<Vec<Nonce>, ErrorObjectOwned>;
+
+    /// Returns the account's nonce and the selected shard; its balance is the shard at the
+    /// native token program.
+    #[method(name = "getAccountView")]
+    async fn get_account_view(
+        &self,
+        shard_selector: ProgramShardSelector,
+    ) -> Result<Account, ErrorObjectOwned>;
 
     #[method(name = "getProofsAndRoot")]
     async fn get_proofs_and_root(

@@ -14,6 +14,8 @@ const INBOX_CONFIG_SEED: [u8; 32] = *b"/LEZ/v0.3/CrossZoneInboxCfg/000/";
 /// already relocates every PDA in this crate whenever the crate changes.
 const INBOX_SEEN_SEED_DOMAIN: [u8; 32] = *b"/LEZ/v0.3/CrossZoneInboxSeen/01/";
 
+pub const CROSS_ZONE_INBOX_NAME: [u8; 16] = *b"cross_zone_inbox";
+
 /// Raw 32-byte zone (channel) id; the host maps it to the zone-sdk `ChannelId`.
 pub type ZoneId = [u8; 32];
 
@@ -61,19 +63,13 @@ pub struct CrossZonePeer {
     /// own config. A route naming a program that does not authorize cross-zone
     /// sources is refused there, at genesis.
     pub allowed_routes: Vec<CrossZoneRoute>,
-    /// The peer's block-signing public keys, pinned to reject blocks inscribed
-    /// by anyone other than that zone's sequencers: a block is acceptable when
-    /// signed by any of them, one entry per sequencer. Empty skips the check
-    /// (the channel signer is still authenticated by the zone-sdk).
-    #[serde(default)]
-    pub expected_block_signing_pubkeys: Vec<[u8; 32]>,
     /// Minimum live committee size (accredited keys on the peer's channel)
     /// below which reading from this peer is suspended, by the sequencer's
     /// watcher and the indexer's verifier alike. 0, the default, disables the
-    /// floor. With a floor set, a channel state unreadable before the first
-    /// successful read counts as below it (fail-closed), while a bounded run
-    /// of later read failures keeps the last known size. Unknown fields are refused above, so
-    /// a misspelling fails startup instead of silently running floorless.
+    /// floor, and a production peer should set it. With a floor set, a channel
+    /// state unreadable before the first successful read counts as below it (fail-closed), while a
+    /// bounded run of later read failures keeps the last known size. Unknown fields are
+    /// refused above, so a misspelling fails startup instead of silently running floorless.
     #[serde(default)]
     pub min_committee_size: u32,
 }
@@ -245,6 +241,11 @@ pub enum Instruction {
     InitConfig(InboxConfig),
 }
 
+#[must_use]
+pub fn cross_zone_inbox_account_id() -> AccountId {
+    AccountId::from_builtin_program_name(&CROSS_ZONE_INBOX_NAME)
+}
+
 /// Content-addressed replay key for a delivered message.
 ///
 /// Hashes `(src_zone, src_block_id, src_tx_index)` under a domain separator.
@@ -279,11 +280,6 @@ const fn inbox_config_seed() -> PdaSeed {
 }
 
 /// The seen-set shard for the peer block the message came from.
-///
-/// TODO(squatting): the address is derivable from `(src_zone, src_block_id)`,
-/// so a squatter can own a future shard first. The dispatch trusts a shard only
-/// when the inbox owns it, so delivery from that peer block then fails loudly
-/// rather than the squatter's bytes deciding what counts as delivered.
 #[must_use]
 pub fn inbox_seen_shard_account_id(
     inbox_id: AccountId,

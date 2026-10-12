@@ -3,8 +3,8 @@ use std::collections::HashMap;
 use key_protocol::key_management::{
     KeyChain, key_tree::chain_index::ChainIndex, secret_holders::SecretSpendingKey,
 };
-use lee::{Account, AccountId, Data, PrivateKey, PublicKey, V03State, program::Program};
-use lee_core::program::DEFAULT_PROGRAM_OWNER;
+use lee::{Account, AccountId, PrivateKey, PublicKey, V03State, program::Program};
+use lee_core::Identifier;
 use serde::{Deserialize, Serialize};
 
 const PRIVATE_KEY_PUB_ACC_A: [u8; 32] = [
@@ -111,26 +111,16 @@ fn initial_priv_accounts_private_keys() -> Vec<PrivateAccountPrivateInitialData>
 
     vec![
         PrivateAccountPrivateInitialData {
-            account: Account {
-                program_owner: DEFAULT_PROGRAM_OWNER,
-                balance: PRIV_ACC_A_INITIAL_BALANCE,
-                data: Data::default(),
-                nonce: 0.into(),
-            },
+            account: Account::funded(PRIV_ACC_A_INITIAL_BALANCE),
             key_chain: key_chain_1,
             chain_index: None,
-            identifier: 0,
+            identifier: Identifier::ZERO,
         },
         PrivateAccountPrivateInitialData {
-            account: Account {
-                program_owner: DEFAULT_PROGRAM_OWNER,
-                balance: PRIV_ACC_B_INITIAL_BALANCE,
-                data: Data::default(),
-                nonce: 0.into(),
-            },
+            account: Account::funded(PRIV_ACC_B_INITIAL_BALANCE),
             key_chain: key_chain_2,
             chain_index: None,
-            identifier: 0,
+            identifier: Identifier::ZERO,
         },
     ]
 }
@@ -151,15 +141,14 @@ fn initial_private_accounts() -> Vec<(lee_core::Commitment, lee_core::Nullifier)
         .iter()
         .map(|init_comm_data| {
             let npk = &init_comm_data.npk;
-            let account_id =
-                lee::AccountId::for_regular_private_account(npk, &init_comm_data.vpk, 0);
-
-            let mut acc = init_comm_data.account.clone();
-
-            acc.program_owner = programs::authenticated_transfer().id().into();
+            let account_id = lee::AccountId::for_regular_private_account(
+                npk,
+                &init_comm_data.vpk,
+                Identifier::ZERO,
+            );
 
             (
-                lee_core::Commitment::new(&account_id, &acc),
+                lee_core::Commitment::new(&account_id, &init_comm_data.account),
                 lee_core::Nullifier::for_account_initialization(&account_id),
             )
         })
@@ -188,16 +177,7 @@ pub fn initial_public_user_accounts() -> Vec<PublicAccountPublicInitialData> {
 fn initial_public_accounts() -> HashMap<AccountId, Account> {
     initial_public_user_accounts()
         .iter()
-        .map(|acc_data| {
-            (
-                acc_data.account_id,
-                Account {
-                    program_owner: programs::authenticated_transfer().id().into(),
-                    balance: acc_data.balance,
-                    ..Default::default()
-                },
-            )
-        })
+        .map(|acc_data| (acc_data.account_id, Account::funded(acc_data.balance)))
         .chain([(
             system_accounts::bridge_account_id(),
             system_accounts::bridge_account(),
@@ -216,54 +196,59 @@ fn initial_public_accounts() -> HashMap<AccountId, Account> {
                 system_accounts::fee_state_account_id(),
                 system_accounts::fee_state_account(),
             ),
-            (
-                system_accounts::fee_escrow_account_id(),
-                system_accounts::fee_account(),
-            ),
-            (
-                system_accounts::fee_inbox_account_id(),
-                system_accounts::fee_account(),
-            ),
+            (system_accounts::fee_escrow_account_id(), Account::default()),
+            (system_accounts::fee_inbox_account_id(), Account::default()),
         ])
         .collect()
 }
 
-fn initial_programs(cross_zone: bool) -> Vec<Program> {
+fn initial_programs(cross_zone: bool) -> Vec<(AccountId, Program)> {
     let mut programs = vec![
-        programs::authenticated_transfer(),
-        programs::token(),
-        programs::amm(),
-        programs::clock(),
-        programs::fee(),
-        programs::ata(),
-        programs::bridge(),
-        programs::sequencer_stake(),
+        (programs::clock_account_id(), programs::clock()),
+        (programs::fee_account_id(), programs::fee()),
+        (programs::bridge_account_id(), programs::bridge()),
+        (
+            programs::sequencer_stake_account_id(),
+            programs::sequencer_stake(),
+        ),
     ];
     if cross_zone {
         // Builtins baked into every node (genesis-block ELFs would exceed the
         // inscription size limit); registered only on cross_zone zones, fixed at
         // genesis.
         programs.extend([
-            programs::cross_zone_inbox(),
-            programs::cross_zone_outbox(),
-            programs::ping_sender(),
-            programs::ping_receiver(),
-            programs::bridge_lock(),
-            programs::wrapped_token(),
+            (
+                programs::cross_zone_inbox_account_id(),
+                programs::cross_zone_inbox(),
+            ),
+            (
+                programs::cross_zone_outbox_account_id(),
+                programs::cross_zone_outbox(),
+            ),
+            (programs::ping_sender_account_id(), programs::ping_sender()),
+            (
+                programs::ping_receiver_account_id(),
+                programs::ping_receiver(),
+            ),
+            (programs::bridge_lock_account_id(), programs::bridge_lock()),
+            (
+                programs::wrapped_token_account_id(),
+                programs::wrapped_token(),
+            ),
         ]);
     }
     programs
 }
 
-/// The pre-genesis state. `cross_zone` selects whether the six cross-zone
-/// builtins are registered; ids are content-derived, so only membership
-/// changes. Not defaulted: every caller states the choice.
+/// The pre-genesis state. `cross_zone` selects whether the six cross-zone builtins are
+/// registered, each at a name-derived, `image_id`-independent address. Not defaulted: every
+/// caller states the choice.
 #[must_use]
 pub fn initial_state(cross_zone: bool) -> V03State {
     lee::V03State::new()
         .with_public_accounts(initial_public_accounts())
         .with_private_accounts(initial_private_accounts())
-        .with_programs(initial_programs(cross_zone))
+        .with_named_programs(initial_programs(cross_zone))
 }
 
 #[cfg(test)]
@@ -297,8 +282,8 @@ mod tests {
     const PUB_ACC_A_TEXT_ADDR: &str = "6iArKUXxhUJqS7kCaPNhwMWt3ro71PDyBj7jwAyE2VQV";
     const PUB_ACC_B_TEXT_ADDR: &str = "7wHg9sbJwc6h3NP1S9bekfAzB8CHifEcxKswCKUt3YQo";
 
-    const PRIV_ACC_A_TEXT_ADDR: &str = "As5oeEYgbwFwHCB8xCnRJA5uQV1eYCcU86Pfir3D29fX";
-    const PRIV_ACC_B_TEXT_ADDR: &str = "GhB15jD2Yig2h2SnDXqxsZii1B3EhnmSucvwodfXKhAa";
+    const PRIV_ACC_A_TEXT_ADDR: &str = "GzKZCEamT6Mt7SnwrhoAJvaQpTG4q7yegcBSCYoRVyaE";
+    const PRIV_ACC_B_TEXT_ADDR: &str = "Baovohr2wgDpZXAEXwfvmMKBrsdotsxUsYpH3LUufDe";
 
     #[test]
     fn pub_state_consistency() {
@@ -383,12 +368,7 @@ mod tests {
                     .key_chain
                     .viewing_public_key
                     .clone(),
-                account: Account {
-                    program_owner: DEFAULT_PROGRAM_OWNER,
-                    balance: PRIV_ACC_A_INITIAL_BALANCE,
-                    data: Data::default(),
-                    nonce: 0.into(),
-                },
+                account: Account::funded(PRIV_ACC_A_INITIAL_BALANCE),
             }
         );
 
@@ -400,20 +380,14 @@ mod tests {
                     .key_chain
                     .viewing_public_key
                     .clone(),
-                account: Account {
-                    program_owner: DEFAULT_PROGRAM_OWNER,
-                    balance: PRIV_ACC_B_INITIAL_BALANCE,
-                    data: Data::default(),
-                    nonce: 0.into(),
-                },
+                account: Account::funded(PRIV_ACC_B_INITIAL_BALANCE),
             }
         );
     }
 
     #[test]
-    fn genesis_fee_accounts_are_registered_and_owned() {
+    fn genesis_fee_accounts_are_registered_with_their_records() {
         let state = initial_state(true);
-        let fee_program_id = programs::fee().id();
 
         let ids = system_accounts::fee_account_ids();
         // state, escrow, inbox — all distinct, all non-default.
@@ -423,55 +397,48 @@ mod tests {
                 assert_ne!(id, other);
             }
             let account = state.get_account_by_id(*id);
-            assert_eq!(account.program_owner, fee_program_id.into());
-            assert_eq!(account.balance, 0);
+            assert_eq!(account.data.native_balance().unwrap(), 0);
         }
 
         // The fee-state account carries the genesis market state; escrow and
         // inbox start empty.
         let fee_state = fee_core::state::FeeState::from_bytes(
-            &state
+            state
                 .get_account_by_id(system_accounts::fee_state_account_id())
                 .data
-                .into_inner(),
+                .shard(programs::fee_account_id()),
         );
         assert_eq!(fee_state, fee_core::state::FeeState::genesis());
         for empty_id in [
             system_accounts::fee_escrow_account_id(),
             system_accounts::fee_inbox_account_id(),
         ] {
-            assert!(
-                state
-                    .get_account_by_id(empty_id)
-                    .data
-                    .into_inner()
-                    .is_empty()
-            );
+            assert!(state.get_account_by_id(empty_id).data.shards.is_empty());
         }
     }
 
     #[test]
     fn genesis_system_accounts_have_expected_contents() {
         // System-account IDs must be distinct and non-default, and the genesis
-        // bridge account must carry its expected field values.  Catches mutations
+        // bridge account must carry its expected field values. Catches mutations
         // that replace `system_bridge_account` with `Default::default()`, delete
-        // its `balance`/`program_owner` fields, or replace
-        // `system_bridge_account_id` with `Default::default()`.
+        // its `balance`, or replace `system_bridge_account_id` with
+        // `Default::default()`.
         let bridge_id = system_accounts::bridge_account_id();
         assert_ne!(bridge_id, AccountId::default());
 
         let state = initial_state(true);
-        let default_owner = Account::default().program_owner;
 
         let bridge = state.get_account_by_id(bridge_id);
         assert_eq!(
-            bridge.balance,
+            bridge.data.native_balance().unwrap(),
             u128::MAX,
             "the bridge holds the whole supply"
         );
-        assert_ne!(
-            bridge.program_owner, default_owner,
-            "bridge must have a non-default program_owner"
+        assert_eq!(
+            bridge.data.shards.keys().copied().collect::<Vec<_>>(),
+            vec![lee_core::native_token::NATIVE_TOKEN_PROGRAM_ID],
+            "the bridge holds balance alone, no program's record"
         );
     }
 
@@ -479,19 +446,22 @@ mod tests {
     #[test]
     fn cross_zone_builtins_register_only_when_declared() {
         let cross_zone_ids = [
-            programs::cross_zone_inbox().id(),
-            programs::cross_zone_outbox().id(),
-            programs::ping_sender().id(),
-            programs::ping_receiver().id(),
-            programs::bridge_lock().id(),
-            programs::wrapped_token().id(),
+            programs::cross_zone_inbox_account_id(),
+            programs::cross_zone_outbox_account_id(),
+            programs::ping_sender_account_id(),
+            programs::ping_receiver_account_id(),
+            programs::bridge_lock_account_id(),
+            programs::wrapped_token_account_id(),
         ];
         let with = initial_state(true);
         let without = initial_state(false);
         for id in cross_zone_ids {
-            assert!(with.get_program(id).is_some(), "registered when declared");
             assert!(
-                without.get_program(id).is_none(),
+                with.get_builtin_program(id).is_some(),
+                "registered when declared"
+            );
+            assert!(
+                without.get_builtin_program(id).is_none(),
                 "absent when not declared"
             );
         }

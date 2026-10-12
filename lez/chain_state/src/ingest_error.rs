@@ -22,8 +22,6 @@ pub enum BlockIngestError {
         computed: HashType,
         header: HashType,
     },
-    #[error("Block header signature does not verify against the embedded producer key")]
-    InvalidProducerSignature,
     #[error("Block has no transactions")]
     EmptyBlock,
     #[error("Last transaction must be the public clock invocation for the block timestamp")]
@@ -76,12 +74,31 @@ impl BlockIngestError {
     /// Whether the failure may be transient rather than a property of the block.
     ///
     /// FIXME: `StateTransition` is too coarse — its `reason` string mixes genuine
-    /// state-transition rejections with infra failures (risc0 executor teardown,
-    /// storage errors). Once it carries a structured cause, narrow this so only
-    /// infra failures retry.
+    /// state-transition rejections with host failures of the risc0 executor. Once it
+    /// carries a structured cause, narrow this so only host failures retry.
     #[must_use]
     pub const fn is_retryable(&self) -> bool {
         matches!(self, Self::StateTransition { .. })
+    }
+
+    /// Whether the block is invalid in itself, rather than out of place on the tip.
+    #[must_use]
+    pub const fn is_invalid_block(&self) -> bool {
+        match self {
+            Self::UnexpectedBlockId { .. } | Self::BrokenChainLink { .. } => false,
+            Self::Deserialize(_)
+            | Self::HashMismatch { .. }
+            | Self::EmptyBlock
+            | Self::InvalidClockTransaction
+            | Self::InvalidFeeTransaction
+            | Self::InvalidRewardTarget { .. }
+            | Self::InvalidFeeClass { .. }
+            | Self::MissingFeeDeclaration { .. }
+            | Self::GasCapExceeded { .. }
+            | Self::RestrictedAccountModification { .. }
+            | Self::NonPublicGenesisTransaction
+            | Self::StateTransition { .. } => true,
+        }
     }
 }
 

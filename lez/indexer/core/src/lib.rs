@@ -436,7 +436,7 @@ impl IndexerCore {
                     // carries before applying it, so the destination never trusts
                     // a dispatch just because a sequencer signed the block: a
                     // forged one halts ingestion rather than persisting invalid
-                    // state, while a replay is accepted since the inbox no-ops it
+                    // state, while a replay is left to the inbox, which refuses it
                     // on chain. An operator-listed block hash skips verification
                     // entirely, ahead of it, so listing clears a dead-peer retry
                     // loop as well as a forged verdict. The keys are marked seen
@@ -469,7 +469,8 @@ impl IndexerCore {
                     };
 
                     match self.store.accept_block(&block, slot).await {
-                        Ok(AcceptOutcome::Applied) => {
+                        // Indexer writes logs directly into DB, they are redundant here.
+                        Ok(AcceptOutcome::Applied(_)) => {
                             if let Some(verifier) = &self.verifier {
                                 verifier.record_seen(verified_keys).await;
                             }
@@ -663,7 +664,7 @@ mod tests {
             timestamp,
             transactions: vec![],
         }
-        .into_pending_block(&lee::PrivateKey::try_new([7; 32]).expect("valid key"))
+        .into_pending_block()
     }
 
     #[tokio::test]
@@ -708,7 +709,7 @@ mod tests {
                 .accept_block(&genesis, Slot::from(1_000))
                 .await
                 .expect("accept"),
-            AcceptOutcome::Applied
+            AcceptOutcome::Applied(_)
         ));
         core.store
             .set_zone_cursor(&Slot::from(1_000))
@@ -757,19 +758,25 @@ mod tests {
     /// An inbox dispatch transaction with fixed source coordinates, so blocks
     /// in these tests carry a decodable dispatch key.
     fn dispatch_tx() -> common::transaction::LeeTransaction {
-        let receiver_id: lee::AccountId = programs::ping_receiver().id().into();
+        let receiver_id = programs::ping_receiver_account_id();
         common::transaction::LeeTransaction::Public(cross_zone::build_dispatch_from_emission(
             &cross_zone::EmissionSource {
                 src_zone: [2; 32],
                 src_block_id: 5,
                 src_block_hash: [3; 32],
                 src_tx_index: 0,
-                src_account_id: programs::ping_sender().id().into(),
+                src_account_id: programs::ping_sender_account_id(),
             },
             receiver_id,
             &[
-                ping_core::receiver_config_account_id(receiver_id).into_value(),
-                ping_core::ping_record_pda(receiver_id).into_value(),
+                lee::ProgramShardSelector::new(
+                    ping_core::receiver_config_account_id(receiver_id),
+                    receiver_id,
+                ),
+                lee::ProgramShardSelector::new(
+                    ping_core::ping_record_pda(receiver_id),
+                    receiver_id,
+                ),
             ],
             b"hi".to_vec(),
         ))

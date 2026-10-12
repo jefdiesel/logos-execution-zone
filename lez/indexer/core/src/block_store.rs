@@ -8,7 +8,7 @@ use common::{
     block::{BedrockStatus, Block, BlockHeader},
     transaction::{LeeTransaction, TxEvents},
 };
-use lee::{Account, AccountId, V03State};
+use lee::{Account, AccountId, ProgramShardSelector, V03State};
 use lee_core::BlockId;
 use log::warn;
 use logos_blockchain_core::header::HeaderId;
@@ -256,6 +256,22 @@ impl IndexerStore {
             .get_account_by_id(*account_id))
     }
 
+    pub async fn account_current_view(&self, selector: ProgramShardSelector) -> Result<Account> {
+        let state = self.current_state.read().await;
+        Ok(project_account(&state, selector))
+    }
+
+    pub fn account_view_at_block(
+        &self,
+        selector: ProgramShardSelector,
+        block_id: u64,
+    ) -> Result<Account> {
+        Ok(project_account(
+            &self.get_state_at_block(block_id)?,
+            selector,
+        ))
+    }
+
     /// The last successfully applied block, or `None` on a cold store.
     /// Read fresh from the store each call.
     fn validated_tip(&self) -> Result<Option<Tip>> {
@@ -337,8 +353,17 @@ impl IndexerStore {
         if let Err(err) = self.clear_stall_if_present() {
             warn!("Failed to clear stall marker after applying block: {err:#}");
         }
-        Ok(AcceptOutcome::Applied)
+        // Indexer writes logs directly into DB, they are redundant here.
+        Ok(AcceptOutcome::Applied(Vec::new()))
     }
+}
+
+fn project_account(state: &V03State, selector: ProgramShardSelector) -> Account {
+    state
+        .get_account_by_id_ref(selector.account_id)
+        .map_or_else(Account::default, |account| {
+            account.project([selector.program_account_id])
+        })
 }
 
 // A filter change takes effect at the next ingested block: rows up to the old
@@ -392,7 +417,7 @@ fn open_with(home: &Path, filter: EventFilter) -> IndexerStore {
     IndexerStore::open_db(
         home,
         true,
-        vec![common::test_utils::claimed_producer_seed()],
+        vec![common::test_utils::producer_seed()],
         filter,
     )
     .expect("open store")
@@ -477,25 +502,25 @@ fn settled_test_block(
 ) -> common::block::Block {
     use common::{
         block::HashableBlockData,
-        test_utils::sequencer_sign_key_for_testing,
+        test_utils::producer_account_for_testing,
         transaction::{LeeTransaction, clock_invocation, fee_invocation},
     };
     let timestamp = id.saturating_mul(100);
-    let summary = chain_state::apply::derive_block_summary(state, &txs, id, timestamp)
+    let (summary, payout) = chain_state::apply::derive_block_summary(state, &txs, id, timestamp)
         .expect("test transactions settle");
-    let producer = lee::AccountId::from(&lee::PublicKey::new_from_private_key(
-        &sequencer_sign_key_for_testing(),
-    ));
+    let producer = producer_account_for_testing();
     let mut transactions = txs;
-    transactions.push(LeeTransaction::Public(fee_invocation(summary, producer)));
-    transactions.push(LeeTransaction::Public(clock_invocation(timestamp)));
+    transactions.push(LeeTransaction::Public(fee_invocation(
+        summary, payout, producer,
+    )));
+    transactions.push(LeeTransaction::Public(clock_invocation(id, timestamp)));
     let block = HashableBlockData {
         block_id: id,
         prev_block_hash: prev_hash.unwrap_or_default(),
         timestamp,
         transactions,
     }
-    .into_pending_block(&sequencer_sign_key_for_testing());
+    .into_pending_block();
     chain_state::apply::apply_block_to_state(&block, state).expect("settled block applies");
     block
 }
@@ -506,7 +531,7 @@ fn settled_test_block(
 #[cfg(test)]
 fn claimed_build_state() -> lee::V03State {
     testnet_initial_state::initial_state(true)
-        .with_public_accounts([common::test_utils::claimed_producer_seed()])
+        .with_public_accounts([common::test_utils::producer_seed()])
 }
 
 #[cfg(test)]
@@ -514,6 +539,7 @@ mod tests {
     use std::collections::{HashMap, HashSet};
 
     use common::test_utils::{create_transaction_native_token_transfer, produce_dummy_block};
+    use lee::ProgramShardSelector;
     use lee_core::program::{InstructionData, ProgramEvent};
     use storage::{DBIO as _, indexer::indexer_cells::EventFilterSegmentsCellOwned};
     use tempfile::tempdir;
@@ -544,45 +570,85 @@ mod tests {
         AccountId::from(&lee::PublicKey::new_from_private_key(&emitter_header_key()))
     }
 
-    // Deploys the emitter guest through `program_loader`: a `WriteSegment` claiming a fresh
-    // segment account, then a `CreateHeader` claiming a fresh header account that points at it.
-    // Both land in the same block, in order, so the header's `CreateHeader` sees the segment
-    // the preceding transaction just committed. Both are ordinary (non-exempt) public
-    // transactions, so each needs its own fee declaration; a funded genesis account co-signs
-    // as payer since the freshly-claimed segment/header accounts hold nothing to self-pay with.
+    // Deploys the emitter guest through `program_loader`, chunked into `WriteSegment`s. A
+    // funded genesis account co-signs every transaction as payer, since new accounts can't
+    // self-pay.
     fn deploy_emitter_txs() -> Vec<LeeTransaction> {
         let payer = &initial_pub_accounts_private_keys()[0];
-        let segment_key = lee::PrivateKey::try_new([200; 32]).unwrap();
-        let segment_id = AccountId::from(&lee::PublicKey::new_from_private_key(&segment_key));
         let header_key = emitter_header_key();
         let header_id = emitter_header_account_id();
 
-        let segment_message = lee::public_transaction::Message::try_new_with_fees(
-            lee_core::program::PROGRAM_LOADER_ACCOUNT_ID,
-            vec![segment_id],
-            vec![lee_core::account::Nonce(0), lee_core::account::Nonce(0)],
-            program_loader_core::Instruction::WriteSegment {
-                bytecode: test_methods::EVENT_EMITTER_ELF.to_vec(),
-                next_segment: None,
-            },
-            common::test_utils::test_fee_declaration(payer.account_id),
-        )
-        .expect("WriteSegment instruction data should always be serializable");
-        let segment_witness_set = lee::public_transaction::WitnessSet::for_message(
-            &segment_message,
-            &[&segment_key, &payer.pub_sign_key],
-        );
-        let segment_tx = LeeTransaction::Public(lee::PublicTransaction::new(
-            segment_message,
-            segment_witness_set,
-        ));
+        // Segments only ever hold `user_elf`.
+        let user_elf = risc0_binfmt::ProgramBinary::decode(test_methods::EVENT_EMITTER_ELF)
+            .expect("EVENT_EMITTER_ELF must be a valid ProgramBinary")
+            .user_elf
+            .to_vec();
+        let chunks: Vec<&[u8]> = user_elf
+            .chunks(program_loader_core::MAX_SEGMENT_DATA_LEN)
+            .collect();
+        // Base 210 avoids colliding with `emitter_header_key`'s [201; 32].
+        let segment_keys: Vec<lee::PrivateKey> = (0..chunks.len())
+            .map(|i| {
+                lee::PrivateKey::try_new([u8::try_from(i).unwrap().saturating_add(210); 32])
+                    .unwrap()
+            })
+            .collect();
+        let segment_ids: Vec<AccountId> = segment_keys
+            .iter()
+            .map(|key| AccountId::from(&lee::PublicKey::new_from_private_key(key)))
+            .collect();
 
+        let mut txs = Vec::with_capacity(chunks.len().saturating_add(1));
+        let mut payer_nonce = 0_u128;
+        for i in (0..chunks.len()).rev() {
+            let mut write_segment_account_ids = vec![segment_ids[i]];
+            write_segment_account_ids.extend(segment_ids.get(i.saturating_add(1)).copied());
+            let segment_message = lee::public_transaction::Message::try_new_with_fees(
+                lee_core::program::PROGRAM_LOADER_ACCOUNT_ID,
+                write_segment_account_ids
+                    .into_iter()
+                    .map(|id| {
+                        ProgramShardSelector::new(id, lee_core::program::PROGRAM_LOADER_ACCOUNT_ID)
+                    })
+                    .collect(),
+                vec![
+                    lee_core::account::Nonce(0),
+                    lee_core::account::Nonce(payer_nonce),
+                ],
+                program_loader_core::Instruction::WriteSegment {
+                    bytecode: chunks[i].to_vec(),
+                    next_segment: segment_ids.get(i.saturating_add(1)).copied(),
+                },
+                common::test_utils::test_fee_declaration(payer.account_id),
+            )
+            .expect("WriteSegment instruction data should always be serializable");
+            let segment_witness_set = lee::public_transaction::WitnessSet::for_message(
+                &segment_message,
+                &[&segment_keys[i], &payer.pub_sign_key],
+            );
+            txs.push(LeeTransaction::Public(lee::PublicTransaction::new(
+                segment_message,
+                segment_witness_set,
+            )));
+            payer_nonce = payer_nonce.saturating_add(1);
+        }
+
+        let mut header_account_ids = vec![header_id];
+        header_account_ids.extend(&segment_ids);
         let header_message = lee::public_transaction::Message::try_new_with_fees(
             lee_core::program::PROGRAM_LOADER_ACCOUNT_ID,
-            vec![header_id, segment_id],
-            vec![lee_core::account::Nonce(0), lee_core::account::Nonce(1)],
+            header_account_ids
+                .into_iter()
+                .map(|id| {
+                    ProgramShardSelector::new(id, lee_core::program::PROGRAM_LOADER_ACCOUNT_ID)
+                })
+                .collect(),
+            vec![
+                lee_core::account::Nonce(0),
+                lee_core::account::Nonce(payer_nonce),
+            ],
             program_loader_core::Instruction::CreateHeader {
-                first_segment: segment_id,
+                first_segment: segment_ids[0],
                 immutable: true,
             },
             common::test_utils::test_fee_declaration(payer.account_id),
@@ -592,21 +658,32 @@ mod tests {
             &header_message,
             &[&header_key, &payer.pub_sign_key],
         );
-        let header_tx = LeeTransaction::Public(lee::PublicTransaction::new(
+        txs.push(LeeTransaction::Public(lee::PublicTransaction::new(
             header_message,
             header_witness_set,
-        ));
+        )));
 
-        vec![segment_tx, header_tx]
+        txs
     }
 
     fn invoke_emitter_tx(events: Vec<ProgramEvent>) -> LeeTransaction {
         // create message with payer so that it's not rejected due to missing fee declaration
         let payer = &initial_pub_accounts_private_keys()[0];
+        // The payer's next nonce after `deploy_emitter_txs`'s chunked deploy.
+        let user_elf = risc0_binfmt::ProgramBinary::decode(test_methods::EVENT_EMITTER_ELF)
+            .expect("EVENT_EMITTER_ELF must be a valid ProgramBinary")
+            .user_elf
+            .to_vec();
+        let chunk_count = user_elf
+            .chunks(program_loader_core::MAX_SEGMENT_DATA_LEN)
+            .count();
+        let payer_nonce = u128::try_from(chunk_count.saturating_add(1)).unwrap();
         let message = lee::public_transaction::Message::try_new_with_fees(
             emitter_header_account_id(),
-            vec![AccountId::new([42; 32])],
-            vec![2_u128.into()],
+            vec![ProgramShardSelector::native_balance(AccountId::new(
+                [42; 32],
+            ))],
+            vec![payer_nonce.into()],
             EmitterInstruction {
                 events,
                 chain: vec![],
@@ -632,7 +709,7 @@ mod tests {
             .expect("genesis applies");
         assert!(matches!(
             store.accept_block(&genesis, Slot::from(0)).await.unwrap(),
-            AcceptOutcome::Applied
+            AcceptOutcome::Applied(_)
         ));
 
         let deploy_block = settled_test_block(
@@ -646,7 +723,7 @@ mod tests {
                 .accept_block(&deploy_block, Slot::from(0))
                 .await
                 .unwrap(),
-            AcceptOutcome::Applied
+            AcceptOutcome::Applied(_)
         ));
 
         let invoke = invoke_emitter_tx(vec![emitted(0), emitted(1)]);
@@ -662,7 +739,7 @@ mod tests {
                 .accept_block(&invoke_block, Slot::from(0))
                 .await
                 .unwrap(),
-            AcceptOutcome::Applied
+            AcceptOutcome::Applied(_)
         ));
 
         invoke_hash
@@ -691,15 +768,23 @@ mod tests {
 
         // Genesis (block 1): fee/clock only.
         let mut build_state = claimed_build_state();
-        let initial_from = build_state.get_account_by_id(from).balance;
-        let initial_to = build_state.get_account_by_id(to).balance;
+        let initial_from = build_state
+            .get_account_by_id(from)
+            .data
+            .native_balance()
+            .unwrap();
+        let initial_to = build_state
+            .get_account_by_id(to)
+            .data
+            .native_balance()
+            .unwrap();
         let genesis = produce_dummy_block(1, None, vec![]);
         chain_state::apply::apply_block_to_state(&genesis, &mut build_state)
             .expect("genesis applies");
         let mut prev_hash = genesis.header.hash;
         assert!(matches!(
             store.accept_block(&genesis, Slot::from(0)).await.unwrap(),
-            AcceptOutcome::Applied
+            AcceptOutcome::Applied(_)
         ));
 
         // Blocks 2..=11: one charged native transfer of 10 each (nonces 0..=9).
@@ -709,14 +794,29 @@ mod tests {
             prev_hash = block.header.hash;
             assert!(matches!(
                 store.accept_block(&block, Slot::from(0)).await.unwrap(),
-                AcceptOutcome::Applied
+                AcceptOutcome::Applied(_)
             ));
         }
 
         // The recipient gains exactly the transfers; the sender also pays fees.
-        assert!(store.account_current_state(&from).await.unwrap().balance < initial_from - 100);
+        assert!(
+            store
+                .account_current_state(&from)
+                .await
+                .unwrap()
+                .data
+                .native_balance()
+                .unwrap()
+                < initial_from - 100
+        );
         assert_eq!(
-            store.account_current_state(&to).await.unwrap().balance,
+            store
+                .account_current_state(&to)
+                .await
+                .unwrap()
+                .data
+                .native_balance()
+                .unwrap(),
             initial_to + 100
         );
         // Tip advanced to the last applied block; a clean run leaves no stall.
@@ -735,8 +835,16 @@ mod tests {
         let sign_key = initial_accounts[0].pub_sign_key.clone();
 
         let mut build_state = claimed_build_state();
-        let initial_from = build_state.get_account_by_id(from).balance;
-        let initial_to = build_state.get_account_by_id(to).balance;
+        let initial_from = build_state
+            .get_account_by_id(from)
+            .data
+            .native_balance()
+            .unwrap();
+        let initial_to = build_state
+            .get_account_by_id(to)
+            .data
+            .native_balance()
+            .unwrap();
         let genesis = produce_dummy_block(1, None, vec![]);
         chain_state::apply::apply_block_to_state(&genesis, &mut build_state)
             .expect("genesis applies");
@@ -753,24 +861,60 @@ mod tests {
         // State at block N is inclusive of block N.
         // Block 1 (genesis, clock-only): no transfers yet.
         assert_eq!(
-            store.account_state_at_block(&from, 1).unwrap().balance,
+            store
+                .account_state_at_block(&from, 1)
+                .unwrap()
+                .data
+                .native_balance()
+                .unwrap(),
             initial_from
         );
         assert_eq!(
-            store.account_state_at_block(&to, 1).unwrap().balance,
+            store
+                .account_state_at_block(&to, 1)
+                .unwrap()
+                .data
+                .native_balance()
+                .unwrap(),
             initial_to
         );
         // Through block 5: 4 transfers applied (blocks 2..=5); the sender also
         // pays a fee per charged transfer.
-        assert!(store.account_state_at_block(&from, 5).unwrap().balance < initial_from - 40);
+        assert!(
+            store
+                .account_state_at_block(&from, 5)
+                .unwrap()
+                .data
+                .native_balance()
+                .unwrap()
+                < initial_from - 40
+        );
         assert_eq!(
-            store.account_state_at_block(&to, 5).unwrap().balance,
+            store
+                .account_state_at_block(&to, 5)
+                .unwrap()
+                .data
+                .native_balance()
+                .unwrap(),
             initial_to + 40
         );
         // Through block 9: 8 transfers applied (blocks 2..=9).
-        assert!(store.account_state_at_block(&from, 9).unwrap().balance < initial_from - 80);
+        assert!(
+            store
+                .account_state_at_block(&from, 9)
+                .unwrap()
+                .data
+                .native_balance()
+                .unwrap()
+                < initial_from - 80
+        );
         assert_eq!(
-            store.account_state_at_block(&to, 9).unwrap().balance,
+            store
+                .account_state_at_block(&to, 9)
+                .unwrap()
+                .data
+                .native_balance()
+                .unwrap(),
             initial_to + 80
         );
     }
@@ -1186,12 +1330,9 @@ mod tests {
 #[cfg(test)]
 mod accept_tests {
     use common::{HashType, block::HashableBlockData, test_utils::produce_dummy_block};
+    use lee::ProgramShardSelector;
 
     use super::*;
-
-    fn signing_key() -> lee::PrivateKey {
-        lee::PrivateKey::try_new([7_u8; 32]).expect("valid key")
-    }
 
     // A block with a correct hash but empty body — enough to exercise the
     // acceptance checks (id/link/hash), which run before any state application.
@@ -1202,7 +1343,7 @@ mod accept_tests {
             timestamp: 0,
             transactions: vec![],
         }
-        .into_pending_block(&signing_key())
+        .into_pending_block()
     }
 
     #[tokio::test]
@@ -1294,7 +1435,7 @@ mod accept_tests {
         let genesis = produce_dummy_block(1, None, vec![]);
         assert!(matches!(
             store.accept_block(&genesis, Slot::from(0)).await.unwrap(),
-            AcceptOutcome::Applied
+            AcceptOutcome::Applied(_)
         ));
 
         // A block that skips ahead (id 3 while the tip is 1) parks the indexer.
@@ -1320,7 +1461,7 @@ mod accept_tests {
         let next = produce_dummy_block(2, Some(genesis.header.hash), vec![]);
         assert!(matches!(
             store.accept_block(&next, Slot::from(0)).await.unwrap(),
-            AcceptOutcome::Applied
+            AcceptOutcome::Applied(_)
         ));
         assert!(
             store.get_stall_reason().unwrap().is_none(),
@@ -1406,9 +1547,15 @@ mod accept_tests {
         );
         assert!(matches!(
             store.accept_block(&block, Slot::from(0)).await.unwrap(),
-            AcceptOutcome::Applied
+            AcceptOutcome::Applied(_)
         ));
-        let balance_after = store.account_current_state(&from).await.unwrap().balance;
+        let balance_after = store
+            .account_current_state(&from)
+            .await
+            .unwrap()
+            .data
+            .native_balance()
+            .unwrap();
 
         // Re-deliver the exact same block: idempotent skip, no state change, no park.
         assert!(matches!(
@@ -1416,7 +1563,13 @@ mod accept_tests {
             AcceptOutcome::AlreadyApplied
         ));
         assert_eq!(
-            store.account_current_state(&from).await.unwrap().balance,
+            store
+                .account_current_state(&from)
+                .await
+                .unwrap()
+                .data
+                .native_balance()
+                .unwrap(),
             balance_after,
             "re-delivered block must not be applied twice"
         );
@@ -1464,7 +1617,7 @@ mod accept_tests {
         );
         assert!(matches!(
             store.accept_block(&block2, Slot::from(0)).await.unwrap(),
-            AcceptOutcome::Applied
+            AcceptOutcome::Applied(_)
         ));
 
         let tx3 = common::test_utils::create_transaction_native_token_transfer(
@@ -1478,10 +1631,16 @@ mod accept_tests {
         );
         assert!(matches!(
             store.accept_block(&block3, Slot::from(0)).await.unwrap(),
-            AcceptOutcome::Applied
+            AcceptOutcome::Applied(_)
         ));
 
-        let balance_after = store.account_current_state(&from).await.unwrap().balance;
+        let balance_after = store
+            .account_current_state(&from)
+            .await
+            .unwrap()
+            .data
+            .native_balance()
+            .unwrap();
 
         // Re-deliver block 2 (id below the tip): a re-delivery, not a divergence.
         assert!(matches!(
@@ -1489,7 +1648,13 @@ mod accept_tests {
             AcceptOutcome::AlreadyApplied
         ));
         assert_eq!(
-            store.account_current_state(&from).await.unwrap().balance,
+            store
+                .account_current_state(&from)
+                .await
+                .unwrap()
+                .data
+                .native_balance()
+                .unwrap(),
             balance_after,
             "re-delivered block below the tip must not be applied again"
         );
@@ -1517,13 +1682,17 @@ mod accept_tests {
         let sign_key = accounts[0].pub_sign_key.clone();
 
         let mut build_state = claimed_build_state();
-        let initial_from = build_state.get_account_by_id(from).balance;
+        let initial_from = build_state
+            .get_account_by_id(from)
+            .data
+            .native_balance()
+            .unwrap();
         let genesis = produce_dummy_block(1, None, vec![]);
         chain_state::apply::apply_block_to_state(&genesis, &mut build_state)
             .expect("genesis applies");
         assert!(matches!(
             store.accept_block(&genesis, Slot::from(0)).await.unwrap(),
-            AcceptOutcome::Applied
+            AcceptOutcome::Applied(_)
         ));
         let mut prev_hash = genesis.header.hash;
 
@@ -1546,14 +1715,14 @@ mod accept_tests {
             prev_hash = block.header.hash;
             assert!(matches!(
                 store.accept_block(&block, Slot::from(0)).await.unwrap(),
-                AcceptOutcome::Applied
+                AcceptOutcome::Applied(_)
             ));
         }
 
         // Snapshot at block 100 = genesis + 99 transfers (plus their fees),
         // written with the block.
         let bp1 = store.dbio.get_breakpoint(1).expect("breakpoint 1 present");
-        assert!(bp1.get_account_by_id(from).balance < initial_from - 99);
+        assert!(bp1.get_account_by_id(from).data.native_balance().unwrap() < initial_from - 99);
 
         // The #605 restart: reopening past the boundary must work.
         drop(store);
@@ -1578,10 +1747,10 @@ mod accept_tests {
         // longer works here: it reverts-with-fee inside a valid block.
         let bogus_deposit = {
             let message = lee::public_transaction::Message::try_new(
-                programs::bridge().id().into(),
+                programs::bridge_account_id(),
                 vec![
-                    lee::AccountId::new([1_u8; 32]),
-                    lee::AccountId::new([2_u8; 32]),
+                    ProgramShardSelector::native_balance(lee::AccountId::new([1_u8; 32])),
+                    ProgramShardSelector::native_balance(lee::AccountId::new([2_u8; 32])),
                 ],
                 vec![],
                 bridge_core::Instruction::Deposit {

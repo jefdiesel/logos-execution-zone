@@ -1,9 +1,16 @@
 use borsh::{BorshDeserialize, BorshSerialize};
-use lee_core::{account::AccountId, program::PdaSeed};
+use lee_core::{
+    account::{AccountId, ProgramShardSelector},
+    program::PdaSeed,
+};
 
 const PING_RECORD_SEED: [u8; 32] = *b"/LEZ/v0.3/PingRecord/0000000000/";
 const SENDER_CONFIG_SEED: [u8; 32] = *b"/LEZ/v0.3/PingSenderCfg/0000000/";
 const RECEIVER_CONFIG_SEED: [u8; 32] = *b"/LEZ/v0.3/PingReceiverCfg/00000/";
+
+pub const PING_SENDER_NAME: [u8; 11] = *b"ping_sender";
+pub const PING_RECEIVER_NAME: [u8; 13] = *b"ping_receiver";
+
 /// Raw 32-byte zone (channel) id, matching the inbox's.
 pub type ZoneId = [u8; 32];
 
@@ -19,7 +26,7 @@ pub enum ReceiverInstruction {
     /// the record PDA.
     Record { payload: Vec<u8> },
     /// Pins the deliverer and the peer sources it may deliver from, written once
-    /// into a default config PDA at genesis. A re-run holding anything different
+    /// into an empty config shard at genesis. A re-run holding anything different
     /// is refused; an identical one is a no-op, which is what genesis replay does.
     ///
     /// Required accounts (1): the receiver config PDA.
@@ -86,11 +93,11 @@ pub enum SenderInstruction {
     Send {
         target_zone: [u8; 32],
         target_account_id: AccountId,
-        target_accounts: Vec<[u8; 32]>,
+        target_accounts: Vec<ProgramShardSelector>,
         payload: Vec<u8>,
         ordinal: u32,
     },
-    /// Pins the outbox program, written once into a default config PDA at
+    /// Pins the outbox program, written once into an empty config shard at
     /// genesis. A re-run naming a different outbox is refused; an identical one
     /// is a no-op, which is what genesis replay does.
     ///
@@ -98,10 +105,17 @@ pub enum SenderInstruction {
     InitConfig { outbox_account_id: AccountId },
 }
 
+#[must_use]
+pub fn ping_sender_account_id() -> AccountId {
+    AccountId::from_builtin_program_name(&PING_SENDER_NAME)
+}
+
+#[must_use]
+pub fn ping_receiver_account_id() -> AccountId {
+    AccountId::from_builtin_program_name(&PING_RECEIVER_NAME)
+}
+
 /// The account a `ping_receiver` records the latest delivered payload into.
-///
-/// TODO(squatting): a derivable address; a squatter who writes data first owns
-/// it and denies the demo flow.
 #[must_use]
 pub fn ping_record_pda(receiver_id: AccountId) -> AccountId {
     AccountId::for_public_pda(&receiver_id, &ping_record_seed())

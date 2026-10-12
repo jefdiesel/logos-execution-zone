@@ -2,9 +2,12 @@ use std::borrow::Cow;
 
 use borsh::{BorshDeserialize, BorshSerialize};
 use lee_core::{
-    account::{AccountId, AccountWithMetadata, Cycles},
+    account::{AccountId, Cycles, ShardData},
     from_frame,
-    program::{CallKind, InstructionData, ProgramId, ProgramInput, ProgramOutput},
+    program::{
+        ApplyInput, ApplyOutput, CallKind, GuestOutput, InstructionData, PlanInput, PlanOutput,
+        ProgramId, get_program_via,
+    },
     to_borsh_frame, to_frame,
 };
 #[cfg(not(feature = "prove"))]
@@ -66,6 +69,13 @@ impl Program {
         &self.elf
     }
 
+    pub fn user_elf(&self) -> Result<Vec<u8>, LeeError> {
+        Ok(risc0_binfmt::ProgramBinary::decode(&self.elf)
+            .map_err(LeeError::InvalidProgramBytecode)?
+            .user_elf
+            .to_vec())
+    }
+
     pub fn serialize_instruction<T: BorshSerialize>(
         instruction: T,
     ) -> Result<InstructionData, LeeError> {
@@ -73,38 +83,38 @@ impl Program {
             .map_err(|e| LeeError::InstructionSerializationError(e.to_string()))
     }
 
-    pub(crate) fn execute(
+    pub(crate) fn plan(
         &self,
-        self_account_id: AccountId,
-        caller_account_id: Option<AccountId>,
-        pre_states: &[AccountWithMetadata],
-        instruction_data: &InstructionData,
+        input: &PlanInput,
         cycle_budget: Cycles,
-    ) -> Result<(ProgramOutput, Cycles), LeeError> {
-        // Write inputs to the program
+    ) -> Result<(PlanOutput, Cycles), LeeError> {
+        let (journal, cycles) =
+            self.run(|env| Self::write_plan_inputs(input, env), cycle_budget)?;
+        Ok((plan_journal(&journal)?, cycles))
+    }
+
+    pub(crate) fn apply(
+        &self,
+        input: &ApplyInput,
+        cycle_budget: Cycles,
+    ) -> Result<(ApplyOutput, Cycles), LeeError> {
+        let (journal, cycles) =
+            self.run(|env| Self::write_apply_inputs(input, env), cycle_budget)?;
+        Ok((apply_journal(&journal)?, cycles))
+    }
+
+    fn run(
+        &self,
+        write: impl FnOnce(&mut ExecutorEnvBuilder) -> Result<(), LeeError>,
+        cycle_budget: Cycles,
+    ) -> Result<(Vec<u8>, Cycles), LeeError> {
         let mut env_builder = ExecutorEnv::builder();
         env_builder.session_limit(Some(cycle_budget));
-        self.write_inputs(
-            self_account_id,
-            caller_account_id,
-            pre_states,
-            instruction_data,
-            &mut env_builder,
-        )?;
+        write(&mut env_builder)?;
         let env = env_builder.build().unwrap();
 
-        // Execute the program (without proving)
         let session = Self::execute_session(env, self.elf(), cycle_budget)?;
-        let cycles = session.cycles;
-
-        // Get outputs
-        let payload = from_frame(&session.journal).ok_or_else(|| {
-            LeeError::ProgramExecutionFailed("malformed program journal frame".to_owned())
-        })?;
-        let program_output = borsh::from_slice(payload)
-            .map_err(|e| LeeError::ProgramExecutionFailed(e.to_string()))?;
-
-        Ok((program_output, cycles))
+        Ok((session.journal, session.cycles))
     }
 
     /// Runs the session, translating the executor's session-limit bail into the
@@ -153,26 +163,29 @@ impl Program {
         Ok(outcome)
     }
 
-    /// Writes a `CallKind::Execute` frame followed by the guest's `ProgramInput` as a single
-    /// length-prefixed borsh frame, the form `read_lee_call` expects.
-    pub fn write_inputs(
-        &self,
-        self_account_id: AccountId,
-        caller_account_id: Option<AccountId>,
-        pre_states: &[AccountWithMetadata],
-        instruction_data: &[u8],
+    pub fn write_plan_inputs(
+        input: &PlanInput,
         env_builder: &mut ExecutorEnvBuilder,
     ) -> Result<(), LeeError> {
-        env_builder.write_slice(&to_borsh_frame(&CallKind::Execute));
+        Self::write_call(CallKind::Plan, input, env_builder)
+    }
 
-        let input = ProgramInput {
-            self_account_id,
-            caller_account_id,
-            pre_states: pre_states.to_vec(),
-            instruction: instruction_data.to_vec(),
-        };
+    pub fn write_apply_inputs(
+        input: &ApplyInput,
+        env_builder: &mut ExecutorEnvBuilder,
+    ) -> Result<(), LeeError> {
+        Self::write_call(CallKind::Apply, input, env_builder)
+    }
+
+    fn write_call<T: BorshSerialize>(
+        kind: CallKind,
+        payload: &T,
+        env_builder: &mut ExecutorEnvBuilder,
+    ) -> Result<(), LeeError> {
+        env_builder.write_slice(&to_borsh_frame(&kind));
+
         let payload =
-            borsh::to_vec(&input).map_err(|e| LeeError::ProgramWriteInputFailed(e.to_string()))?;
+            borsh::to_vec(payload).map_err(|e| LeeError::ProgramWriteInputFailed(e.to_string()))?;
         env_builder.write_slice(&to_frame(&payload));
         Ok(())
     }
@@ -203,4 +216,49 @@ pub(crate) fn check_exit_code(
             Err(on_failure(format!("unexpected exit {exit_code:?}")))
         }
     }
+}
+
+/// Re-attaches the protocol's fixed kernel ELF to `user_elf`, producing a full `ProgramBinary`
+/// blob ready to decode and execute.
+pub(crate) fn attach_kernel(user_elf: &[u8]) -> Vec<u8> {
+    risc0_binfmt::ProgramBinary::new(user_elf, risc0_zkos_v1compat::V1COMPAT_ELF).encode()
+}
+
+/// Resolves whatever's deployed at `account_id` into a runnable ELF via [`get_program_via`],
+/// then re-attaches the kernel.
+pub(crate) fn resolve_program<'state>(
+    account_id: AccountId,
+    loader_shard: impl Fn(AccountId) -> Option<&'state ShardData>,
+) -> Option<(ProgramId, Vec<u8>)> {
+    let (image_id, user_elf) = get_program_via(account_id, loader_shard)?;
+    Some((image_id, attach_kernel(&user_elf)))
+}
+
+pub(crate) fn decode_guest_output(journal: &[u8]) -> Result<GuestOutput, LeeError> {
+    let payload = from_frame(journal).ok_or_else(|| {
+        LeeError::ProgramExecutionFailed("malformed program journal frame".to_owned())
+    })?;
+    borsh::from_slice(payload).map_err(|e| LeeError::ProgramExecutionFailed(e.to_string()))
+}
+
+/// A journal of the other entrypoint's shape is a hard reject, not a decode fallback: it is
+/// what stops a plan receipt standing in for an apply receipt under one image id.
+pub(crate) fn plan_journal(journal: &[u8]) -> Result<PlanOutput, LeeError> {
+    match decode_guest_output(journal)? {
+        GuestOutput::Plan(plan) => Ok(plan),
+        GuestOutput::Apply(_) => Err(wrong_entrypoint("plan", "an apply")),
+    }
+}
+
+pub(crate) fn apply_journal(journal: &[u8]) -> Result<ApplyOutput, LeeError> {
+    match decode_guest_output(journal)? {
+        GuestOutput::Apply(output) => Ok(output),
+        GuestOutput::Plan(_) => Err(wrong_entrypoint("apply", "a plan")),
+    }
+}
+
+fn wrong_entrypoint(scheduled: &str, returned: &str) -> LeeError {
+    LeeError::ProgramExecutionFailed(format!(
+        "a scheduled {scheduled} returned {returned} journal"
+    ))
 }

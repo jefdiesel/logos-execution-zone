@@ -16,7 +16,8 @@
         "channel_params": {
             "minimum_sequencer_stake": 149,
             "posting_timeframe": 300,
-            "posting_timeout": 25
+            "posting_timeout": 25,
+            "exit_delay": 100
         }
     },
     "gossip": {
@@ -48,39 +49,5 @@
                 "balance": 20000000000000
             }
         }
-    ],
-    "signing_key": [
-        37,
-        37,
-        37,
-        37,
-        37,
-        37,
-        37,
-        37,
-        37,
-        37,
-        37,
-        37,
-        37,
-        37,
-        37,
-        37,
-        37,
-        37,
-        37,
-        37,
-        37,
-        37,
-        37,
-        37,
-        37,
-        37,
-        37,
-        37,
-        37,
-        37,
-        37,
-        37
     ]
 }

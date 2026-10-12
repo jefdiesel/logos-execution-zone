@@ -11,10 +11,10 @@ workspace = true
 # LEZ and workspace crates.
 borsh.workspace = true
 test_fixtures.workspace = true
-lee_core = { workspace = true, features = ["host"] }
+lee_core = { workspace = true, features = ["test_utils"] }
 lee.workspace = true
-authenticated_transfer_core.workspace = true
 sequencer_core.workspace = true
+sequencer_bedrock_actor = { workspace = true, features = ["actor"] }
 wallet.workspace = true
 common.workspace = true
 key_protocol.workspace = true
@@ -26,18 +26,20 @@ cross_zone_inbox_core.workspace = true
 cross_zone_marker_core.workspace = true
 bridge_lock_core.workspace = true
 wrapped_token_core.workspace = true
-token_core.workspace = true
 indexer_service_rpc = { workspace = true, features = ["client"] }
 indexer_service.workspace = true
 sequencer_service_rpc = { workspace = true, features = ["client"] }
-sequencer_service.workspace = true
+sequencer_service = { workspace = true, features = ["rpc"] }
 wallet-ffi.workspace = true
 indexer_ffi.workspace = true
+sequencer_ffi.workspace = true
 indexer_service_protocol.workspace = true
 system_accounts.workspace = true
 sequencer_stake_core.workspace = true
 programs.workspace = true
 test_programs.workspace = true
+test_methods.workspace = true
+jsonrpsee = { workspace = true, features = ["jsonrpsee-types"] }
 testnet_initial_state.workspace = true
 program_loader_core.workspace = true
 
@@ -51,6 +53,7 @@ testing-framework-core.workspace = true
 # External dependencies.
 anyhow.workspace = true
 async-trait.workspace = true
+kameo.workspace = true
 bytesize.workspace = true
 cucumber = { features = [
   "macros",
@@ -67,7 +70,12 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 
 [dev-dependencies]
-sequencer_core = { workspace = true, features = ["test-utils"] }
+fee_core.workspace = true
+sequencer_core = { workspace = true }
+sequencer_bedrock_actor = { workspace = true, features = [
+  "actor",
+  "test-utils",
+] }
 
 [features]
 cucumber = ["dep:cucumber"]

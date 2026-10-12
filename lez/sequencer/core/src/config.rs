@@ -6,7 +6,7 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{Context as _, Result, ensure};
+use anyhow::{Result, ensure};
 use bytesize::ByteSize;
 use common::config::BasicAuth;
 pub use cross_zone_inbox_core::{CrossZoneConfig, CrossZonePeer, CrossZoneRoute};
@@ -89,13 +89,6 @@ pub struct SequencerConfig {
     /// Interval in which pending blocks are retried.
     #[serde(with = "humantime_serde")]
     pub retry_pending_blocks_timeout: Duration,
-    /// The key this sequencer signs its blocks with.
-    ///
-    /// Absent when the node is given one separately (`--signing-key`), which is
-    /// what lets a set of sequencers share a single config file — it is all
-    /// that otherwise differs between them.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub signing_key: Option<[u8; 32]>,
     /// Bedrock configuration options.
     pub bedrock_config: BedrockConfig,
     /// Genesis configuration.
@@ -155,14 +148,6 @@ impl SequencerConfig {
         Ok(config)
     }
 
-    /// The key [`Self::signing_key`] names, ready to sign blocks with.
-    pub fn block_signing_key(&self) -> Result<lee::PrivateKey> {
-        let bytes = self.signing_key.context(
-            "No block signing key: set `signing_key` in the config, or pass --signing-key",
-        )?;
-        lee::PrivateKey::try_new(bytes).context("Block signing key is not a valid private key")
-    }
-
     /// Where this sequencer's database lives, suffixed with the channel id like
     /// the indexer's, so several sequencers can share a home directory. Only the
     /// database is per-channel; `bedrock_signing_key` stays unsuffixed, so
@@ -203,5 +188,6 @@ pub const fn default_channel_params() -> ChannelParams {
         minimum_sequencer_stake: system_accounts::DEFAULT_MINIMUM_SEQUENCER_STAKE,
         posting_timeframe: system_accounts::DEFAULT_SEQUENCER_POSTING_TIMEFRAME,
         posting_timeout: system_accounts::DEFAULT_SEQUENCER_POSTING_TIMEOUT,
+        exit_delay: system_accounts::DEFAULT_SEQUENCER_EXIT_DELAY,
     }
 }

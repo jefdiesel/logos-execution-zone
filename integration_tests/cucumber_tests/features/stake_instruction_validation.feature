@@ -10,16 +10,12 @@ Feature: Stake instruction validation
   # non-inclusion protocol and its two-block window are described in
   # sequencer_registration.feature.
   #
-  # Instruction cases not yet covered here:
-  # - P-15, P-16 need no new test program: the mover instruction data is
-  #   caller-controlled and opaque to sequencer_stake, so authenticated_transfer
-  #   can be told to move a different amount than the Stake declares
-  # - P-19 needs a ConfirmStake chained from another program, rejected by the
-  #   self-caller guard; the stake_chain_caller program supports it
-  #
   # P-17 deploys a test program at runtime through program_loader, since test
   # guests are not in the node's compiled-in program set. A deployed program is
   # addressed by the header account its deployment claims, not by its image id.
+  #
+  # P-19 (a ConfirmStake chained from another program) has no target any more:
+  # Stake moves the funds natively and ConfirmStake is gone from the program.
 
   Background:
     Given a LEZ stack with fast blocks and configured public accounts
@@ -28,17 +24,6 @@ Feature: Stake instruction validation
     And a default-owned, unclaimed ownership account for the sequencer key
     And a funding account holding "ten times the minimum stake"
     And chain waits give up after 60 blocks
-
-  @stake_instruction_ci @P-18 @P0 @L3
-  # In-program reason: "ConfirmStake can only be invoked as a self-chained
-  # call". The expected balance matches the stake funds account, the account
-  # ConfirmStake reads, and the caller check is the handler's first assert,
-  # so it is the one that rejects. The ownership account signs because a
-  # top-level transaction needs a signer and the funds PDA has no key.
-  Scenario: ConfirmStake submitted top-level is rejected
-    When a ConfirmStake matching the current funds balance is submitted as a top-level transaction
-    Then the stake transaction is not included within the next 2 blocks
-    And the config, funding and ownership accounts are unchanged
 
   @stake_instruction_ci @P-17 @P1 @L3
   # In-program reason: "Stake is only invoked as a top-level user

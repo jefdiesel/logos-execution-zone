@@ -7,7 +7,7 @@ use lee::{
     GENESIS_BLOCK_ID, PublicTransaction,
     public_transaction::{Message, WitnessSet},
 };
-use lee_core::account::AccountId;
+use lee_core::account::{AccountId, ProgramShardSelector};
 use ping_core::{SenderInstruction, ping_record_pda, receiver_config_account_id};
 
 /// The peer's hash-linked chain from its genesis up to and including `last`,
@@ -31,18 +31,18 @@ pub fn ping_emission(
     target_account_id: AccountId,
     payload: &[u8],
 ) -> LeeTransaction {
-    let receiver_id: AccountId = programs::ping_receiver().id().into();
+    let receiver_id = programs::ping_receiver_account_id();
     let send = SenderInstruction::Send {
         target_zone,
         target_account_id,
         target_accounts: vec![
-            receiver_config_account_id(receiver_id).into_value(),
-            ping_record_pda(receiver_id).into_value(),
+            ProgramShardSelector::new(receiver_config_account_id(receiver_id), receiver_id),
+            ProgramShardSelector::new(ping_record_pda(receiver_id), receiver_id),
         ],
         payload: payload.to_vec(),
         ordinal: 0,
     };
-    let message = Message::try_new(programs::ping_sender().id().into(), vec![], vec![], send)
+    let message = Message::try_new(programs::ping_sender_account_id(), vec![], vec![], send)
         .expect("emission serializes");
     LeeTransaction::Public(PublicTransaction::new(
         message,

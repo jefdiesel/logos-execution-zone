@@ -31,25 +31,27 @@ fn settled_block(
 ) -> Block {
     use common::transaction::{LeeTransaction, clock_invocation, fee_invocation};
     let timestamp = id.saturating_mul(100);
-    let summary = if id == lee::GENESIS_BLOCK_ID {
+    let (summary, payout) = if id == lee::GENESIS_BLOCK_ID {
         // Genesis transactions are fee-exempt
-        fee_core::BlockFeeSummary::default()
+        let summary = fee_core::BlockFeeSummary::default();
+        let payout = chain_state::apply::opening_fee_state(state).apply_block(&summary);
+        (summary, payout)
     } else {
         chain_state::apply::derive_block_summary(state, &transactions, id, timestamp)
             .expect("test transactions settle")
     };
-    let producer = lee::AccountId::from(&lee::PublicKey::new_from_private_key(
-        &common::test_utils::sequencer_sign_key_for_testing(),
-    ));
-    transactions.push(LeeTransaction::Public(fee_invocation(summary, producer)));
-    transactions.push(LeeTransaction::Public(clock_invocation(timestamp)));
+    let producer = common::test_utils::producer_account_for_testing();
+    transactions.push(LeeTransaction::Public(fee_invocation(
+        summary, payout, producer,
+    )));
+    transactions.push(LeeTransaction::Public(clock_invocation(id, timestamp)));
     common::block::HashableBlockData {
         block_id: id,
         prev_block_hash: prev_hash,
         timestamp,
         transactions,
     }
-    .into_pending_block(&common::test_utils::sequencer_sign_key_for_testing())
+    .into_pending_block()
 }
 
 fn acc1_sign_key() -> lee::PrivateKey {
@@ -74,16 +76,7 @@ fn initial_state() -> lee::V03State {
         (acc2(), INITIAL_ACC2_BALANCE),
     ]
     .into_iter()
-    .map(|(id, balance)| {
-        (
-            id,
-            Account {
-                program_owner: programs::authenticated_transfer().id().into(),
-                balance,
-                ..Account::default()
-            },
-        )
-    })
+    .map(|(id, balance)| (id, Account::funded(balance)))
     .collect::<Vec<_>>();
 
     // push clock system accounts
@@ -100,19 +93,18 @@ fn initial_state() -> lee::V03State {
         system_accounts::fee_escrow_account_id(),
         system_accounts::fee_inbox_account_id(),
     ] {
-        public_accounts.push((fee_id, system_accounts::fee_account()));
+        public_accounts.push((fee_id, Account::default()));
     }
 
     // simulate the producer's stake so charged blocks
     // can credit its reward account
-    public_accounts.push(common::test_utils::claimed_producer_seed());
+    public_accounts.push(common::test_utils::producer_seed());
 
     lee::V03State::new()
         .with_public_accounts(public_accounts)
-        .with_programs([
-            programs::authenticated_transfer(),
-            programs::clock(),
-            programs::fee(),
+        .with_named_programs([
+            (programs::clock_account_id(), programs::clock()),
+            (programs::fee_account_id(), programs::fee()),
         ])
 }
 
@@ -194,13 +186,29 @@ fn one_block_insertion() {
     // The recipient gains exactly the transferred amount; the sender also
     // pays a real fee on top of it.
     assert_eq!(
-        final_state.get_account_by_id(acc2()).balance
-            - breakpoint.get_account_by_id(acc2()).balance,
+        final_state
+            .get_account_by_id(acc2())
+            .data
+            .native_balance()
+            .unwrap()
+            - breakpoint
+                .get_account_by_id(acc2())
+                .data
+                .native_balance()
+                .unwrap(),
         1
     );
     assert!(
-        breakpoint.get_account_by_id(acc1()).balance
-            - final_state.get_account_by_id(acc1()).balance
+        breakpoint
+            .get_account_by_id(acc1())
+            .data
+            .native_balance()
+            .unwrap()
+            - final_state
+                .get_account_by_id(acc1())
+                .data
+                .native_balance()
+                .unwrap()
             > 1
     );
 }
@@ -249,14 +257,22 @@ fn put_block_stores_breakpoint_in_same_batch() {
     }
 
     let bp1 = dbio.get_breakpoint(1).unwrap();
-    assert_eq!(bp1.get_account_by_id(acc1()).balance, INITIAL_ACC1_BALANCE);
-    assert_eq!(bp1.get_account_by_id(acc2()).balance, INITIAL_ACC2_BALANCE);
+    assert_eq!(
+        bp1.get_account_by_id(acc1()).data.native_balance().unwrap(),
+        INITIAL_ACC1_BALANCE
+    );
+    assert_eq!(
+        bp1.get_account_by_id(acc2()).data.native_balance().unwrap(),
+        INITIAL_ACC2_BALANCE
+    );
     // Only the boundary block schedules a write: breakpoint 0 must be the only other one.
     assert_eq!(
         dbio.get_breakpoint(0)
             .unwrap()
             .get_account_by_id(acc1())
-            .balance,
+            .data
+            .native_balance()
+            .unwrap(),
         INITIAL_ACC1_BALANCE
     );
 }
@@ -299,11 +315,21 @@ fn state_replay_falls_back_over_missing_breakpoints() {
     // pays a real fee per charged transfer (none in the genesis block, whose
     // transactions are exempt).
     assert_eq!(
-        final_state.get_account_by_id(acc2()).balance - INITIAL_ACC2_BALANCE,
+        final_state
+            .get_account_by_id(acc2())
+            .data
+            .native_balance()
+            .unwrap()
+            - INITIAL_ACC2_BALANCE,
         u128::from(BREAKPOINT_INTERVAL) + 1
     );
     assert!(
-        INITIAL_ACC1_BALANCE - final_state.get_account_by_id(acc1()).balance
+        INITIAL_ACC1_BALANCE
+            - final_state
+                .get_account_by_id(acc1())
+                .data
+                .native_balance()
+                .unwrap()
             > u128::from(BREAKPOINT_INTERVAL) + 1
     );
 }

@@ -6,7 +6,7 @@ use indexer_service::{ChannelId, ClientConfig, EventFilterConfig, IndexerConfig}
 use key_protocol::key_management::{KeyChain, secret_holders::SeedHolder};
 use lee::{AccountId, PrivateKey, PublicKey};
 use lee_core::Identifier;
-use logos_blockchain_key_management_system_service::keys::{Ed25519Key, ZkPublicKey};
+use logos_blockchain_key_management_system_service::keys::{UnsecuredEd25519Key, ZkPublicKey};
 use num_bigint::BigUint;
 use sequencer_core::{
     config::{
@@ -16,7 +16,7 @@ use sequencer_core::{
 };
 use sequencer_stake_core::SequencerKey;
 use url::Url;
-use wallet::config::{MultiSequencerClientConfig, SequencerConnectionData, WalletConfig};
+use wallet::config::{SequencerConnectionData, WalletConfig};
 
 /// Turn length the integration-test channels are created with.
 ///
@@ -27,6 +27,9 @@ pub const TEST_POSTING_TIMEFRAME: u32 = 20;
 
 /// Idle slots before the turn passes on; the production 25 outlasts the shortened timeframe.
 pub const TEST_POSTING_TIMEOUT: u32 = TEST_POSTING_TIMEFRAME;
+
+/// Blocks an unstake waits; the production 100 would outlast the exit tests.
+pub const TEST_EXIT_DELAY: u64 = 3;
 
 // Public balances are LGO-scale (`testnet_initial_state` precedent): charged
 // transactions reserve `gas_limit x base_fee` up front (~16M at wallet
@@ -39,15 +42,11 @@ pub const INITIAL_PRIVATE_BALANCES_FOR_WALLET: [u128; 2] = [10_000, 20_000];
 /// The public account for funding the private accounts' balances at genesis.
 pub(crate) const PRIVATE_FUNDER_INDEX: usize = 0;
 
-/// Fixed sequencer signing key; exposed so the fixture generator can reopen the produced store.
-pub const SEQUENCER_SIGNING_KEY: [u8; 32] = [37; 32];
-
-/// Key of the account holding the sequencer's genesis stake. Separate from
-/// [`SEQUENCER_SIGNING_KEY`]: block signing and stake control are distinct roles.
+/// Key of the account holding the sequencer's genesis stake.
 pub const SEQUENCER_STAKE_KEY: [u8; 32] = [55; 32];
 
-/// Bedrock signing key used by the prebuilt dump as first accredited key.
-pub const SEQUENCER_BEDROCK_SIGNING_KEY: [u8; 32] = [77; 32];
+/// Bedrock signing key of the test sequencer, staked in the prebuilt dump.
+pub const BEDROCK_SIGNING_KEY: [u8; 32] = [77; 32];
 
 // Fixed entropy seeds for the default accounts: deterministic so one prebuilt database is reusable,
 // and distinct from the `testnet_initial_state` accounts to avoid depending on / double-funding
@@ -58,6 +57,10 @@ const DEFAULT_PRIVATE_ACCOUNT_SEEDS: [[u8; 32]; 2] = [[0x33; 32], [0x44; 32]];
 // Keep this identity separate from the sorted public-account fixture ordering. The private pool
 // is funded by this account at genesis and when private accounts are initialized.
 const PRIVATE_FUNDER_ACCOUNT_SEED: [u8; 32] = [0x11; 32];
+
+/// Funding key of the Bedrock test node, matching `funding_pk` in `bedrock/node-config.yaml`.
+const BEDROCK_FUNDING_KEY_HEX: &str =
+    "2e03b2eff5a45478e7e79668d2a146cf2c5c7925bce927f2b1c67f2ab4fc0d26";
 
 #[derive(Clone)]
 pub struct InitialPrivateAccountForWallet {
@@ -99,6 +102,7 @@ impl Default for SequencerPartialConfig {
             channel_params: ChannelParams {
                 posting_timeframe: TEST_POSTING_TIMEFRAME,
                 posting_timeout: TEST_POSTING_TIMEOUT,
+                exit_delay: TEST_EXIT_DELAY,
                 ..sequencer_core::config::default_channel_params()
             },
         }
@@ -148,7 +152,6 @@ pub fn sequencer_config(
     funding_key: ZkPublicKey,
     genesis_transactions: Vec<GenesisAction>,
     cross_zone: Option<CrossZoneConfig>,
-    signing_key: Option<[u8; 32]>,
     gossip: Option<GossipConfig>,
 ) -> Result<SequencerConfig> {
     let SequencerPartialConfig {
@@ -168,7 +171,6 @@ pub fn sequencer_config(
         block_create_timeout,
         retry_pending_blocks_timeout: Duration::from_secs(5),
         genesis: genesis_transactions,
-        signing_key: Some(signing_key.unwrap_or(SEQUENCER_SIGNING_KEY)),
         bedrock_config: BedrockConfig {
             channel_id,
             node_url: addr_to_url(UrlProtocol::Http, bedrock_addr)
@@ -221,7 +223,7 @@ pub fn default_private_accounts_for_wallet() -> Vec<InitialPrivateAccountForWall
         .zip(INITIAL_PRIVATE_BALANCES_FOR_WALLET)
         .map(|(key_chain, balance)| InitialPrivateAccountForWallet {
             key_chain,
-            identifier: 0,
+            identifier: Identifier::ZERO,
             balance,
         })
         .collect()
@@ -281,27 +283,18 @@ pub fn genesis_from_accounts(
         .collect()
 }
 
-pub fn wallet_config(sequencer_addrs: &[SocketAddr]) -> Result<WalletConfig> {
-    let mut sequencers = vec![];
-
-    for addr in sequencer_addrs {
-        sequencers.push(SequencerConnectionData {
-            sequencer_addr: addr_to_url(UrlProtocol::Http, *addr)
+pub fn wallet_config(sequencer_addr: &SocketAddr) -> Result<WalletConfig> {
+    Ok(WalletConfig {
+        sequencer: SequencerConnectionData {
+            sequencer_addr: addr_to_url(UrlProtocol::Http, *sequencer_addr)
                 .context("Failed to convert sequencer addr to URL")?,
             basic_auth: None,
-        });
-    }
-
-    Ok(WalletConfig {
-        sequencers,
+        },
         seq_poll_timeout: Duration::from_secs(30),
         seq_tx_poll_max_blocks: 15,
         seq_poll_max_retries: 10,
         seq_block_poll_max_amount: 100,
-        multi_sequencer_client_config: MultiSequencerClientConfig {
-            distribution_limit: 1,
-            calibration_limit: 5,
-        },
+        gas_limit: wallet::DEFAULT_GAS_LIMIT,
     })
 }
 
@@ -361,11 +354,14 @@ pub fn bedrock_channel_id_b() -> ChannelId {
 
 /// Generate sequencer signing key from `u32` number via repeating le bytes 8 times.
 #[must_use]
-pub fn sequencer_signing_key_from_seed(seed: u32) -> [u8; 32] {
-    seed.to_le_bytes()
-        .repeat(8)
-        .try_into()
-        .unwrap_or_else(|_| unreachable!())
+pub fn sequencer_signing_key_from_seed(seed: u32) -> UnsecuredEd25519Key {
+    UnsecuredEd25519Key::from_bytes(
+        &seed
+            .to_le_bytes()
+            .repeat(8)
+            .try_into()
+            .unwrap_or_else(|_| unreachable!()),
+    )
 }
 
 /// Seed of the account owning sequencer `index`'s founding stake.
@@ -390,7 +386,7 @@ pub fn founding_stake_owner_key(index: usize) -> Result<PrivateKey> {
 /// `channel_params` must be the ones the channel is created with, or these
 /// founding stakes land below the minimum and accredit nobody.
 pub fn genesis_sequencer_stakes(
-    sequencer_signing_keys: &[[u8; 32]],
+    sequencer_signing_keys: &[UnsecuredEd25519Key],
     channel_params: ChannelParams,
 ) -> Result<Vec<GenesisAction>> {
     let minimum_stake = channel_params.minimum_sequencer_stake;
@@ -398,7 +394,7 @@ pub fn genesis_sequencer_stakes(
         .iter()
         .enumerate()
         .map(|(index, signing_key)| {
-            let public_key = Ed25519Key::from_bytes(signing_key).public_key();
+            let public_key = signing_key.public_key();
             let sequencer_key = SequencerKey::new(public_key.to_bytes())
                 .context("Sequencer signing key is not a valid Ed25519 point")?;
             let owner = founding_stake_owner_key(index)?;
@@ -427,13 +423,15 @@ pub fn bedrock_channel_id_from_seed(seed: u32) -> ChannelId {
     ChannelId::from(channel_id)
 }
 
-/// Funding key of the Bedrock test node, matching `funding_pk` in `bedrock/node-config.yaml`.
 #[must_use]
 pub fn bedrock_funding_key() -> ZkPublicKey {
-    const PUBLIC_KEY_HEX: &str = "2e03b2eff5a45478e7e79668d2a146cf2c5c7925bce927f2b1c67f2ab4fc0d26";
-
-    let bytes = hex::decode(PUBLIC_KEY_HEX).expect("Fixed funding key must be valid hex");
+    let bytes = hex::decode(BEDROCK_FUNDING_KEY_HEX).expect("Fixed funding key must be valid hex");
     ZkPublicKey::from(BigUint::from_bytes_le(&bytes))
+}
+
+#[must_use]
+pub const fn bedrock_funding_key_id() -> &'static str {
+    BEDROCK_FUNDING_KEY_HEX
 }
 
 /// A source-only zone: programs registered, `InitConfig`s emitted, nobody watched.
@@ -522,7 +520,6 @@ mod tests {
             bedrock_channel_id(),
             bedrock_funding_key(),
             Vec::new(),
-            None,
             None,
             None,
         )

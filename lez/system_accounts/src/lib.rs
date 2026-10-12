@@ -17,40 +17,44 @@ pub const DEFAULT_MINIMUM_SEQUENCER_STAKE: u128 = 149;
 /// blocks.
 pub const DEFAULT_SEQUENCER_POSTING_TIMEFRAME: Slots = 300;
 pub const DEFAULT_SEQUENCER_POSTING_TIMEOUT: Slots = 25;
-pub const DEFAULT_SEQUENCER_CONFIGURATION_THRESHOLD: u16 = 1;
 pub const DEFAULT_SEQUENCER_WITHDRAW_THRESHOLD: u16 = 1;
+
+// TODO: Size against mainnet finality before launch.
+/// Blocks an unstake waits before release.
+pub const DEFAULT_SEQUENCER_EXIT_DELAY: u64 = 100;
 
 pub type Slots = u32;
 
 #[must_use]
 pub fn bridge_account_id() -> AccountId {
-    bridge_core::compute_bridge_account_id(programs::bridge().id().into())
+    bridge_core::compute_bridge_account_id(programs::bridge_account_id())
 }
 
 /// Holds the whole supply: genesis allocations and L1 deposits are both
 /// `Deposit`s that draw on it, so what it still holds is the unissued supply.
 #[must_use]
 pub fn bridge_account() -> Account {
-    Account {
-        program_owner: programs::authenticated_transfer().id().into(),
-        balance: u128::MAX,
-        ..Account::default()
-    }
+    Account::funded(u128::MAX)
+}
+
+#[must_use]
+pub fn fee_program_id() -> AccountId {
+    programs::fee_account_id()
 }
 
 #[must_use]
 pub fn fee_state_account_id() -> AccountId {
-    fee_core::compute_fee_state_account_id(programs::fee().id().into())
+    fee_core::compute_fee_state_account_id(programs::fee_account_id())
 }
 
 #[must_use]
 pub fn fee_escrow_account_id() -> AccountId {
-    fee_core::compute_fee_escrow_account_id(programs::fee().id().into())
+    fee_core::compute_fee_escrow_account_id(programs::fee_account_id())
 }
 
 #[must_use]
 pub fn fee_inbox_account_id() -> AccountId {
-    fee_core::compute_fee_inbox_account_id(programs::fee().id().into())
+    fee_core::compute_fee_inbox_account_id(programs::fee_account_id())
 }
 
 /// Fee program account IDs in the order expected by the fee program.
@@ -63,26 +67,16 @@ pub fn fee_account_ids() -> [AccountId; 3] {
     ]
 }
 
-#[must_use]
-pub fn fee_account() -> Account {
-    Account {
-        program_owner: programs::fee().id().into(),
-        ..Account::default()
-    }
-}
-
-/// The fee-state account at genesis: owned by the fee program, carrying the
-/// genesis market state in its data.
+/// The fee-state account initialized with the genesis market state.
 #[must_use]
 pub fn fee_state_account() -> Account {
-    Account {
-        program_owner: programs::fee().id().into(),
-        data: fee_core::state::FeeState::genesis()
+    Account::default().with_shard(
+        programs::fee_account_id(),
+        fee_core::state::FeeState::genesis()
             .to_bytes()
             .try_into()
             .expect("FeeState data should fit"),
-        ..Account::default()
-    }
+    )
 }
 
 #[must_use]
@@ -92,13 +86,13 @@ pub const fn clock_account_ids() -> [AccountId; 3] {
 
 #[must_use]
 pub fn sequencer_stake_config_account_id() -> AccountId {
-    sequencer_stake_core::sequencer_stake_config_account_id(programs::sequencer_stake().id().into())
+    sequencer_stake_core::sequencer_stake_config_account_id(programs::sequencer_stake_account_id())
 }
 
 #[must_use]
 pub fn stake_funds_account_id(ownership_id: &AccountId) -> AccountId {
     sequencer_stake_core::stake_funds_account_id(
-        programs::sequencer_stake().id().into(),
+        programs::sequencer_stake_account_id(),
         ownership_id,
     )
 }
@@ -115,9 +109,9 @@ pub fn sequencer_stake_config_account(
     channel_params: Option<sequencer_stake_core::ChannelParams>,
     channel_id: Option<[u8; 32]>,
 ) -> Account {
-    Account {
-        program_owner: programs::sequencer_stake().id().into(),
-        data: sequencer_stake_core::SequencerStakeConfig {
+    Account::default().with_shard(
+        programs::sequencer_stake_account_id(),
+        sequencer_stake_core::SequencerStakeConfig {
             channel_params,
             channel_id,
             entries: BTreeMap::new(),
@@ -125,21 +119,19 @@ pub fn sequencer_stake_config_account(
         .to_bytes()
         .try_into()
         .expect("sequencer stake config data should fit"),
-        ..Account::default()
-    }
+    )
 }
 
 #[must_use]
 pub fn clock_account() -> Account {
-    Account {
-        program_owner: programs::clock().id().into(),
-        data: ClockAccountData {
+    Account::default().with_shard(
+        programs::clock_account_id(),
+        ClockAccountData {
             block_id: 0,
             timestamp: 0,
         }
         .to_bytes()
         .try_into()
         .expect("Clock account data should fit"),
-        ..Account::default()
-    }
+    )
 }

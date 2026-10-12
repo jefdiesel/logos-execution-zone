@@ -5,7 +5,7 @@
 
 use common::{block::Block, transaction::LeeTransaction};
 use kameo::{
-    Actor, Reply,
+    Actor,
     actor::ActorRef,
     message::{Context, Message},
     reply::DelegatedReply,
@@ -14,13 +14,14 @@ use lee_core::{
     BlockId, CommitmentSetDigest, MembershipProof,
     account::{Balance, Nonce},
 };
+pub use sequencer_actors_common::mock::{Checkpoint, Replace, ReplaceReply};
 
 use crate::{
     ExecutorActorTrait, Result,
     error::Error,
     protocol::{
-        FeeStateQuote, GetAccount, GetAccountBalance, GetAccountNonces, GetAccountReply, GetBlock,
-        GetBlockRange, GetChannelId, GetChannelIdReply, GetCrossZoneDeadLetters,
+        ChannelId, FeeStateQuote, GetAccount, GetAccountBalance, GetAccountNonces, GetAccountReply,
+        GetAccountView, GetBlock, GetBlockRange, GetChannelId, GetCrossZoneDeadLetters,
         GetCrossZoneDeadLettersReply, GetFeeQuote, GetLastBlockId, GetProofsAndRoot,
         GetTransaction, ProduceBlock, RequeueCrossZoneDeadLetter, RequeueCrossZoneDeadLetterReply,
         Transaction,
@@ -89,11 +90,17 @@ mockall::mock! {
             ctx: &mut Context<Self, GetAccountReply>
         ) -> GetAccountReply;
 
+        pub fn handle_get_account_view(
+            &mut self,
+            msg: GetAccountView,
+            ctx: &mut Context<Self, GetAccountReply>
+        ) -> GetAccountReply;
+
         pub fn handle_get_channel_id(
             &mut self,
             msg: GetChannelId,
-            ctx: &mut Context<Self, GetChannelIdReply>
-        ) -> GetChannelIdReply;
+            ctx: &mut Context<Self, Result<ChannelId>>
+        ) -> Result<ChannelId>;
 
         pub fn handle_get_cross_zone_dead_letters(
             &mut self,
@@ -126,9 +133,6 @@ impl Actor for MockExecutorActor {
     }
 }
 
-/// Special message to trigger [`MockExecutorActor::checkpoint()`].
-pub struct Checkpoint;
-
 impl Message<Checkpoint> for MockExecutorActor {
     type Reply = ();
 
@@ -141,24 +145,12 @@ impl Message<Checkpoint> for MockExecutorActor {
     }
 }
 
-/// Special message to [`std::mem::replace()`] the inner state of [`MockExecutorActor`] with a new
-/// one, returning old state.
-/// This is useful for testing, to swap in a new mock with different expectations.
-pub struct Replace {
-    pub mock: MockExecutorActor,
-}
-
-#[derive(Reply)]
-pub struct ReplaceReply {
-    pub old_mock: MockExecutorActor,
-}
-
-impl Message<Replace> for MockExecutorActor {
-    type Reply = ReplaceReply;
+impl Message<Replace<Self>> for MockExecutorActor {
+    type Reply = ReplaceReply<Self>;
 
     async fn handle(
         &mut self,
-        Replace { mock }: Replace,
+        Replace { mock }: Replace<Self>,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         let old_mock = std::mem::replace(self, mock);
@@ -282,8 +274,20 @@ impl Message<GetAccount> for MockExecutorActor {
     }
 }
 
+impl Message<GetAccountView> for MockExecutorActor {
+    type Reply = GetAccountReply;
+
+    async fn handle(
+        &mut self,
+        msg: GetAccountView,
+        ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        self.handle_get_account_view(msg, ctx)
+    }
+}
+
 impl Message<GetChannelId> for MockExecutorActor {
-    type Reply = GetChannelIdReply;
+    type Reply = Result<ChannelId>;
 
     async fn handle(
         &mut self,

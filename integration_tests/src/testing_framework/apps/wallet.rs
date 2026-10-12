@@ -8,15 +8,15 @@ use std::{
 use anyhow::{Context as _, anyhow};
 use async_trait::async_trait;
 use common::HashType;
-use lee::{AccountId, PrivateKey, PublicKey};
-use lee_core::program::{InstructionData, ProgramId};
+use lee::{AccountId, PrivateKey, PublicKey, program::Program};
+use lee_core::program::InstructionData;
 use program_loader_core::MAX_SEGMENT_DATA_LEN;
 use tempfile::TempDir;
 use testing_framework_app::{AppDeployment, AppHostEnv, DeployContext};
 use testing_framework_core::scenario::DynError;
 use tokio::sync::{mpsc, oneshot};
 use wallet::{
-    AccountIdentity, WalletCore,
+    AccountIdentity, AccountMention, WalletCore,
     account::{AccountIdWithPrivacy, Label},
     cli::{
         CliAccountMention, Command, SubcommandReturnValue, account::AccountSubcommand,
@@ -102,14 +102,14 @@ enum WalletRequest {
         response: oneshot::Sender<Result<HashType, String>>,
     },
     SendProgramTransaction {
-        accounts: Vec<AccountIdentity>,
+        accounts: Vec<AccountMention>,
         instruction_data: InstructionData,
         program_account_id: AccountId,
         payer: Option<AccountId>,
         response: oneshot::Sender<Result<HashType, String>>,
     },
     DeployProgram {
-        bytecode: Vec<u8>,
+        program: Program,
         payer: AccountId,
         response: oneshot::Sender<Result<AccountId, String>>,
     },
@@ -168,7 +168,7 @@ impl WalletActor {
                                 let balance = components
                                     .wallet
                                     .get_account_private(account_id)
-                                    .map(|account| account.balance);
+                                    .map(|account| account.data.native_balance().unwrap_or_default());
                                 let _unused = response.send(Ok(balance));
                             }
                             WalletRequest::PrivateAccountCommitment {
@@ -218,7 +218,7 @@ impl WalletActor {
                                         to_npk: None,
                                         to_vpk: None,
                                         to_keys: None,
-                                        to_identifier: Some(0),
+                                        to_identifier: Some(lee_core::Identifier::ZERO),
                                         amount,
                                     }),
                                 )
@@ -275,7 +275,7 @@ impl WalletActor {
                                         to_npk: None,
                                         to_vpk: None,
                                         to_keys: None,
-                                        to_identifier: Some(0),
+                                        to_identifier: Some(lee_core::Identifier::ZERO),
                                         amount,
                                     }),
                                 )
@@ -381,7 +381,7 @@ impl WalletActor {
                                         to_npk: None,
                                         to_vpk: None,
                                         to_keys: None,
-                                        to_identifier: Some(0),
+                                        to_identifier: Some(lee_core::Identifier::ZERO),
                                         amount,
                                     }),
                                 )
@@ -425,17 +425,23 @@ impl WalletActor {
                                 let _unused = response.send(result);
                             }
                             WalletRequest::DeployProgram {
-                                bytecode,
+                                program,
                                 payer,
                                 response,
                             } => {
                                 let result = async {
                                     // A deploy claims every account it names: one
-                                    // header plus one segment per bytecode chunk,
-                                    // all fresh wallet accounts. None of them holds
-                                    // a balance, so `payer` covers the fees.
-                                    let segment_count =
-                                        bytecode.chunks(MAX_SEGMENT_DATA_LEN).count();
+                                    // header plus one segment per chunk of the
+                                    // program's user ELF, which is all the loader
+                                    // uploads, as the kernel is the protocol's.
+                                    // All of them are fresh wallet accounts and
+                                    // none holds a balance, so `payer` covers the
+                                    // fees.
+                                    let segment_count = program
+                                        .user_elf()
+                                        .map_err(|error| anyhow!(error.to_string()))?
+                                        .len()
+                                        .div_ceil(MAX_SEGMENT_DATA_LEN);
                                     let (header_id, _) =
                                         components.wallet.create_new_account_public(None);
                                     let segment_ids = std::iter::repeat_with(|| {
@@ -451,7 +457,7 @@ impl WalletActor {
                                         .deploy(
                                             header_id,
                                             &segment_ids,
-                                            bytecode,
+                                            program.elf().to_vec(),
                                             true,
                                             Some(payer),
                                         )
@@ -683,22 +689,22 @@ impl LezRuntime {
         .await
     }
 
-    /// Signs and submits a public transaction against a compiled-in program,
+    /// Signs and submits a public transaction against an arbitrary program,
     /// with the wallet picking the fee payer, if any, from the signing
-    /// accounts. See [`Self::send_program_account_transaction`].
+    /// accounts. See [`Self::send_program_transaction_paid_by`].
     pub async fn send_program_transaction(
         &self,
-        accounts: Vec<AccountIdentity>,
+        accounts: Vec<AccountMention>,
         instruction_data: InstructionData,
-        program_id: ProgramId,
+        program_id: AccountId,
     ) -> Result<HashType, DynError> {
-        self.send_program_account_transaction(accounts, instruction_data, program_id.into(), None)
+        self.send_program_transaction_paid_by(accounts, instruction_data, program_id, None)
             .await
     }
 
     /// Signs and submits a public transaction against the program at
-    /// `program_account_id`: a compiled-in program's id mapped to an account,
-    /// or the header account a runtime deployment claimed.
+    /// `program_account_id`: a compiled-in program's account, or the header
+    /// account a runtime deployment claimed.
     ///
     /// `AccountIdentity::Public` entries are signed with the wallet's key for
     /// that account; `AccountIdentity::PublicNoSign` entries are carried as
@@ -706,9 +712,9 @@ impl LezRuntime {
     /// co-signing without joining the pre-state list. The returned hash only
     /// means the sequencer's mempool admitted the transaction; whether it
     /// executes is decided during block building.
-    pub async fn send_program_account_transaction(
+    pub async fn send_program_transaction_paid_by(
         &self,
-        accounts: Vec<AccountIdentity>,
+        accounts: Vec<AccountMention>,
         instruction_data: InstructionData,
         program_account_id: AccountId,
         payer: Option<AccountId>,
@@ -723,16 +729,16 @@ impl LezRuntime {
         .await
     }
 
-    /// Deploys a program at runtime through `program_loader`, paid by `payer`,
+    /// Deploys `program` at runtime through `program_loader`, paid by `payer`,
     /// waiting for every deployment transaction to land. Returns the header
     /// account the deployment claimed, which the program is addressed by.
     pub async fn deploy_program(
         &self,
-        bytecode: Vec<u8>,
+        program: Program,
         payer: AccountId,
     ) -> Result<AccountId, DynError> {
         self.request(|response| WalletRequest::DeployProgram {
-            bytecode,
+            program,
             payer,
             response,
         })
@@ -847,29 +853,34 @@ impl AppDeployment<AppHostEnv> for WalletApp {
                     .build()
                     .context("failed to create LEZ wallet setup runtime")?;
                 runtime.block_on(async move {
-                    let (wallet, initialized_state_dir, password) = match configured_state_dir {
-                        Some(setup_home) => crate::setup::setup_wallet_at(
-                            std::slice::from_ref(&sequencer_addr),
-                            &public_accounts,
-                            &private_accounts,
-                            WalletConfigOverrides::default(),
-                            &setup_home,
-                        )
-                        .await
-                        .context("failed to set up LEZ wallet")
-                        .map(|(wallet, _, password)| (wallet, None, password)),
-                        None => setup_wallet(
-                            std::slice::from_ref(&sequencer_addr),
-                            &public_accounts,
-                            &private_accounts,
-                            WalletConfigOverrides::default(),
-                        )
-                        .await
-                        .context("failed to set up LEZ wallet")
-                        .map(|(wallet, wallet_state_dir, password)| {
-                            (wallet, Some(wallet_state_dir), password)
-                        }),
-                    }?;
+                    let (wallet, initialized_state_dir, password) = configured_state_dir
+                        .map_or_else(
+                            || {
+                                setup_wallet(
+                                    &sequencer_addr,
+                                    &public_accounts,
+                                    &private_accounts,
+                                    WalletConfigOverrides::default(),
+                                )
+                                .context("failed to set up LEZ wallet")
+                                .map(
+                                    |(wallet, wallet_state_dir, password)| {
+                                        (wallet, Some(wallet_state_dir), password)
+                                    },
+                                )
+                            },
+                            |setup_home| {
+                                crate::setup::setup_wallet_at(
+                                    &sequencer_addr,
+                                    &public_accounts,
+                                    &private_accounts,
+                                    WalletConfigOverrides::default(),
+                                    &setup_home,
+                                )
+                                .context("failed to set up LEZ wallet")
+                                .map(|(wallet, _, password)| (wallet, None, password))
+                            },
+                        )?;
                     let mut wallet = wallet;
                     if initialize_private_account_funding {
                         fund_private_accounts(&mut wallet, &public_accounts, &private_accounts)

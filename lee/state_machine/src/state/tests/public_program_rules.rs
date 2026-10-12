@@ -2,40 +2,25 @@ use lee_core::program::InstructionData;
 
 use super::*;
 
-/// A program can drop an entire account from its own output by simply omitting its
-/// `AccountStateDiff` — `validate_execution` has no way to catch this on its own, since a
-/// shorter `state_diffs` list is perfectly well-formed. This must still be rejected: every
-/// account the caller declared in the transaction must appear somewhere in the final diff.
+/// A program can drop an entire account from its own output by simply omitting it from the
+/// handles it echoes — `validate_plan` has no way to catch this on its own, since a
+/// shorter `accounts` list is perfectly well-formed. This must still be rejected: every
+/// account the caller declared in the transaction must appear in the program's echo.
 #[test]
 fn program_should_fail_if_it_drops_a_declared_account() {
-    // Both accounts need a non-default program_owner: an account left at DEFAULT_PROGRAM_ID with
-    // non-default data would itself violate the protocl rule the moment it's echoed back.
-    // `with_public_account_balances` leaves program_owner at DEFAULT_PROGRAM_ID, so use
-    // `with_public_accounts` to set it explicitly instead.
     let mut state = V03State::new()
-        .with_public_accounts([
-            (
-                AccountId::new([1; 32]),
-                Account {
-                    program_owner: crate::test_methods::dropped_account().id().into(),
-                    balance: 100,
-                    ..Account::default()
-                },
-            ),
-            (
-                AccountId::new([2; 32]),
-                Account {
-                    program_owner: crate::test_methods::dropped_account().id().into(),
-                    balance: 0,
-                    ..Account::default()
-                },
-            ),
+        .with_public_account_balances([
+            (AccountId::new([1; 32]), 100),
+            (AccountId::new([2; 32]), 0),
         ])
-        .with_test_programs();
-    let account_ids = vec![AccountId::new([1; 32]), AccountId::new([2; 32])];
-    let program_id: AccountId = crate::test_methods::dropped_account().id().into();
+        .with_programs([crate::test_methods::dropped_account()]);
+    let shard_selectors = vec![
+        ProgramShardSelector::native_balance(AccountId::new([1; 32])),
+        ProgramShardSelector::native_balance(AccountId::new([2; 32])),
+    ];
+    let program_id = AccountId::from_builtin_program(crate::test_methods::dropped_account().id());
     let message =
-        public_transaction::Message::try_new(program_id, account_ids, vec![], ()).unwrap();
+        public_transaction::Message::try_new(program_id, shard_selectors, vec![], ()).unwrap();
     let witness_set = public_transaction::WitnessSet::for_message(&message, &[]);
     let tx = PublicTransaction::new(message, witness_set);
 
@@ -43,33 +28,34 @@ fn program_should_fail_if_it_drops_a_declared_account() {
 
     assert!(
         matches!(
-            result,
-            Err(LeeError::InvalidProgramBehavior(
-                InvalidProgramBehaviorError::DeclaredAccountMissingFromOutput { account_id }
-            )) if account_id == AccountId::new([2; 32])
+            &result,
+            Err(LeeError::InvalidProgramBehavior(InvalidProgramBehaviorError::Execution(
+                ExecutionError::ExecutionValidation {
+                    program_account_id: err_program_id,
+                    source: ExecutionValidationError::PlanInputMismatch { expected, actual },
+                }
+            ))) if *err_program_id == program_id
+                && expected.accounts.len() == 2
+                && actual.accounts.len() == 1
         ),
-        "expected DeclaredAccountMissingFromOutput for the dropped account, got {result:?}"
+        "expected a plan input mismatch for the dropped account, got {result:?}"
     );
 }
 
 #[test]
-fn program_should_fail_if_transfers_balance_from_non_owned_account() {
+fn program_should_fail_if_it_debits_an_unauthorized_account() {
     let sender_account_id = AccountId::new([1; 32]);
     let receiver_account_id = AccountId::new([2; 32]);
-    let mut state = V03State::new()
-        .with_public_account_balances([(sender_account_id, 100)])
-        .with_test_programs();
-    let balance_to_move: u128 = 1;
-    let program_id: AccountId = crate::test_methods::simple_balance_transfer().id().into();
-    assert_ne!(
-        state.get_account_by_id(sender_account_id).program_owner,
-        program_id
-    );
+    let mut state = V03State::new().with_public_account_balances([(sender_account_id, 100)]);
+    let amount: u128 = 1;
     let message = public_transaction::Message::try_new(
-        program_id,
-        vec![sender_account_id, receiver_account_id],
+        NATIVE_TOKEN_PROGRAM_ID,
+        vec![
+            ProgramShardSelector::native_balance(sender_account_id),
+            ProgramShardSelector::native_balance(receiver_account_id),
+        ],
         vec![],
-        balance_to_move,
+        NativeInstruction::Transfer { amount },
     )
     .unwrap();
     let witness_set = public_transaction::WitnessSet::for_message(&message, &[]);
@@ -79,71 +65,31 @@ fn program_should_fail_if_transfers_balance_from_non_owned_account() {
 
     assert!(matches!(
         result,
-        Err(LeeError::InvalidProgramBehavior(InvalidProgramBehaviorError::ExecutionValidationFailed(
-            ExecutionValidationError::UnauthorizedBalanceDecrease { account_id: err_account_id }
-        ))) if err_account_id == sender_account_id
+        Err(LeeError::InvalidProgramBehavior(
+            InvalidProgramBehaviorError::NativeTransferFailed(
+                TransferError::UnauthorizedSender {
+                    account_id: err_account_id
+                }
+            )
+        )) if err_account_id == sender_account_id
     ));
 }
 
 #[test]
-fn program_should_fail_if_debits_owned_but_unauthorized_account() {
-    let sender_account_id = AccountId::new([1; 32]);
-    let receiver_account_id = AccountId::new([2; 32]);
-    let program_id: AccountId = crate::test_methods::simple_balance_transfer().id().into();
-    let mut state = V03State::new().with_test_programs();
-    state.force_insert_account(
-        sender_account_id,
-        Account {
-            program_owner: program_id,
-            balance: 100,
-            ..Account::default()
-        },
-    );
-    let balance_to_move: u128 = 1;
-    let message = public_transaction::Message::try_new(
-        program_id,
-        vec![sender_account_id, receiver_account_id],
-        vec![],
-        balance_to_move,
-    )
-    .unwrap();
-    let witness_set = public_transaction::WitnessSet::for_message(&message, &[]);
-    let tx = PublicTransaction::new(message, witness_set);
-
-    let result = state.transition_from_public_transaction(&tx, 1, 0);
-
-    assert!(matches!(
-        result,
-        Err(LeeError::InvalidProgramBehavior(InvalidProgramBehaviorError::ExecutionValidationFailed(
-            ExecutionValidationError::UnauthorizedBalanceDecrease { account_id: err_account_id }
-        ))) if err_account_id == sender_account_id
-    ));
-}
-
-#[test]
-fn program_should_transfer_balance_from_authorized_non_owned_account() {
+fn program_should_transfer_balance_from_an_authorized_account() {
     let sender_key = PrivateKey::try_new([3; 32]).unwrap();
     let sender_account_id = AccountId::from(&PublicKey::new_from_private_key(&sender_key));
     let receiver_account_id = AccountId::new([2; 32]);
-    let owner_program_id: AccountId = crate::test_methods::data_changer().id().into();
-    let program_id: AccountId = crate::test_methods::simple_balance_transfer().id().into();
-    assert_ne!(owner_program_id, program_id);
-    let mut state = V03State::new().with_test_programs();
-    for (account_id, balance) in [(sender_account_id, 100), (receiver_account_id, 0)] {
-        state.force_insert_account(
-            account_id,
-            Account {
-                program_owner: owner_program_id,
-                balance,
-                ..Account::default()
-            },
-        );
-    }
+    let mut state = V03State::new()
+        .with_public_account_balances([(sender_account_id, 100), (receiver_account_id, 0)]);
     let message = public_transaction::Message::try_new(
-        program_id,
-        vec![sender_account_id, receiver_account_id],
+        NATIVE_TOKEN_PROGRAM_ID,
+        vec![
+            ProgramShardSelector::native_balance(sender_account_id),
+            ProgramShardSelector::native_balance(receiver_account_id),
+        ],
         vec![Nonce(0)],
-        1_u128,
+        NativeInstruction::Transfer { amount: 1 },
     )
     .unwrap();
     let witness_set = public_transaction::WitnessSet::for_message(&message, &[&sender_key]);
@@ -151,69 +97,127 @@ fn program_should_transfer_balance_from_authorized_non_owned_account() {
 
     state.transition_from_public_transaction(&tx, 1, 0).unwrap();
 
-    assert_eq!(state.get_account_by_id(sender_account_id).balance, 99);
-    assert_eq!(state.get_account_by_id(receiver_account_id).balance, 1);
+    assert_eq!(
+        state
+            .get_account_by_id(sender_account_id)
+            .data
+            .native_balance(),
+        Ok(99)
+    );
+    assert_eq!(
+        state
+            .get_account_by_id(receiver_account_id)
+            .data
+            .native_balance(),
+        Ok(1)
+    );
 }
 
 #[test]
-fn program_should_fail_if_modifies_data_of_non_owned_account() {
-    let initial_data = HashMap::new();
-    let mut state = V03State::new()
-        .with_public_accounts(initial_data)
-        .with_test_programs();
-    let account_id = AccountId::new([255; 32]);
-    let program_id: AccountId = crate::test_methods::data_changer().id().into();
+fn a_data_write_on_a_shard_the_executing_program_does_not_own_is_rejected_publicly() {
+    let target_id = AccountId::new([1; 32]);
+    let program_id = AccountId::from_builtin_program(crate::test_methods::data_changer().id());
+    let foreign_program_account_id =
+        AccountId::from_builtin_program(crate::test_methods::noop().id());
+    // Another program's shard and the native balance shard are both foreign to the executing
+    // program, and public execution refuses each by the same rule.
+    let cases = [
+        (
+            "another program's shard",
+            ProgramShardSelector::new(target_id, foreign_program_account_id),
+            vec![7_u8; 4],
+        ),
+        (
+            "the native balance shard",
+            ProgramShardSelector::native_balance(target_id),
+            encode_balance(500).to_vec(),
+        ),
+    ];
 
-    state.force_insert_account(
-        account_id,
-        Account {
-            program_owner: [0, 1, 2, 3, 4, 5, 6, 7].into(),
-            balance: 100,
-            ..Account::default()
-        },
-    );
-    assert_ne!(
-        state.get_account_by_id(account_id).program_owner,
-        program_id
-    );
-    let message =
-        public_transaction::Message::try_new(program_id, vec![account_id], vec![], vec![0_u8])
-            .unwrap();
+    for (shard, selector, written) in cases {
+        let mut state = V03State::new().with_programs([
+            crate::test_methods::data_changer(),
+            crate::test_methods::noop(),
+        ]);
+        let message =
+            public_transaction::Message::try_new(program_id, vec![selector], vec![], written)
+                .unwrap();
+        let witness_set = public_transaction::WitnessSet::for_message(&message, &[]);
+        let tx = PublicTransaction::new(message, witness_set);
+
+        let result = state.transition_from_public_transaction(&tx, 1, 0);
+
+        assert!(
+            matches!(
+                &result,
+                Err(LeeError::InvalidProgramBehavior(InvalidProgramBehaviorError::Execution(
+                    ExecutionError::ExecutionValidation {
+                        source: ExecutionValidationError::ForeignShardWrite { account_id, executing_account_id },
+                        ..
+                    }
+                ))) if *account_id == target_id && *executing_account_id == program_id
+            ),
+            "writing {shard} must be refused, got {result:?}"
+        );
+        assert_eq!(state.get_account_by_id(target_id), Account::default());
+    }
+}
+
+#[test]
+fn an_apply_returning_chained_calls_is_rejected_publicly() {
+    let program_id = AccountId::from_builtin_program(crate::test_methods::chains_from_apply().id());
+    let mut state = V03State::new().with_programs([crate::test_methods::chains_from_apply()]);
+    let message = public_transaction::Message::try_new(
+        program_id,
+        vec![ProgramShardSelector::new(
+            AccountId::new([1; 32]),
+            program_id,
+        )],
+        vec![],
+        (),
+    )
+    .unwrap();
     let witness_set = public_transaction::WitnessSet::for_message(&message, &[]);
     let tx = PublicTransaction::new(message, witness_set);
 
     let result = state.transition_from_public_transaction(&tx, 1, 0);
 
     assert!(matches!(
-        result,
-        Err(LeeError::InvalidProgramBehavior(InvalidProgramBehaviorError::ExecutionValidationFailed(
-            ExecutionValidationError::UnauthorizedDataModification { account_id: err_account_id, executing_account_id }
-        ))) if err_account_id == account_id && executing_account_id == program_id
+        execution_error(result),
+        ExecutionError::ExecutionValidation {
+            program_account_id,
+            source: ExecutionValidationError::ChainedCallsFromApply,
+        } if program_account_id == program_id
     ));
 }
 
 #[test]
-fn program_should_fail_if_does_not_preserve_total_balance_by_minting() {
-    let initial_data = HashMap::new();
+fn a_data_write_on_the_executing_shard_is_accepted_publicly() {
+    let target_id = AccountId::new([1; 32]);
     let mut state = V03State::new()
-        .with_public_accounts(initial_data)
-        .with_test_programs();
-    let account_id = AccountId::new([1; 32]);
-    let program_id: AccountId = crate::test_methods::minter().id().into();
+        .with_public_accounts([(target_id, Account::funded(250))])
+        .with_programs([crate::test_methods::data_changer()]);
+    let program_id = AccountId::from_builtin_program(crate::test_methods::data_changer().id());
+    let written = vec![7_u8; 4];
 
-    let message =
-        public_transaction::Message::try_new(program_id, vec![account_id], vec![], ()).unwrap();
+    let message = public_transaction::Message::try_new(
+        program_id,
+        vec![ProgramShardSelector::new(target_id, program_id)],
+        vec![],
+        written.clone(),
+    )
+    .unwrap();
     let witness_set = public_transaction::WitnessSet::for_message(&message, &[]);
     let tx = PublicTransaction::new(message, witness_set);
 
-    let result = state.transition_from_public_transaction(&tx, 2, 0);
+    state.transition_from_public_transaction(&tx, 1, 0).unwrap();
 
-    assert!(matches!(
-        result,
-        Err(LeeError::InvalidProgramBehavior(InvalidProgramBehaviorError::ExecutionValidationFailed(
-            ExecutionValidationError::MismatchedTotalBalance { total_added, total_subbed }
-        ))) if total_added == 1.into() && total_subbed == 0.into()
-    ));
+    // Funded beforehand, so the whole-account assertion also pins that an application write
+    // leaves the native balance shard alone.
+    assert_eq!(
+        state.get_account_by_id(target_id),
+        Account::funded(250).with_shard(program_id, written.try_into().unwrap())
+    );
 }
 
 /// A chained call may only name an account the transaction declared or an earlier call already
@@ -222,53 +226,64 @@ fn program_should_fail_if_does_not_preserve_total_balance_by_minting() {
 fn program_should_fail_if_it_references_an_undeclared_account() {
     let account_id = AccountId::new([1; 32]);
     let undeclared_account_id = AccountId::new([99; 32]);
-    let mut state = V03State::new()
-        .with_public_account_balances([(account_id, 0)])
-        .with_test_programs();
-    let program_id: AccountId = crate::test_methods::references_undeclared_account()
-        .id()
-        .into();
-    let callee_id = crate::test_methods::noop().id();
-    let instruction: (ProgramId, InstructionData, AccountId) = (
-        callee_id,
-        Program::serialize_instruction(()).unwrap(),
-        undeclared_account_id,
-    );
-    let message =
-        public_transaction::Message::try_new(program_id, vec![account_id], vec![], instruction)
-            .unwrap();
-    let witness_set = public_transaction::WitnessSet::for_message(&message, &[]);
-    let tx = PublicTransaction::new(message, witness_set);
+    // Existing in global state does not make an undeclared account reachable.
+    for balances in [
+        vec![(account_id, 0)],
+        vec![(account_id, 0), (undeclared_account_id, 99)],
+    ] {
+        let mut state = V03State::new()
+            .with_public_account_balances(balances)
+            .with_programs([
+                crate::test_methods::noop(),
+                crate::test_methods::references_undeclared_account(),
+            ]);
+        let program_id = AccountId::from_builtin_program(
+            crate::test_methods::references_undeclared_account().id(),
+        );
+        let callee_id = crate::test_methods::noop().id();
+        let instruction: (ProgramId, InstructionData, AccountId) = (
+            callee_id,
+            Program::serialize_instruction(()).unwrap(),
+            undeclared_account_id,
+        );
+        let message = public_transaction::Message::try_new(
+            program_id,
+            vec![ProgramShardSelector::native_balance(account_id)],
+            vec![],
+            instruction,
+        )
+        .unwrap();
+        let witness_set = public_transaction::WitnessSet::for_message(&message, &[]);
+        let tx = PublicTransaction::new(message, witness_set);
 
-    let result = state.transition_from_public_transaction(&tx, 1, 0);
+        let result = state.transition_from_public_transaction(&tx, 1, 0);
 
-    assert!(
-        matches!(
-            result,
-            Err(LeeError::InvalidProgramBehavior(
-                InvalidProgramBehaviorError::UnknownChainedCallAccount { account_id: err_account_id }
-            )) if err_account_id == undeclared_account_id
-        ),
-        "expected UnknownChainedCallAccount for the undeclared account, got {result:?}"
-    );
+        assert!(
+            matches!(
+                result,
+                Err(LeeError::InvalidProgramBehavior(InvalidProgramBehaviorError::Execution(
+                    ExecutionError::UnknownAccount {
+                        account_id: err_account_id
+                    }
+                ))) if err_account_id == undeclared_account_id
+            ),
+            "expected UnknownAccount for the undeclared account, got {result:?}"
+        );
+    }
 }
 
-/// A program can echo its real `pre_states` honestly and still fabricate an extra, untouched
-/// account in its own output — one it was never given via `ChainedCall.pre_state_ids`. This must be
-/// rejected independently of whether the fabricated account happens to already exist anywhere.
 #[test]
 fn program_should_fail_if_it_injects_an_undeclared_pre_state() {
     let account_id = AccountId::new([1; 32]);
     let fabricated_account_id = AccountId::new([123; 32]);
     let mut state = V03State::new()
         .with_public_account_balances([(account_id, 0)])
-        .with_test_programs();
-    let program_id: AccountId = crate::test_methods::injects_undeclared_pre_state()
-        .id()
-        .into();
+        .with_programs([crate::test_methods::injects_undeclared_pre_state()]);
+    let program_id =
+        AccountId::from_builtin_program(crate::test_methods::injects_undeclared_pre_state().id());
     let message = public_transaction::Message::try_new(
         program_id,
-        vec![account_id],
+        vec![ProgramShardSelector::native_balance(account_id)],
         vec![],
         fabricated_account_id,
     )
@@ -280,76 +295,41 @@ fn program_should_fail_if_it_injects_an_undeclared_pre_state() {
 
     assert!(
         matches!(
-            result,
-            Err(LeeError::InvalidProgramBehavior(
-                InvalidProgramBehaviorError::UndeclaredAccountInProgramOutput {
-                    account_id: err_account_id,
-                    ..
+            &result,
+            Err(LeeError::InvalidProgramBehavior(InvalidProgramBehaviorError::Execution(
+                ExecutionError::ExecutionValidation {
+                    program_account_id: err_program_id,
+                    source: ExecutionValidationError::PlanInputMismatch { expected, actual },
                 }
-            )) if err_account_id == fabricated_account_id
+            ))) if *err_program_id == program_id
+                && expected.accounts.len() == 1
+                && actual.accounts.len() == 2
         ),
-        "expected UndeclaredAccountInProgramOutput for the fabricated account, got {result:?}"
+        "expected a plan input mismatch for the fabricated account, got {result:?}"
     );
 }
 
-#[test]
-fn program_should_fail_if_does_not_preserve_total_balance_by_burning() {
-    let program_id: AccountId = crate::test_methods::burner().id().into();
-    let key = PrivateKey::try_new([7; 32]).unwrap();
-    let account_id = AccountId::from(&PublicKey::new_from_private_key(&key));
-    let mut state = V03State::new().with_test_programs();
-    state.force_insert_account(
-        account_id,
-        Account {
-            program_owner: program_id,
-            balance: 100,
-            ..Account::default()
-        },
-    );
-    let balance_to_burn: u128 = 1;
-    assert!(state.get_account_by_id(account_id).balance > balance_to_burn);
-
-    let message = public_transaction::Message::try_new(
-        program_id,
-        vec![account_id],
-        vec![Nonce(0)],
-        balance_to_burn,
-    )
-    .unwrap();
-    let witness_set = public_transaction::WitnessSet::for_message(&message, &[&key]);
-    let tx = PublicTransaction::new(message, witness_set);
-    let result = state.transition_from_public_transaction(&tx, 2, 0);
-
-    assert!(matches!(
-        result,
-        Err(LeeError::InvalidProgramBehavior(InvalidProgramBehaviorError::ExecutionValidationFailed(
-            ExecutionValidationError::MismatchedTotalBalance { total_added, total_subbed }
-        ))) if total_added == 0.into() && total_subbed == 1.into()
-    ));
-}
-
-/// A callee must account for exactly the accounts its caller named. `dropped_account` is handed
-/// two and journals one, so the chained call is rejected — without this, a program's journal need
-/// not correspond to the accounts it was actually called with.
+/// Rejects a chained call that omits a requested shard selector from its output.
 #[test]
 fn program_should_fail_if_a_callee_drops_an_account_its_caller_named() {
     let owner = crate::test_methods::dropped_account().id();
-    let held = |balance| Account {
-        program_owner: owner.into(),
-        balance,
-        ..Account::default()
-    };
     let mut state = V03State::new()
-        .with_public_accounts([
-            (AccountId::new([1; 32]), held(100)),
-            (AccountId::new([2; 32]), held(0)),
+        .with_public_account_balances([
+            (AccountId::new([1; 32]), 100),
+            (AccountId::new([2; 32]), 0),
         ])
-        .with_test_programs();
+        .with_programs([
+            crate::test_methods::dropped_account(),
+            crate::test_methods::non_delegating_forwarder(),
+        ]);
 
     // The forwarder names both accounts for the callee; the callee journals only the first.
     let message = public_transaction::Message::try_new(
-        crate::test_methods::non_delegating_forwarder().id().into(),
-        vec![AccountId::new([1; 32]), AccountId::new([2; 32])],
+        AccountId::from_builtin_program(crate::test_methods::non_delegating_forwarder().id()),
+        vec![
+            ProgramShardSelector::native_balance(AccountId::new([1; 32])),
+            ProgramShardSelector::native_balance(AccountId::new([2; 32])),
+        ],
         vec![],
         (owner, Vec::<u8>::new(), true, Vec::<PdaSeed>::new()),
     )
@@ -361,24 +341,26 @@ fn program_should_fail_if_a_callee_drops_an_account_its_caller_named() {
 
     assert!(
         matches!(
-            result,
-            Err(LeeError::InvalidProgramBehavior(
-                InvalidProgramBehaviorError::ChainedCallAccountsMismatch { program_account_id }
-            )) if program_account_id == AccountId::from(owner)
+            &result,
+            Err(LeeError::InvalidProgramBehavior(InvalidProgramBehaviorError::Execution(
+                ExecutionError::ExecutionValidation {
+                    program_account_id,
+                    source: ExecutionValidationError::PlanInputMismatch { expected, actual },
+                }
+            ))) if *program_account_id == AccountId::from_builtin_program(owner)
+                && expected.accounts.len() == 2
+                && actual.accounts.len() == 1
         ),
-        "expected ChainedCallAccountsMismatch for the callee, got {result:?}"
+        "expected a plan input mismatch for the callee, got {result:?}"
     );
 }
 
 #[test]
 fn insufficient_balance_transfer_leaves_state_untouched() {
-    let program = crate::test_methods::simple_balance_transfer();
     let from_key = PrivateKey::try_new([21; 32]).unwrap();
     let from = AccountId::from(&PublicKey::new_from_private_key(&from_key));
     let initial_balance = 10;
-    let mut state = V03State::new()
-        .with_public_accounts(public_state_from_balances(&[(from, initial_balance)]))
-        .with_test_programs();
+    let mut state = V03State::new().with_public_account_balances([(from, initial_balance)]);
 
     let to_key = PrivateKey::try_new([22; 32]).unwrap();
     let to = AccountId::from(&PublicKey::new_from_private_key(&to_key));
@@ -388,10 +370,13 @@ fn insufficient_balance_transfer_leaves_state_untouched() {
     let recipient_pre = state.get_account_by_id(to);
 
     let message = public_transaction::Message::try_new(
-        program.id().into(),
-        vec![from, to],
+        NATIVE_TOKEN_PROGRAM_ID,
+        vec![
+            ProgramShardSelector::native_balance(from),
+            ProgramShardSelector::native_balance(to),
+        ],
         vec![Nonce(0), Nonce(0)],
-        amount,
+        NativeInstruction::Transfer { amount },
     )
     .unwrap();
     let witness_set = public_transaction::WitnessSet::for_message(&message, &[&from_key, &to_key]);
@@ -402,8 +387,8 @@ fn insufficient_balance_transfer_leaves_state_untouched() {
     assert!(matches!(
         result,
         Err(LeeError::InvalidProgramBehavior(
-            InvalidProgramBehaviorError::ExecutionValidationFailed(
-                ExecutionValidationError::InvalidBalanceDiff { account_id, .. }
+            InvalidProgramBehaviorError::NativeTransferFailed(
+                TransferError::InsufficientBalance { account_id }
             )
         )) if account_id == from
     ));
@@ -412,45 +397,132 @@ fn insufficient_balance_transfer_leaves_state_untouched() {
     assert_eq!(state.get_account_by_id(to), recipient_pre);
 }
 
-/// Order no longer carries meaning: each `AccountStateDiff` embeds its own pre-state, so a
-/// program listing its diffs in a different order than it received the corresponding pre-states
-/// still validates and applies correctly.
 #[test]
-fn reordered_state_diffs_still_succeed() {
-    let program = crate::test_methods::reordering_transfer();
-    let from_key = PrivateKey::try_new([23; 32]).unwrap();
-    let from = AccountId::from(&PublicKey::new_from_private_key(&from_key));
-    let initial_balance = 10;
+fn effects_may_be_emitted_in_any_order_relative_to_the_handles() {
+    let program = crate::test_methods::reordering_writer();
+    let program_id = AccountId::from_builtin_program(program.id());
+    let written = vec![7_u8; 4];
+    let first = AccountId::new([23; 32]);
+    let second = AccountId::new([24; 32]);
+    let mut state = V03State::new().with_programs([crate::test_methods::reordering_writer()]);
+
+    let message = public_transaction::Message::try_new(
+        program_id,
+        vec![
+            ProgramShardSelector::new(first, program_id),
+            ProgramShardSelector::new(second, program_id),
+        ],
+        vec![],
+        vec![7_u8; 4],
+    )
+    .unwrap();
+    let witness_set = public_transaction::WitnessSet::for_message(&message, &[]);
+    let tx = PublicTransaction::new(message, witness_set);
+
+    state
+        .transition_from_public_transaction(&tx, 1, 0)
+        .expect("effects carry their own selector, so their order is free");
+
+    // The guest emitted the second handle's effect first; each still landed on its own shard.
+    assert_eq!(
+        state
+            .get_account_by_id(first)
+            .data
+            .shard(program_id)
+            .as_ref(),
+        written
+    );
+    assert_eq!(state.get_account_by_id(second), Account::default());
+}
+
+fn forwarding_transaction(
+    root_shard_selector: ProgramShardSelector,
+    callee_shard_selector: ProgramShardSelector,
+    write: &[u8],
+) -> PublicTransaction {
+    let forwarder_id = AccountId::from_builtin_program(crate::test_methods::shard_forwarder().id());
+    let callee_id = AccountId::from_builtin_program(crate::test_methods::data_changer().id());
+    let message = public_transaction::Message::try_new(
+        forwarder_id,
+        vec![root_shard_selector],
+        vec![],
+        vec![(
+            callee_id,
+            callee_shard_selector,
+            Program::serialize_instruction(write.to_vec()).unwrap(),
+        )],
+    )
+    .unwrap();
+    let witness_set = public_transaction::WitnessSet::for_message(&message, &[]);
+    PublicTransaction::new(message, witness_set)
+}
+
+#[test]
+fn a_chained_call_reads_another_shard_of_a_root_account_from_chain_state() {
+    let account_id = AccountId::new([1; 32]);
+    let forwarder_id = AccountId::from_builtin_program(crate::test_methods::shard_forwarder().id());
+    let callee_id = AccountId::from_builtin_program(crate::test_methods::data_changer().id());
+    let stranger = AccountId::new([9; 32]);
+    let on_chain: ShardData = b"on-chain".to_vec().try_into().unwrap();
+    let stranger_data: ShardData = b"stranger".to_vec().try_into().unwrap();
+    let written = vec![7; 4];
     let mut state = V03State::new()
         .with_public_accounts([(
-            from,
+            account_id,
             Account {
-                program_owner: program.id().into(),
-                balance: initial_balance,
-                ..Account::default()
+                nonce: Nonce(3),
+                ..Account::funded(5)
+                    .with_shard(callee_id, on_chain)
+                    .with_shard(stranger, stranger_data.clone())
             },
         )])
         .with_test_programs();
 
-    let to_key = PrivateKey::try_new([24; 32]).unwrap();
-    let to = AccountId::from(&PublicKey::new_from_private_key(&to_key));
-    let amount: u128 = 4;
+    for root in [
+        ProgramShardSelector::new(account_id, forwarder_id),
+        ProgramShardSelector::native_balance(account_id),
+    ] {
+        let tx = forwarding_transaction(
+            root,
+            ProgramShardSelector::new(account_id, callee_id),
+            &written,
+        );
 
-    let message = public_transaction::Message::try_new(
-        program.id().into(),
-        vec![from, to],
-        vec![Nonce(0), Nonce(0)],
-        amount,
-    )
-    .unwrap();
-    let witness_set = public_transaction::WitnessSet::for_message(&message, &[&from_key, &to_key]);
-    let tx = PublicTransaction::new(message, witness_set);
+        state.transition_from_public_transaction(&tx, 1, 0).unwrap();
 
-    state.transition_from_public_transaction(&tx, 1, 0).unwrap();
+        assert_eq!(
+            state.get_account_by_id(account_id),
+            Account {
+                nonce: Nonce(3),
+                ..Account::funded(5)
+                    .with_shard(callee_id, written.clone().try_into().unwrap())
+                    .with_shard(stranger, stranger_data.clone())
+            }
+        );
+    }
+}
 
-    assert_eq!(
-        state.get_account_by_id(from).balance,
-        initial_balance - amount
+#[test]
+fn a_chained_call_on_an_account_the_root_never_named_is_rejected_publicly() {
+    let account_id = AccountId::new([1; 32]);
+    let other_id = AccountId::new([2; 32]);
+    let forwarder_id = AccountId::from_builtin_program(crate::test_methods::shard_forwarder().id());
+    let callee_id = AccountId::from_builtin_program(crate::test_methods::data_changer().id());
+    let mut state = V03State::new()
+        .with_public_account_balances([(account_id, 0), (other_id, 0)])
+        .with_test_programs();
+    let tx = forwarding_transaction(
+        ProgramShardSelector::new(account_id, forwarder_id),
+        ProgramShardSelector::new(other_id, callee_id),
+        &[7; 4],
     );
-    assert_eq!(state.get_account_by_id(to).balance, amount);
+
+    let result = state.transition_from_public_transaction(&tx, 1, 0);
+
+    assert!(matches!(
+        result,
+        Err(LeeError::InvalidProgramBehavior(InvalidProgramBehaviorError::Execution(
+            ExecutionError::UnknownAccount { account_id }
+        ))) if account_id == other_id
+    ));
 }

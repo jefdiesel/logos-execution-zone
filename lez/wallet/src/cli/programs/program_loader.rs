@@ -21,7 +21,7 @@ pub enum ProgramLoaderSubcommand {
     /// Write one bytecode segment. Low-level primitive: `Deploy`/`Update` handle a whole
     /// program's segments in one call.
     WriteSegment {
-        /// The (unclaimed) account to write the segment to.
+        /// The account to write the segment to; its `program_loader` shard must still be empty.
         #[arg(long)]
         target: CliAccountMention,
         /// File containing this segment's raw bytecode chunk.
@@ -31,16 +31,15 @@ pub enum ProgramLoaderSubcommand {
         /// already exist).
         #[arg(long)]
         next_segment: Option<AccountId>,
-        /// An existing, funded account to pay the fee from. `target` is always freshly claimed
-        /// and so holds nothing to self-pay with; omit to fall back to the wallet's ordinary
-        /// self-pay selection (which will fail unless `target` is otherwise funded).
+        /// A funded account to pay the fee. If omitted, the wallet selects a payer
+        /// from the transaction's signing accounts.
         #[arg(long)]
         payer: Option<CliAccountMention>,
     },
     /// Create a new program header pointing at an already-uploaded segment chain. Low-level
     /// primitive: `Deploy` handles segment upload + header creation together.
     CreateHeader {
-        /// The (unclaimed) account to write the header to.
+        /// The account to write the header to; its `program_loader` shard must still be empty.
         #[arg(long)]
         target: CliAccountMention,
         /// The first segment of the chain this header should point at. The rest of the chain is
@@ -74,15 +73,16 @@ pub enum ProgramLoaderSubcommand {
     /// Deploy a new program: chunk `elf`, upload one segment per account in `segments` (in
     /// order), then create `header` pointing at the resulting chain.
     ///
-    /// The number of `segments` must exactly match the number of chunks `elf` splits into.
+    /// The number of `segments` must exactly match the number of chunks `user_elf` splits into.
     Deploy {
         /// Path to the program's compiled ELF binary.
         #[arg(long)]
         elf: PathBuf,
-        /// The (unclaimed) account to create the header at.
+        /// The account to create the header at; its `program_loader` shard must still be empty.
         #[arg(long)]
         header: CliAccountMention,
-        /// The (unclaimed) accounts to write segments to, in chain order (first chunk first).
+        /// The accounts to write segments to, in chain order (first chunk first); each one's
+        /// `program_loader` shard must still be empty.
         #[arg(long, num_args = 1..)]
         segments: Vec<CliAccountMention>,
         /// Whether the deployed program self-declares as immutable (not protocol-enforced).
@@ -96,7 +96,7 @@ pub enum ProgramLoaderSubcommand {
     /// Update an existing program in place: chunk `elf`, upload a fresh set of segments (segments
     /// are write-once, so a new chain is always created), then rewrite `header` to point at it.
     ///
-    /// The number of `segments` must exactly match the number of chunks `elf` splits into.
+    /// The number of `segments` must exactly match the number of chunks `user_elf` splits into.
     Update {
         /// Path to the program's new compiled ELF binary.
         #[arg(long)]
@@ -104,7 +104,8 @@ pub enum ProgramLoaderSubcommand {
         /// The existing header account. Must already be authorized by this wallet.
         #[arg(long)]
         header: CliAccountMention,
-        /// The (unclaimed) accounts to write the new segments to, in chain order.
+        /// The accounts to write the new segments to, in chain order; each one's
+        /// `program_loader` shard must still be empty.
         #[arg(long, num_args = 1..)]
         segments: Vec<CliAccountMention>,
         /// Whether the deployed program self-declares as immutable (not protocol-enforced).

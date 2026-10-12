@@ -1,100 +1,114 @@
 use cross_zone_inbox_core::{
-    CrossZoneMessage, InboxConfig, Instruction, SeenShard, inbox_config_account_id,
+    InboxConfig, Instruction, SeenShard, ZoneId, inbox_config_account_id,
     inbox_seen_shard_account_id,
 };
 use cross_zone_marker_core::inbox_source_marker_account_id;
 use lee_core::{
-    account::{AccountWithMetadata, BalanceDiff},
-    program::{
-        AccountStateDiff, ChainedCall, ProgramCall, ProgramInput, ProgramOutput, read_lee_call,
-        respond_unsupported_call,
-    },
+    account::{AccountId, ProgramShardSelector},
+    program::{AccountMeta, ChainedCall, Plan, PlanInput, run_program, write_once},
 };
 
-fn unchanged(pre: &AccountWithMetadata) -> AccountStateDiff {
-    AccountStateDiff::unchanged(pre.clone())
+#[derive(borsh::BorshSerialize, borsh::BorshDeserialize)]
+enum Effect {
+    ForeignZone(ZoneId),
+    MarkDelivery {
+        src_block_hash: [u8; 32],
+        src_tx_index: u32,
+    },
+    InitConfig(InboxConfig),
 }
 
 fn main() {
-    let call = read_lee_call::<Instruction>();
-    let ProgramCall::Execute(
-        ProgramInput {
-            self_account_id,
-            caller_account_id,
-            pre_states,
-            instruction,
-        },
-        instruction_data,
-    ) = call
-    else {
-        respond_unsupported_call(call);
-    };
+    run_program(plan, apply)
+}
 
-    assert!(
-        caller_account_id.is_none(),
-        "Inbox is only invoked as a top-level sequencer-origin transaction"
-    );
-
-    match instruction {
-        Instruction::Dispatch(msg) => dispatch(
-            self_account_id,
-            caller_account_id,
-            pre_states,
-            instruction_data,
-            &msg,
-        ),
-        Instruction::InitConfig(config) => init_config(
-            self_account_id,
-            caller_account_id,
-            pre_states,
-            instruction_data,
-            &config,
-        ),
+fn apply(effect: Effect, pre_data: &[u8]) -> Option<Vec<u8>> {
+    match effect {
+        Effect::ForeignZone(src_zone) => {
+            let cfg = InboxConfig::from_bytes(pre_data).expect("inbox config decodes");
+            assert!(
+                src_zone != cfg.self_zone,
+                "Source zone must not be this zone"
+            );
+            None
+        }
+        Effect::MarkDelivery {
+            src_block_hash,
+            src_tx_index,
+        } => {
+            let mut shard = SeenShard::from_bytes(pre_data).expect("seen shard decodes");
+            // One block id, one delivering block. The address binds the zone and block id but
+            // not which block claimed them, so an equivocating peer's two blocks at one id land
+            // here; the first binds the shard and the second aborts.
+            assert!(
+                shard.binds(&src_block_hash),
+                "Seen shard is bound to a different peer block at this block id"
+            );
+            assert!(
+                !shard.contains(src_tx_index),
+                "This delivery is already recorded"
+            );
+            shard.insert(src_block_hash, src_tx_index);
+            Some(shard.to_bytes())
+        }
+        // Genesis is replayed onto seeded state during multi-sequencer reconstruction, so
+        // a written config must already hold exactly this.
+        Effect::InitConfig(config) => Some(write_once(pre_data, config.to_bytes())),
     }
 }
 
-/// Delivers a finalized peer message to its target program, no-op on replay.
+fn plan(input: &PlanInput, instruction: Instruction) -> Plan {
+    assert!(
+        input.caller_account_id.is_none(),
+        "Inbox is only invoked as a top-level sequencer-origin transaction"
+    );
+
+    let mut plan = Plan::new(input);
+    let self_account_id = input.self_account_id;
+    let accounts = &input.accounts;
+    match instruction {
+        Instruction::Dispatch(message) => dispatch(&mut plan, self_account_id, accounts, message),
+        Instruction::InitConfig(config) => {
+            let [config_meta] = <&[_; 1]>::try_from(accounts.as_slice())
+                .expect("InitConfig requires the config account");
+            assert_config_account(config_meta, self_account_id);
+            plan.effect(config_meta, &Effect::InitConfig(config));
+        }
+    }
+    plan
+}
+
+/// Delivers a finalized peer message to its target program, refusing a replay.
 ///
 /// The inbox does not decide who may deliver what. It authenticates transport
 /// and nothing else: any program this zone hosts can be named as a target, with
-/// instruction bytes and account ids the peer chose. So a program meant to be
+/// instruction bytes and shard selectors the peer chose. So a program meant to be
 /// reachable across zones MUST check the marker at position 0 against sources it
 /// authorized itself, the way `wrapped_token` and `ping_receiver` do. A program
 /// not meant to be reachable has only whatever its own code happens to do. Some
 /// refuse: four assert `caller_account_id` is none, several chain into the
 /// marker's zero program id and are stopped by the host, and the rest are saved
-/// by an address assert on a PDA. Others no longer do — a target that used to be
-/// stopped only because it claimed the marker without its authorization now runs,
-/// since ownership follows a data write and needs no claim. What such a target
-/// can be made to do is write state at addresses the peer names, which is the
-/// squatting any locally deployed program can already do, at no local fee. None
-/// of that was written with cross-zone delivery in mind. User-deployed programs
-/// are reachable too, and were written with no expectation of an inbox caller at
-/// all.
+/// by an address assert on a PDA. What a target without such a check can be made
+/// to do is write its own shard at the addresses the peer names. None of that
+/// was written with cross-zone delivery in mind. User-deployed programs are
+/// reachable too, and were written with no expectation of an inbox caller at all.
 fn dispatch(
-    self_account_id: lee_core::account::AccountId,
-    caller_account_id: Option<lee_core::account::AccountId>,
-    pre_states: Vec<AccountWithMetadata>,
-    instruction_data: Vec<u8>,
-    msg: &CrossZoneMessage,
+    plan: &mut Plan,
+    self_account_id: AccountId,
+    accounts: &[AccountMeta],
+    msg: cross_zone_inbox_core::CrossZoneMessage,
 ) {
     assert!(
         msg.l1_inclusion_witness.is_none(),
         "l1_inclusion_witness must be None in v1"
     );
 
-    // pre_states layout: [config, seen_shard, source marker, then the target accounts].
-    let mut accounts = pre_states.into_iter();
+    let mut accounts = accounts.iter();
     let config = accounts.next().expect("config account required");
     let seen = accounts.next().expect("seen shard account required");
     let marker = accounts.next().expect("source marker account required");
-    let target_accounts: Vec<AccountWithMetadata> = accounts.collect();
 
-    assert_eq!(
-        config.account_id,
-        inbox_config_account_id(self_account_id),
-        "First account must be the inbox config PDA"
-    );
+    assert_config_account(config, self_account_id);
     assert_eq!(
         seen.account_id,
         inbox_seen_shard_account_id(self_account_id, &msg.src_zone, msg.src_block_id),
@@ -109,123 +123,104 @@ fn dispatch(
         "Third account must be the source marker PDA for this message"
     );
 
-    let cfg = InboxConfig::from_bytes(&config.account.data).expect("inbox config decodes");
-
-    assert!(
-        msg.src_zone != cfg.self_zone,
-        "Source zone must not be this zone"
+    plan.effect(config, &Effect::ForeignZone(msg.src_zone));
+    plan.effect(
+        seen,
+        &Effect::MarkDelivery {
+            src_block_hash: msg.src_block_hash,
+            src_tx_index: msg.src_tx_index,
+        },
     );
-    // Mirrors the bridge receipt.
-    let mut shard = if seen.account.program_owner == self_account_id {
-        SeenShard::from_bytes(&seen.account.data).expect("seen shard decodes")
-    } else {
-        SeenShard::default()
-    };
-
-    // One block id, one delivering block. The address binds the zone and block
-    // id but not which block claimed them, so an equivocating peer's two blocks
-    // at one id land here; the first binds the shard and the second aborts.
-    //
-    // Before the replay check, not after: reaching the replay branch first would
-    // turn a wrong-block delivery into a silent no-op, which the indexer's
-    // already-seen short circuit would then wave through.
-    assert!(
-        shard.binds(&msg.src_block_hash),
-        "Seen shard is bound to a different peer block at this block id"
-    );
-
-    let already_seen = shard.contains(msg.src_tx_index);
-
-    // On replay this is a no-op: the seen shard is untouched and no call is made.
-    let (seen_post, chained_calls) = if already_seen {
-        (unchanged(&seen), vec![])
-    } else {
-        shard.insert(msg.src_block_hash, msg.src_tx_index);
-        let seen_post = AccountStateDiff::new(
-            seen,
-            BalanceDiff::Add(0),
-            shard
-                .to_bytes()
-                .try_into()
-                .expect("seen shard fits in account data"),
-        );
-
-        // The payload carries the target instruction as borsh bytes: its instruction_data verbatim.
-        let call_instruction_data = msg.payload.clone();
-
-        // The marker leads, so a target reads its source at a fixed position
-        // without knowing anything about the accounts that follow it.
-        let mut call_accounts = vec![marker.account_id];
-        call_accounts.extend(target_accounts.iter().map(|a| a.account_id));
-        let call = ChainedCall {
-            program_account_id: msg.target_account_id,
-            pre_state_ids: call_accounts,
-            instruction_data: call_instruction_data,
-            pda_seeds: vec![],
-        };
-        (seen_post, vec![call])
-    };
-
-    let mut post_diffs = vec![unchanged(&config), seen_post, unchanged(&marker)];
-    post_diffs.extend(target_accounts.iter().map(unchanged));
-
-    ProgramOutput::new(
-        self_account_id,
-        caller_account_id,
-        instruction_data,
-        post_diffs,
-    )
-    .with_chained_calls(chained_calls)
-    .write();
+    // Put the source marker first, followed by the requested shard selectors.
+    let mut shard_selectors = vec![ProgramShardSelector::native_balance(marker.account_id)];
+    shard_selectors.extend(accounts.map(ProgramShardSelector::from));
+    plan.call(ChainedCall {
+        program_account_id: msg.target_account_id,
+        shard_selectors,
+        instruction_data: msg.payload,
+        pda_seeds: vec![],
+    });
 }
 
-/// Writes the inbox config into the config PDA exactly once at genesis.
-fn init_config(
-    self_account_id: lee_core::account::AccountId,
-    caller_account_id: Option<lee_core::account::AccountId>,
-    pre_states: Vec<AccountWithMetadata>,
-    instruction_data: Vec<u8>,
-    config: &InboxConfig,
-) {
-    // pre_states: [config PDA].
-    let [config_meta] = <[AccountWithMetadata; 1]>::try_from(pre_states)
-        .expect("InitConfig requires the config account");
+fn assert_config_account(config: &AccountMeta, self_account_id: AccountId) {
     assert_eq!(
-        config_meta.account_id,
+        config.account_id,
         inbox_config_account_id(self_account_id),
-        "account must be the inbox config PDA"
+        "First account must be the inbox config PDA"
     );
-    // Init-once, idempotent under genesis replay: an empty config is a first init;
-    // a written config must already hold exactly this, since genesis is replayed
-    // onto seeded state during multi-sequencer reconstruction. Implicit ownership
-    // alone would not stop the owning program from rewriting its own config data
-    // on a later call.
-    if !config_meta.account.data.is_empty() {
-        assert_eq!(
-            config_meta.account.program_owner, self_account_id,
-            "inbox config PDA is owned by another program"
-        );
-        assert_eq!(
-            *config_meta.account.data,
-            config.to_bytes(),
-            "inbox config already initialized differently"
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const HASH: [u8; 32] = [1; 32];
+    const OTHER_HASH: [u8; 32] = [2; 32];
+
+    fn shard_with(indices: &[u32]) -> Vec<u8> {
+        let mut shard = SeenShard::default();
+        for index in indices {
+            shard.insert(HASH, *index);
+        }
+        shard.to_bytes()
+    }
+
+    fn mark(src_tx_index: u32) -> Effect {
+        Effect::MarkDelivery {
+            src_block_hash: HASH,
+            src_tx_index,
+        }
+    }
+
+    #[test]
+    fn a_first_delivery_is_recorded() {
+        assert_eq!(apply(mark(3), &[]), Some(shard_with(&[3])));
+        assert_eq!(apply(mark(4), &shard_with(&[3])), Some(shard_with(&[3, 4])));
+    }
+
+    #[test]
+    #[should_panic(expected = "This delivery is already recorded")]
+    fn a_recorded_delivery_cannot_claim_to_be_the_first() {
+        // The replay amplifier: taken, this re-fires the target's chained call for a message
+        // the zone already delivered.
+        apply(mark(3), &shard_with(&[3]));
+    }
+
+    #[test]
+    #[should_panic(expected = "bound to a different peer block")]
+    fn a_second_block_at_one_block_id_cannot_mark_a_delivery() {
+        apply(
+            Effect::MarkDelivery {
+                src_block_hash: OTHER_HASH,
+                src_tx_index: 5,
+            },
+            &shard_with(&[3]),
         );
     }
 
-    let config_post = AccountStateDiff::new(
-        config_meta,
-        BalanceDiff::Add(0),
-        config
-            .to_bytes()
-            .try_into()
-            .expect("inbox config fits in account data"),
-    );
+    #[test]
+    fn a_message_from_a_peer_zone_is_accepted() {
+        let config = InboxConfig { self_zone: [9; 32] };
+        assert_eq!(
+            apply(Effect::ForeignZone([7; 32]), &config.to_bytes()),
+            None
+        );
+    }
 
-    ProgramOutput::new(
-        self_account_id,
-        caller_account_id,
-        instruction_data,
-        vec![config_post],
-    )
-    .write();
+    #[test]
+    #[should_panic(expected = "Source zone must not be this zone")]
+    fn a_message_this_zone_addressed_to_itself_is_refused() {
+        let config = InboxConfig { self_zone: [9; 32] };
+        apply(Effect::ForeignZone([9; 32]), &config.to_bytes());
+    }
+
+    #[test]
+    #[should_panic(expected = "shard already holds different data")]
+    fn a_reinit_with_different_contents_is_refused() {
+        let config = InboxConfig { self_zone: [9; 32] };
+        apply(
+            Effect::InitConfig(InboxConfig { self_zone: [8; 32] }),
+            &config.to_bytes(),
+        );
+    }
 }

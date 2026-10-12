@@ -4,6 +4,10 @@
 //! drawn from the existing per-program unit tests, then prints a table and writes a
 //! JSON dump for regression comparison.
 //!
+//! A program instruction is two kinds of guest invocation, not one: a planner run that sees
+//! only account handles and emits shard effects, and one apply run per effect that sees a
+//! single shard's data. Both are measured, one row each, because a caller pays for all of them.
+//!
 //! Run with `cargo run --release -p cycle_bench`. `RISC0_DEV_MODE` has no effect on
 //! executor cycle counts.
 
@@ -20,26 +24,35 @@
     reason = "Bench tool: matches test-style fixture code"
 )]
 
-use std::{path::PathBuf, time::Instant};
+use std::{
+    collections::{HashMap, HashSet},
+    path::PathBuf,
+    time::Instant,
+};
 
-use amm_core::{PoolDefinition, compute_liquidity_token_pda, compute_pool_pda, compute_vault_pda};
-use anyhow::Result;
-use associated_token_account_core::{compute_ata_seed, get_associated_token_account_id};
+use anyhow::{Result, bail};
 use clap::Parser;
 use clock_core::{
     CLOCK_01_PROGRAM_ACCOUNT_ID, CLOCK_10_PROGRAM_ACCOUNT_ID, CLOCK_50_PROGRAM_ACCOUNT_ID,
     ClockAccountData,
 };
 use cycle_bench::{ppe, stats::Stats};
+use fee_core::{BlockFeeSummary, state::FeeState};
 use lee::program::Program;
 use lee_core::{
-    Timestamp,
-    account::{Account, AccountId, AccountWithMetadata, Data},
-    program::InstructionData,
+    BlockId, Timestamp,
+    account::{AccountId, ProgramShardSelector, ShardData},
+    from_frame,
+    native_token::encode_balance,
+    program::{AccountMeta, ApplyInput, GuestOutput, InstructionData, PlanInput, PlanOutput},
 };
 use risc0_zkvm::{ExecutorEnv, default_executor, default_prover};
 use serde::Serialize;
-use token_core::{TokenDefinition, TokenHolding};
+
+/// Two points fit a line exactly, making R² 1.0 by construction and the slope pure noise.
+const MIN_CALIBRATION_POINTS: usize = 3;
+
+const FEE_REFUND_AMOUNT: u128 = 5_000;
 
 #[derive(Parser, Debug)]
 #[command(about = "Per-program executor and (optionally) prover cycle measurements")]
@@ -49,7 +62,7 @@ struct Cli {
     prove: bool,
 
     /// Also run privacy-preserving execution circuit (PPE) composition cases:
-    /// (a) single `auth_transfer` Transfer through `execute_and_prove`, (b) `chain_caller`
+    /// (a) single native Transfer through `execute_and_prove`, (b) `chain_caller`
     /// with depth N=1,3,5,9. Requires --features ppe at build time. Very slow.
     #[arg(long)]
     ppe: bool,
@@ -60,10 +73,27 @@ struct Cli {
     exec_iters: usize,
 }
 
+#[derive(Debug, Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+enum Phase {
+    Plan,
+    Apply,
+}
+
+impl Phase {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Plan => "plan",
+            Self::Apply => "apply",
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct BenchResult {
     program_name: &'static str,
-    instruction: &'static str,
+    instruction: String,
+    phase: Phase,
     user_cycles: u64,
     segments: usize,
     exec_stats: Stats,
@@ -116,10 +146,10 @@ impl Calibration {
     /// The fit uses best-of-N rather than the mean so a single OS scheduling spike in one
     /// case cannot tilt the slope; best-of-N is the per-case noise floor and reproduces
     /// run-to-run, which is what a pinned-hardware throughput constant needs.
-    /// Returns `None` when there are fewer than two distinct cycle counts to fit a line.
+    /// Returns `None` unless the rows clear [`MIN_CALIBRATION_POINTS`] over two or more programs.
     fn fit(results: &[BenchResult]) -> Option<Self> {
         let n = results.len();
-        if n < 2 {
+        if n < MIN_CALIBRATION_POINTS || Self::programs(results).len() < 2 {
             return None;
         }
         let xs: Vec<f64> = results.iter().map(|r| r.user_cycles as f64).collect();
@@ -168,13 +198,46 @@ impl Calibration {
     fn calibrated_ms(&self, user_cycles: u64) -> f64 {
         self.slope_ms_per_cycle * user_cycles as f64
     }
+
+    fn programs(results: &[BenchResult]) -> HashSet<&'static str> {
+        results.iter().map(|r| r.program_name).collect()
+    }
+}
+
+struct Fixture {
+    account: AccountMeta,
+    data: ShardData,
+}
+
+impl Fixture {
+    fn new(
+        account_id: AccountId,
+        is_authorized: bool,
+        program_account_id: AccountId,
+        data: ShardData,
+    ) -> Self {
+        Self {
+            account: AccountMeta::new(account_id, is_authorized, program_account_id),
+            data,
+        }
+    }
+
+    fn balance(account_id: AccountId, is_authorized: bool, balance: u128) -> Self {
+        Self {
+            account: AccountMeta::native_balance(account_id, is_authorized),
+            data: encode_balance(balance),
+        }
+    }
 }
 
 struct Case {
     program_name: &'static str,
     instruction_label: &'static str,
     program: Program,
-    pre_states: Vec<AccountWithMetadata>,
+    /// Where the program is registered on chain. Effects name this as their shard owner, so
+    /// deriving it from the image id instead would make every plan panic.
+    program_account_id: AccountId,
+    fixtures: Vec<Fixture>,
     instruction_data: InstructionData,
 }
 
@@ -183,313 +246,275 @@ impl Case {
         program_name: &'static str,
         instruction_label: &'static str,
         program: Program,
-        pre_states: Vec<AccountWithMetadata>,
+        program_account_id: AccountId,
+        fixtures: Vec<Fixture>,
         instruction: &I,
     ) -> Result<Self> {
         Ok(Self {
             program_name,
             instruction_label,
             program,
-            pre_states,
+            program_account_id,
+            fixtures,
             instruction_data: borsh::to_vec(instruction)?,
         })
     }
 
-    fn run(self, prove: bool, exec_iters: usize) -> Result<BenchResult> {
+    fn run(self, prove: bool, exec_iters: usize) -> Result<Vec<BenchResult>> {
         let Self {
             program_name,
             instruction_label,
             program,
-            pre_states,
+            program_account_id: self_account_id,
+            fixtures,
             instruction_data,
         } = self;
-        let self_account_id: AccountId = program.id().into();
-        let caller_account_id: Option<AccountId> = None;
 
-        // One warmup pass discarded, then `exec_iters` samples. The executor has
-        // large per-call setup overhead (ELF parsing, env init); reporting both
-        // best-of-N and mean ± stdev shows whether jitter is significant.
-        let mut samples: Vec<f64> = Vec::with_capacity(exec_iters);
-        let mut last_info = None;
-        let total = exec_iters.saturating_add(1).max(2);
-        for iter in 0..total {
-            let mut env_builder = ExecutorEnv::builder();
-            program.write_inputs(
-                self_account_id,
-                caller_account_id,
-                &pre_states,
-                &instruction_data,
-                &mut env_builder,
-            )?;
-            let env = env_builder.build()?;
+        let mut shards: HashMap<ProgramShardSelector, ShardData> = fixtures
+            .iter()
+            .map(|f| (ProgramShardSelector::from(&f.account), f.data.clone()))
+            .collect();
+        let input = PlanInput {
+            self_account_id,
+            caller_account_id: None,
+            accounts: fixtures.into_iter().map(|f| f.account).collect(),
+            instruction_data,
+        };
 
-            let started = Instant::now();
-            let info = default_executor().execute(env, program.elf())?;
-            let elapsed_ms = started.elapsed().as_secs_f64() * 1_000.0;
-
-            if iter > 0 {
-                samples.push(elapsed_ms);
-            }
-            last_info = Some(info);
-        }
-        let info = last_info.expect("at least one iteration");
-        let exec_stats = Stats::from_samples(&samples);
-
-        let mut prove_stats = None;
-        let mut prove_total_cycles = None;
-        let mut prove_user_cycles = None;
-        let mut prove_paging_cycles = None;
-        let mut prove_segments = None;
-        if prove {
-            let mut env_builder = ExecutorEnv::builder();
-            program.write_inputs(
-                self_account_id,
-                caller_account_id,
-                &pre_states,
-                &instruction_data,
-                &mut env_builder,
-            )?;
-            let env = env_builder.build()?;
-
-            let started = Instant::now();
-            let prove_info = default_prover()
-                .prove(env, program.elf())
-                .map_err(|e| anyhow::anyhow!("prove failed: {e}"))?;
-            let prove_ms = started.elapsed().as_secs_f64() * 1_000.0;
-            prove_stats = Some(Stats::from_samples(&[prove_ms]));
-            prove_total_cycles = Some(prove_info.stats.total_cycles);
-            prove_user_cycles = Some(prove_info.stats.user_cycles);
-            prove_paging_cycles = Some(prove_info.stats.paging_cycles);
-            prove_segments = Some(prove_info.stats.segments);
-            eprintln!(
-                "  prove({program_name}/{instruction_label}): {prove_ms:.1} ms ({:.1}s), total_cycles={}, segments={}",
-                prove_ms / 1_000.0,
-                prove_info.stats.total_cycles,
-                prove_info.stats.segments,
-            );
-        }
-
-        Ok(BenchResult {
+        let mut rows = Vec::new();
+        let (journal, row) = sample(
             program_name,
-            instruction: instruction_label,
-            user_cycles: info.cycles(),
-            segments: info.segments.len(),
-            exec_stats,
-            net_compute_ms: None,
-            calibrated_ms: None,
-            prove_stats,
-            prove_total_cycles,
-            prove_user_cycles,
-            prove_paging_cycles,
-            prove_segments,
-        })
-    }
-}
+            instruction_label,
+            Phase::Plan,
+            &program,
+            prove,
+            exec_iters,
+            |env| Ok(Program::write_plan_inputs(&input, env)?),
+        )?;
+        rows.push(row);
 
-fn authenticated_transfer_transfer() -> Vec<AccountWithMetadata> {
-    let sender = AccountWithMetadata {
-        account: Account {
-            balance: 1_000_000,
-            ..Account::default()
-        },
-        is_authorized: true,
-        account_id: AccountId::new([1; 32]),
-    };
-    let recipient = AccountWithMetadata {
-        account: Account::default(),
-        is_authorized: false,
-        account_id: AccountId::new([2; 32]),
-    };
-    vec![sender, recipient]
-}
+        let plan = plan_journal(&journal)?;
+        for effect in plan.effects {
+            let apply_input = ApplyInput {
+                self_account_id,
+                selector: effect.selector,
+                pre_data: shards.get(&effect.selector).cloned().unwrap_or_default(),
+                effect_data: effect.data,
+            };
+            let (output, apply_row) = sample(
+                program_name,
+                instruction_label,
+                Phase::Apply,
+                &program,
+                prove,
+                exec_iters,
+                |env| Ok(Program::write_apply_inputs(&apply_input, env)?),
+            )?;
+            rows.push(apply_row);
 
-fn token_holding(
-    definition_id: AccountId,
-    account_id: AccountId,
-    balance: u128,
-    is_authorized: bool,
-) -> AccountWithMetadata {
-    AccountWithMetadata {
-        account: Account {
-            program_owner: programs::token().id().into(),
-            balance: 0,
-            data: Data::from(&TokenHolding::Fungible {
-                definition_id,
-                balance,
-            }),
-            nonce: 0_u128.into(),
-        },
-        is_authorized,
-        account_id,
-    }
-}
-
-fn token_definition(
-    account_id: AccountId,
-    total_supply: u128,
-    is_authorized: bool,
-) -> AccountWithMetadata {
-    AccountWithMetadata {
-        account: Account {
-            program_owner: programs::token().id().into(),
-            balance: 0,
-            data: Data::from(&TokenDefinition::Fungible {
-                name: String::from("test"),
-                total_supply,
-                metadata_id: None,
-            }),
-            nonce: 0_u128.into(),
-        },
-        is_authorized,
-        account_id,
-    }
-}
-
-fn token_transfer_pre_states() -> Vec<AccountWithMetadata> {
-    let def = AccountId::new([15; 32]);
-    let sender = token_holding(def, AccountId::new([17; 32]), 100_000, true);
-    let recipient = token_holding(def, AccountId::new([42; 32]), 50_000, true);
-    vec![sender, recipient]
-}
-
-fn token_mint_pre_states() -> Vec<AccountWithMetadata> {
-    let def_id = AccountId::new([15; 32]);
-    let def = token_definition(def_id, 100_000, true);
-    let holding = token_holding(def_id, AccountId::new([17; 32]), 1_000, true);
-    vec![def, holding]
-}
-
-fn token_burn_pre_states() -> Vec<AccountWithMetadata> {
-    let def_id = AccountId::new([15; 32]);
-    let def = token_definition(def_id, 100_000, true);
-    let holding = token_holding(def_id, AccountId::new([17; 32]), 1_000, true);
-    vec![def, holding]
-}
-
-fn clock_account(account_id: AccountId, block_id: u64) -> AccountWithMetadata {
-    AccountWithMetadata {
-        account: Account {
-            program_owner: programs::clock().id().into(),
-            balance: 0,
-            data: ClockAccountData {
-                block_id,
-                timestamp: Timestamp::from(0_u64),
+            if let Some(post_data) = apply_journal(&output)?.post_data {
+                shards.insert(effect.selector, post_data);
             }
-            .to_bytes()
-            .try_into()
-            .expect("ClockAccountData should fit in account data"),
-            nonce: 0_u128.into(),
-        },
-        is_authorized: false,
-        account_id,
+        }
+
+        Ok(rows)
     }
 }
 
-fn clock_pre_states_tick_at(block_id: u64) -> Vec<AccountWithMetadata> {
+/// One warmup pass discarded. The executor has
+/// large per-call setup overhead (ELF parsing, env init); reporting both
+/// best-of-N and mean ± stdev shows whether jitter is significant.
+fn sample(
+    program_name: &'static str,
+    instruction_label: &'static str,
+    phase: Phase,
+    program: &Program,
+    prove: bool,
+    exec_iters: usize,
+    write: impl Fn(&mut risc0_zkvm::ExecutorEnvBuilder) -> Result<()>,
+) -> Result<(Vec<u8>, BenchResult)> {
+    let mut samples: Vec<f64> = Vec::with_capacity(exec_iters);
+    let mut last_info = None;
+    let total = exec_iters.saturating_add(1).max(2);
+    for iter in 0..total {
+        let mut env_builder = ExecutorEnv::builder();
+        write(&mut env_builder)?;
+        let env = env_builder.build()?;
+
+        let started = Instant::now();
+        let info = default_executor().execute(env, program.elf())?;
+        let elapsed_ms = started.elapsed().as_secs_f64() * 1_000.0;
+
+        if iter > 0 {
+            samples.push(elapsed_ms);
+        }
+        last_info = Some(info);
+    }
+    let info = last_info.expect("at least one iteration");
+    let exec_stats = Stats::from_samples(&samples);
+
+    let mut prove_stats = None;
+    let mut prove_total_cycles = None;
+    let mut prove_user_cycles = None;
+    let mut prove_paging_cycles = None;
+    let mut prove_segments = None;
+    if prove {
+        let mut env_builder = ExecutorEnv::builder();
+        write(&mut env_builder)?;
+        let env = env_builder.build()?;
+
+        let started = Instant::now();
+        let prove_info = default_prover()
+            .prove(env, program.elf())
+            .map_err(|e| anyhow::anyhow!("prove failed: {e}"))?;
+        let prove_ms = started.elapsed().as_secs_f64() * 1_000.0;
+        prove_stats = Some(Stats::from_samples(&[prove_ms]));
+        prove_total_cycles = Some(prove_info.stats.total_cycles);
+        prove_user_cycles = Some(prove_info.stats.user_cycles);
+        prove_paging_cycles = Some(prove_info.stats.paging_cycles);
+        prove_segments = Some(prove_info.stats.segments);
+        eprintln!(
+            "  prove({program_name}/{instruction_label}/{}): {prove_ms:.1} ms ({:.1}s), total_cycles={}, segments={}",
+            phase.label(),
+            prove_ms / 1_000.0,
+            prove_info.stats.total_cycles,
+            prove_info.stats.segments,
+        );
+    }
+
+    let result = BenchResult {
+        program_name,
+        instruction: instruction_label.to_owned(),
+        phase,
+        user_cycles: info.cycles(),
+        segments: info.segments.len(),
+        exec_stats,
+        net_compute_ms: None,
+        calibrated_ms: None,
+        prove_stats,
+        prove_total_cycles,
+        prove_user_cycles,
+        prove_paging_cycles,
+        prove_segments,
+    };
+    Ok((info.journal.bytes, result))
+}
+
+fn guest_output(journal: &[u8]) -> Result<GuestOutput> {
+    let payload = from_frame(journal).ok_or_else(|| anyhow::anyhow!("malformed journal frame"))?;
+    Ok(borsh::from_slice(payload)?)
+}
+
+fn plan_journal(journal: &[u8]) -> Result<PlanOutput> {
+    match guest_output(journal)? {
+        GuestOutput::Plan(plan) => Ok(plan),
+        GuestOutput::Apply(_) => bail!("a scheduled plan returned an apply journal"),
+    }
+}
+
+fn apply_journal(journal: &[u8]) -> Result<lee_core::program::ApplyOutput> {
+    match guest_output(journal)? {
+        GuestOutput::Apply(output) => Ok(output),
+        GuestOutput::Plan(_) => bail!("a scheduled apply returned a plan journal"),
+    }
+}
+
+/// Fee's plan derives its PDAs from its own address, so fixtures must use the same value.
+fn fee_self_account_id() -> AccountId {
+    programs::fee_account_id()
+}
+
+fn fee_distribute_summary() -> BlockFeeSummary {
+    BlockFeeSummary {
+        gas_used_exec: 1_000_000,
+        gas_used_stor: 100_000,
+        revenue_base: 8_000_000,
+        revenue_tip: 64,
+    }
+}
+
+fn fee_distribute_payout() -> u128 {
+    FeeState::genesis().apply_block(&fee_distribute_summary())
+}
+
+fn fee_distribute_accounts() -> Vec<Fixture> {
+    let fee_id = fee_self_account_id();
+    let summary = fee_distribute_summary();
+    // The inspect effect refuses an inbox holding anything but the block's revenue.
+    let collected = summary.revenue_base.saturating_add(summary.revenue_tip);
+    vec![
+        Fixture::new(
+            fee_core::compute_fee_state_account_id(fee_id),
+            true,
+            fee_id,
+            FeeState::genesis()
+                .to_bytes()
+                .try_into()
+                .expect("FeeState should fit in account data"),
+        ),
+        Fixture::balance(fee_core::compute_fee_escrow_account_id(fee_id), true, 0),
+        Fixture::balance(
+            fee_core::compute_fee_inbox_account_id(fee_id),
+            true,
+            collected,
+        ),
+        Fixture::balance(AccountId::new([71; 32]), true, 0),
+    ]
+}
+
+fn fee_refund_accounts() -> Vec<Fixture> {
+    vec![
+        Fixture::balance(
+            fee_core::compute_fee_inbox_account_id(fee_self_account_id()),
+            true,
+            FEE_REFUND_AMOUNT,
+        ),
+        Fixture::balance(AccountId::new([72; 32]), true, 0),
+    ]
+}
+
+/// A shard-write of `bytes` bytes. The payload is the cycle dial: the built-in programs left in
+/// the repo all sit under 30k cycles, too narrow a range to condition the calibration fit.
+fn data_writer_case(label: &'static str, bytes: usize) -> Result<Case> {
+    let program = test_programs::data_writer();
+    let program_account_id = AccountId::from_builtin_program(program.id());
+    let fixtures = vec![Fixture::new(
+        AccountId::new([83; 32]),
+        true,
+        program_account_id,
+        ShardData::default(),
+    )];
+    Case::new(
+        "data_writer",
+        label,
+        program,
+        program_account_id,
+        fixtures,
+        &vec![7_u8; bytes],
+    )
+}
+
+fn clock_account(account_id: AccountId, block_id: BlockId) -> Fixture {
+    Fixture::new(
+        account_id,
+        false,
+        programs::clock_account_id(),
+        ClockAccountData {
+            block_id,
+            timestamp: Timestamp::from(0_u64),
+        }
+        .to_bytes()
+        .try_into()
+        .expect("ClockAccountData should fit in account data"),
+    )
+}
+
+fn clock_accounts_tick_at(block_id: BlockId) -> Vec<Fixture> {
     vec![
         clock_account(CLOCK_01_PROGRAM_ACCOUNT_ID, block_id),
         clock_account(CLOCK_10_PROGRAM_ACCOUNT_ID, block_id),
         clock_account(CLOCK_50_PROGRAM_ACCOUNT_ID, block_id),
     ]
-}
-
-fn amm_token_a_def_id() -> AccountId {
-    AccountId::new([42; 32])
-}
-fn amm_token_b_def_id() -> AccountId {
-    AccountId::new([43; 32])
-}
-fn amm_pool_id() -> AccountId {
-    compute_pool_pda(
-        programs::amm().id().into(),
-        amm_token_a_def_id(),
-        amm_token_b_def_id(),
-    )
-}
-fn amm_vault_a_id() -> AccountId {
-    compute_vault_pda(
-        programs::amm().id().into(),
-        amm_pool_id(),
-        amm_token_a_def_id(),
-    )
-}
-fn amm_vault_b_id() -> AccountId {
-    compute_vault_pda(
-        programs::amm().id().into(),
-        amm_pool_id(),
-        amm_token_b_def_id(),
-    )
-}
-fn amm_lp_def_id() -> AccountId {
-    compute_liquidity_token_pda(programs::amm().id().into(), amm_pool_id())
-}
-
-/// Pool seeded with reserves `1_000` / `500`, lp supply `sqrt(1000*500) = 707`.
-fn amm_pool_account() -> AccountWithMetadata {
-    let reserve_a: u128 = 1_000;
-    let reserve_b: u128 = 500;
-    let lp_supply = (reserve_a * reserve_b).isqrt();
-    AccountWithMetadata {
-        account: Account {
-            program_owner: programs::amm().id().into(),
-            balance: 0,
-            data: Data::from(&PoolDefinition {
-                definition_token_a_id: amm_token_a_def_id(),
-                definition_token_b_id: amm_token_b_def_id(),
-                vault_a_id: amm_vault_a_id(),
-                vault_b_id: amm_vault_b_id(),
-                liquidity_pool_id: amm_lp_def_id(),
-                liquidity_pool_supply: lp_supply,
-                reserve_a,
-                reserve_b,
-                fees: 0,
-                active: true,
-            }),
-            nonce: 0_u128.into(),
-        },
-        is_authorized: true,
-        account_id: amm_pool_id(),
-    }
-}
-
-fn amm_swap_pre_states() -> Vec<AccountWithMetadata> {
-    let pool = amm_pool_account();
-    let vault_a = token_holding(amm_token_a_def_id(), amm_vault_a_id(), 1_000, true);
-    let vault_b = token_holding(amm_token_b_def_id(), amm_vault_b_id(), 500, true);
-    let user_a = token_holding(amm_token_a_def_id(), AccountId::new([45; 32]), 1_000, true);
-    let user_b = token_holding(amm_token_b_def_id(), AccountId::new([46; 32]), 500, false);
-    vec![pool, vault_a, vault_b, user_a, user_b]
-}
-
-fn amm_add_liquidity_pre_states() -> Vec<AccountWithMetadata> {
-    let pool = amm_pool_account();
-    let vault_a = token_holding(amm_token_a_def_id(), amm_vault_a_id(), 1_000, true);
-    let vault_b = token_holding(amm_token_b_def_id(), amm_vault_b_id(), 500, true);
-    let lp_supply = (1_000_u128 * 500_u128).isqrt();
-    let lp_def = token_definition(amm_lp_def_id(), lp_supply, true);
-    let user_a = token_holding(amm_token_a_def_id(), AccountId::new([45; 32]), 1_000, true);
-    let user_b = token_holding(amm_token_b_def_id(), AccountId::new([46; 32]), 500, true);
-    let user_lp = token_holding(amm_lp_def_id(), AccountId::new([47; 32]), 0, true);
-    vec![pool, vault_a, vault_b, lp_def, user_a, user_b, user_lp]
-}
-
-fn ata_create_pre_states() -> Vec<AccountWithMetadata> {
-    let owner_id = AccountId::new([91; 32]);
-    let definition_id = AccountId::new([15; 32]);
-    let owner = AccountWithMetadata {
-        account: Account::default(),
-        is_authorized: true,
-        account_id: owner_id,
-    };
-    let token_def = token_definition(definition_id, 100_000, false);
-    let seed = compute_ata_seed(owner_id, definition_id);
-    let ata_id = get_associated_token_account_id(&programs::ata().id().into(), &seed);
-    let ata_account = AccountWithMetadata {
-        account: Account::default(),
-        is_authorized: false,
-        account_id: ata_id,
-    };
-    vec![owner, token_def, ata_account]
 }
 
 fn main() -> Result<()> {
@@ -500,85 +525,73 @@ fn main() -> Result<()> {
         eprintln!("cycle_bench: prove mode ON, this will be slow (~minutes per program)");
     }
 
+    // `Advance` requires each clock account's pre-state one block below the instruction's.
     let cases = [
-        Case::new(
-            "authenticated_transfer",
-            "Transfer",
-            programs::authenticated_transfer(),
-            authenticated_transfer_transfer(),
-            &authenticated_transfer_core::Instruction::Transfer { amount: 5_000 },
-        )?,
-        Case::new(
-            "token",
-            "Transfer",
-            programs::token(),
-            token_transfer_pre_states(),
-            &token_core::Instruction::Transfer {
-                amount_to_transfer: 5_000,
-            },
-        )?,
-        Case::new(
-            "token",
-            "Mint",
-            programs::token(),
-            token_mint_pre_states(),
-            &token_core::Instruction::Mint {
-                amount_to_mint: 5_000,
-            },
-        )?,
-        Case::new(
-            "token",
-            "Burn",
-            programs::token(),
-            token_burn_pre_states(),
-            &token_core::Instruction::Burn {
-                amount_to_burn: 500,
-            },
-        )?,
         Case::new(
             "clock",
             "Tick (block_id+1, no multiples)",
             programs::clock(),
-            clock_pre_states_tick_at(0),
-            &Timestamp::from(1_700_000_000_u64),
-        )?,
-        Case::new(
-            "amm",
-            "SwapExactInput",
-            programs::amm(),
-            amm_swap_pre_states(),
-            &amm_core::Instruction::SwapExactInput {
-                swap_amount_in: 200,
-                min_amount_out: 1,
-                token_definition_id_in: amm_token_a_def_id(),
+            programs::clock_account_id(),
+            clock_accounts_tick_at(0),
+            &clock_core::Instruction {
+                timestamp: Timestamp::from(1_700_000_000_u64),
+                block_id: 1,
             },
         )?,
         Case::new(
-            "amm",
-            "AddLiquidity",
-            programs::amm(),
-            amm_add_liquidity_pre_states(),
-            &amm_core::Instruction::AddLiquidity {
-                min_amount_liquidity: 1,
-                max_amount_to_add_token_a: 400,
-                max_amount_to_add_token_b: 200,
+            "clock",
+            "Tick (10-block rollup)",
+            programs::clock(),
+            programs::clock_account_id(),
+            clock_accounts_tick_at(9),
+            &clock_core::Instruction {
+                timestamp: Timestamp::from(1_700_000_000_u64),
+                block_id: 10,
             },
         )?,
         Case::new(
-            "ata",
-            "Create",
-            programs::ata(),
-            ata_create_pre_states(),
-            &associated_token_account_core::Instruction::Create {
-                ata_program_id: programs::ata().id().into(),
+            "clock",
+            "Tick (10 and 50-block rollups)",
+            programs::clock(),
+            programs::clock_account_id(),
+            clock_accounts_tick_at(49),
+            &clock_core::Instruction {
+                timestamp: Timestamp::from(1_700_000_000_u64),
+                block_id: 50,
             },
         )?,
+        Case::new(
+            "fee",
+            "Distribute",
+            programs::fee(),
+            programs::fee_account_id(),
+            fee_distribute_accounts(),
+            &fee_core::Instruction::Distribute {
+                summary: fee_distribute_summary(),
+                payout: fee_distribute_payout(),
+            },
+        )?,
+        Case::new(
+            "fee",
+            "Refund",
+            programs::fee(),
+            programs::fee_account_id(),
+            fee_refund_accounts(),
+            &fee_core::Instruction::Refund {
+                amount: FEE_REFUND_AMOUNT,
+            },
+        )?,
+        data_writer_case("Write 4 KiB", 4 * 1024)?,
+        data_writer_case("Write 64 KiB", 64 * 1024)?,
     ];
 
     let mut results: Vec<BenchResult> = cases
         .into_iter()
         .map(|c| c.run(prove, exec_iters))
-        .collect::<Result<Vec<_>>>()?;
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .flatten()
+        .collect();
 
     let calibration = Calibration::fit(&results);
     if let Some(cal) = calibration {
@@ -586,6 +599,12 @@ fn main() -> Result<()> {
             r.calibrated_ms = Some(cal.calibrated_ms(r.user_cycles));
             r.net_compute_ms = Some(r.exec_stats.best_ms - cal.intercept_ms);
         }
+    } else {
+        eprintln!(
+            "cycle_bench: NO CALIBRATION. {} row(s) over {} program(s); needs {MIN_CALIBRATION_POINTS}+ rows over 2+ programs. calib_ms and net_ms are omitted.",
+            results.len(),
+            Calibration::programs(&results).len(),
+        );
     }
 
     print_table(&results, prove);
@@ -656,6 +675,7 @@ fn print_table(results: &[BenchResult], prove: bool) {
         .max()
         .unwrap_or(0)
         .max("instruction".len());
+    let fw = "phase".len();
     let cw = 12_usize;
     let sw = 8_usize;
     let exec_w = results
@@ -667,16 +687,20 @@ fn print_table(results: &[BenchResult], prove: bool) {
 
     let dw = 10_usize;
     println!(
-        "{:<pw$}  {:<iw$}  {:>cw$}  {:>sw$}  {:<exec_w$}  {:>dw$}  {:>dw$}",
+        "{:<pw$}  {:<iw$}  {:<fw$}  {:>cw$}  {:>sw$}  {:<exec_w$}  {:>dw$}  {:>dw$}",
         "program",
         "instruction",
+        "phase",
         "user_cycles",
         "segments",
         "exec_ms (best / mean ± stdev)",
         "calib_ms",
         "net_ms",
     );
-    println!("{}", "-".repeat(pw + iw + cw + sw + exec_w + 2 * dw + 12));
+    println!(
+        "{}",
+        "-".repeat(pw + iw + fw + cw + sw + exec_w + 2 * dw + 14)
+    );
     for r in results {
         let calib = r
             .calibrated_ms
@@ -685,8 +709,15 @@ fn print_table(results: &[BenchResult], prove: bool) {
             .net_compute_ms
             .map_or_else(|| "-".to_owned(), |v| format!("{v:.2}"));
         println!(
-            "{:<pw$}  {:<iw$}  {:>cw$}  {:>sw$}  {:<exec_w$}  {:>dw$}  {:>dw$}",
-            r.program_name, r.instruction, r.user_cycles, r.segments, r.exec_stats, calib, net,
+            "{:<pw$}  {:<iw$}  {:<fw$}  {:>cw$}  {:>sw$}  {:<exec_w$}  {:>dw$}  {:>dw$}",
+            r.program_name,
+            r.instruction,
+            r.phase.label(),
+            r.user_cycles,
+            r.segments,
+            r.exec_stats,
+            calib,
+            net,
         );
     }
 
@@ -696,10 +727,10 @@ fn print_table(results: &[BenchResult], prove: bool) {
         let pwallw = 24_usize;
         let psw = 10_usize;
         println!(
-            "{:<pw$}  {:<iw$}  {:>pcw$}  {:>pwallw$}  {:>psw$}",
-            "program", "instruction", "prove_total_c", "prove_ms (s)", "prove_segs",
+            "{:<pw$}  {:<iw$}  {:<fw$}  {:>pcw$}  {:>pwallw$}  {:>psw$}",
+            "program", "instruction", "phase", "prove_total_c", "prove_ms (s)", "prove_segs",
         );
-        println!("{}", "-".repeat(pw + iw + pcw + pwallw + psw + 8));
+        println!("{}", "-".repeat(pw + iw + fw + pcw + pwallw + psw + 10));
         for r in results {
             let total = r
                 .prove_total_cycles
@@ -712,8 +743,13 @@ fn print_table(results: &[BenchResult], prove: bool) {
                 .prove_segments
                 .map_or_else(|| "-".to_owned(), |s| s.to_string());
             println!(
-                "{:<pw$}  {:<iw$}  {:>pcw$}  {:>pwallw$}  {:>psw$}",
-                r.program_name, r.instruction, total, pms, psegs,
+                "{:<pw$}  {:<iw$}  {:<fw$}  {:>pcw$}  {:>pwallw$}  {:>psw$}",
+                r.program_name,
+                r.instruction,
+                r.phase.label(),
+                total,
+                pms,
+                psegs,
             );
         }
     }
@@ -723,14 +759,19 @@ fn print_table(results: &[BenchResult], prove: bool) {
 mod tests {
     use cycle_bench::stats::Stats;
 
-    use super::{BenchResult, Calibration};
+    use super::{BenchResult, Calibration, Phase};
 
     /// Minimal `BenchResult` carrying only the fields the calibration fit reads:
     /// `user_cycles` (x) and `exec_stats.best_ms` (y).
     fn point(user_cycles: u64, best_ms: f64) -> BenchResult {
+        point_in("test", user_cycles, best_ms)
+    }
+
+    fn point_in(program_name: &'static str, user_cycles: u64, best_ms: f64) -> BenchResult {
         BenchResult {
-            program_name: "test",
-            instruction: "test",
+            program_name,
+            instruction: "test".to_owned(),
+            phase: Phase::Plan,
             user_cycles,
             segments: 1,
             exec_stats: Stats::from_samples(&[best_ms]),
@@ -751,7 +792,11 @@ mod tests {
     #[test]
     fn fit_recovers_a_known_line() {
         // best_ms = 10 + 0.001 * user_cycles  ->  slope 1e-3, intercept 10, throughput 1000.
-        let results = [point(1000, 11.0), point(2000, 12.0), point(3000, 13.0)];
+        let results = [
+            point(1000, 11.0),
+            point(2000, 12.0),
+            point_in("other", 3000, 13.0),
+        ];
         let cal = Calibration::fit(&results).expect("fit over three points");
 
         assert!(
@@ -780,16 +825,27 @@ mod tests {
     }
 
     #[test]
-    fn fit_needs_at_least_two_points() {
+    fn fit_needs_at_least_three_points() {
         assert!(Calibration::fit(&[]).is_none());
         assert!(Calibration::fit(&[point(1000, 11.0)]).is_none());
+        assert!(Calibration::fit(&[point(1000, 11.0), point_in("other", 2000, 12.0)]).is_none());
+    }
+
+    #[test]
+    fn fit_refuses_rows_from_a_single_program() {
+        let results = [point(1000, 11.0), point(2000, 12.0), point(3000, 13.0)];
+        assert!(Calibration::fit(&results).is_none());
     }
 
     #[test]
     fn fit_with_identical_cycle_counts_returns_none() {
         // Zero spread in x leaves the slope undetermined; the fit must decline rather than divide
         // by zero.
-        let results = [point(1000, 11.0), point(1000, 12.0)];
+        let results = [
+            point(1000, 11.0),
+            point(1000, 12.0),
+            point_in("other", 1000, 13.0),
+        ];
         assert!(Calibration::fit(&results).is_none());
     }
 }

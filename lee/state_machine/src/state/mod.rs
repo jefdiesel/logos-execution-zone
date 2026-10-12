@@ -1,15 +1,14 @@
-use std::collections::{BTreeSet, HashMap, HashSet};
-
 use borsh::{BorshDeserialize, BorshSerialize};
 use lee_core::{
     BlockId, Commitment, CommitmentSetDigest, DUMMY_COMMITMENT, MembershipProof, Nullifier,
     Timestamp,
-    account::{Account, AccountId, Data},
+    account::{Account, AccountId, ShardData},
     program::{
         PROGRAM_LOADER_ACCOUNT_ID, ProgramHeader, ProgramId, ProgramSegment, TransactionEvent,
-        get_program_via,
+        get_program_via, immutable_mirror_commitment,
     },
 };
+use rpds::{HashTrieMapSync, HashTrieSetSync, RedBlackTreeSetSync};
 
 use crate::{
     error::LeeError,
@@ -20,14 +19,20 @@ use crate::{
     validated_state_diff::{StateDiff, ValidatedStateDiff},
 };
 
-pub const MAX_NUMBER_CHAINED_CALLS: usize = 10;
-
 #[derive(Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 #[cfg_attr(test, derive(Debug))]
 pub struct CommitmentSet {
     merkle_tree: MerkleTree,
-    commitments: HashMap<Commitment, usize>,
-    root_history: HashSet<CommitmentSetDigest>,
+    #[borsh(
+        serialize_with = "crate::encoding::persistent::serialize_map",
+        deserialize_with = "crate::encoding::persistent::deserialize_map"
+    )]
+    commitments: HashTrieMapSync<Commitment, usize>,
+    #[borsh(
+        serialize_with = "crate::encoding::persistent::serialize_set",
+        deserialize_with = "crate::encoding::persistent::deserialize_set"
+    )]
+    root_history: HashTrieSetSync<CommitmentSetDigest>,
 }
 
 impl CommitmentSet {
@@ -48,9 +53,9 @@ impl CommitmentSet {
     pub(crate) fn extend(&mut self, commitments: &[Commitment]) {
         for commitment in commitments.iter().copied() {
             let index = self.merkle_tree.insert(commitment.to_byte_array());
-            self.commitments.insert(commitment, index);
+            self.commitments.insert_mut(commitment, index);
         }
-        self.root_history.insert(self.digest());
+        self.root_history.insert_mut(self.digest());
     }
 
     fn contains(&self, commitment: &Commitment) -> bool {
@@ -63,23 +68,25 @@ impl CommitmentSet {
     pub(crate) fn with_capacity(capacity: usize) -> Self {
         Self {
             merkle_tree: MerkleTree::with_capacity(capacity),
-            commitments: HashMap::new(),
-            root_history: HashSet::new(),
+            commitments: HashTrieMapSync::new_sync(),
+            root_history: HashTrieSetSync::new_sync(),
         }
     }
 }
 
 #[cfg_attr(test, derive(Debug))]
 #[derive(Clone, PartialEq, Eq)]
-struct NullifierSet(BTreeSet<Nullifier>);
+struct NullifierSet(RedBlackTreeSetSync<Nullifier>);
 
 impl NullifierSet {
-    const fn new() -> Self {
-        Self(BTreeSet::new())
+    fn new() -> Self {
+        Self(RedBlackTreeSetSync::new_sync())
     }
 
     fn extend(&mut self, new_nullifiers: &[Nullifier]) {
-        self.0.extend(new_nullifiers);
+        for nullifier in new_nullifiers {
+            self.0.insert_mut(*nullifier);
+        }
     }
 
     fn contains(&self, nullifier: &Nullifier) -> bool {
@@ -97,14 +104,15 @@ impl BorshDeserialize for NullifierSet {
     fn deserialize_reader<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
         let vec = Vec::<Nullifier>::deserialize_reader(reader)?;
 
-        let mut set = BTreeSet::new();
+        let mut set = RedBlackTreeSetSync::new_sync();
         for n in vec {
-            if !set.insert(n) {
+            if set.contains(&n) {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     "duplicate nullifier in NullifierSet",
                 ));
             }
+            set.insert_mut(n);
         }
 
         Ok(Self(set))
@@ -114,7 +122,11 @@ impl BorshDeserialize for NullifierSet {
 #[derive(Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 #[cfg_attr(test, derive(Debug))]
 pub struct V03State {
-    public_state: HashMap<AccountId, Account>,
+    #[borsh(
+        serialize_with = "crate::encoding::persistent::serialize_map",
+        deserialize_with = "crate::encoding::persistent::deserialize_map"
+    )]
+    public_state: HashTrieMapSync<AccountId, Account>,
     private_state: (CommitmentSet, NullifierSet),
 }
 
@@ -126,7 +138,7 @@ impl Default for V03State {
         let private_state = (commitment_set, nullifier_set);
 
         Self {
-            public_state: HashMap::default(),
+            public_state: HashTrieMapSync::new_sync(),
             private_state,
         }
     }
@@ -150,16 +162,10 @@ impl V03State {
         mut self,
         balances: impl IntoIterator<Item = (AccountId, u128)>,
     ) -> Self {
-        let public_accounts = balances.into_iter().map(|(account_id, balance)| {
-            (
-                account_id,
-                Account {
-                    balance,
-                    ..Account::default()
-                },
-            )
-        });
-        self.public_state.extend(public_accounts);
+        for (account_id, balance) in balances {
+            self.public_state
+                .insert_mut(account_id, Account::funded(balance));
+        }
         self
     }
 
@@ -169,7 +175,9 @@ impl V03State {
         mut self,
         public_accounts: impl IntoIterator<Item = (AccountId, Account)>,
     ) -> Self {
-        self.public_state.extend(public_accounts);
+        for (account_id, account) in public_accounts {
+            self.public_state.insert_mut(account_id, account);
+        }
         self
     }
 
@@ -186,52 +194,93 @@ impl V03State {
         self
     }
 
-    /// Initializes state with given builtin programs.
     #[must_use]
-    pub fn with_programs(mut self, programs: impl IntoIterator<Item = Program>) -> Self {
-        for program in programs {
-            self.insert_program(&program);
+    pub fn with_named_programs(
+        mut self,
+        programs: impl IntoIterator<Item = (AccountId, Program)>,
+    ) -> Self {
+        for (account_id, program) in programs {
+            self.insert_program_at(account_id, &program, true);
         }
         self
     }
 
-    /// Seeds a builtin as a loader-owned header pointing at one segment holding its whole ELF —
-    /// the same shape a live `program_loader` deploy produces, just written directly rather than
-    /// through a transaction. The header keeps living at the bijection address
-    /// (`AccountId::from(program.id())`) so existing call sites addressing builtins by `ProgramId`
-    /// keep working; the segment's address is this function's own internal convention, never
-    /// independently recomputed elsewhere.
-    pub(crate) fn insert_program(&mut self, program: &Program) {
-        let header_account_id = AccountId::from(program.id());
-        let segment_account_id = genesis_segment_account_id(header_account_id);
+    #[must_use]
+    pub fn with_programs(self, programs: impl IntoIterator<Item = Program>) -> Self {
+        self.with_genesis_programs(programs.into_iter().map(|program| (program, true)))
+    }
 
-        let segment = Account {
-            program_owner: PROGRAM_LOADER_ACCOUNT_ID,
-            data: Data::try_from(
-                ProgramSegment {
-                    bytecode: program.elf().to_vec(),
-                    next_segment: None,
-                }
-                .to_bytes(),
-            )
-            .expect("elf must fit under DATA_MAX_LENGTH"),
-            ..Account::default()
+    #[must_use]
+    pub fn with_genesis_programs(
+        mut self,
+        programs: impl IntoIterator<Item = (Program, bool)>,
+    ) -> Self {
+        for (program, immutable) in programs {
+            self.insert_program(&program, immutable);
+        }
+        self
+    }
+
+    /// Seeds a builtin as a loader-owned header pointing at a segment chain holding its
+    /// `user_elf`, chunked the same way a live `program_loader` deploy would.
+    pub(crate) fn insert_program(&mut self, program: &Program, immutable: bool) {
+        self.insert_program_at(
+            AccountId::from_builtin_program(program.id()),
+            program,
+            immutable,
+        );
+    }
+
+    fn insert_program_at(
+        &mut self,
+        header_account_id: AccountId,
+        program: &Program,
+        immutable: bool,
+    ) {
+        let user_elf = risc0_binfmt::ProgramBinary::decode(program.elf())
+            .expect("builtin program must be a valid ProgramBinary")
+            .user_elf
+            .to_vec();
+
+        let chunks: Vec<&[u8]> = user_elf
+            .chunks(program_loader_core::MAX_SEGMENT_DATA_LEN)
+            .collect();
+        let segment_account_ids: Vec<AccountId> = (0..chunks.len())
+            .map(|i| genesis_segment_account_id(header_account_id, i))
+            .collect();
+
+        for (i, chunk) in chunks.iter().enumerate() {
+            let segment = Account::default().with_shard(
+                PROGRAM_LOADER_ACCOUNT_ID,
+                ShardData::try_from(
+                    ProgramSegment {
+                        bytecode: chunk.to_vec(),
+                        next_segment: segment_account_ids.get(i.saturating_add(1)).copied(),
+                    }
+                    .to_bytes(),
+                )
+                .expect("segment fits under DATA_MAX_LENGTH"),
+            );
+            self.public_state
+                .insert_mut(segment_account_ids[i], segment);
+        }
+
+        let program_header = ProgramHeader {
+            image_id: program.id(),
+            program_first_segment: segment_account_ids[0],
+            immutable,
         };
-        let header = Account {
-            program_owner: PROGRAM_LOADER_ACCOUNT_ID,
-            data: Data::try_from(
-                ProgramHeader {
-                    image_id: program.id(),
-                    program_first_segment: segment_account_id,
-                    immutable: true,
-                }
-                .to_bytes(),
-            )
-            .expect("program header fits under DATA_MAX_LENGTH"),
-            ..Account::default()
-        };
-        self.public_state.insert(segment_account_id, segment);
-        self.public_state.insert(header_account_id, header);
+        let header = Account::default().with_shard(
+            PROGRAM_LOADER_ACCOUNT_ID,
+            ShardData::try_from(program_header.to_bytes())
+                .expect("program header fits under DATA_MAX_LENGTH"),
+        );
+        self.public_state.insert_mut(header_account_id, header);
+
+        if immutable {
+            let commitment = immutable_mirror_commitment(header_account_id, &program_header);
+            self.private_state.0.extend(&[commitment]);
+        }
     }
 
     #[must_use]
@@ -248,7 +297,7 @@ impl V03State {
             reason = "Iteration order doesn't matter here"
         )]
         for (account_id, account) in public_diff {
-            *self.get_account_by_id_mut(account_id) = account;
+            self.public_state.insert_mut(account_id, account);
         }
         for account_id in signer_account_ids {
             self.get_account_by_id_mut(account_id)
@@ -283,7 +332,12 @@ impl V03State {
     }
 
     fn get_account_by_id_mut(&mut self, account_id: AccountId) -> &mut Account {
-        self.public_state.entry(account_id).or_default()
+        if !self.public_state.contains_key(&account_id) {
+            self.public_state.insert_mut(account_id, Account::default());
+        }
+        self.public_state
+            .get_mut(&account_id)
+            .expect("the account was just inserted")
     }
 
     #[must_use]
@@ -300,18 +354,11 @@ impl V03State {
         self.public_state.get(&account_id)
     }
 
-    /// Looks up a program deployed at its bijection address (`AccountId::from(program_id)`),
-    /// reconstructing its bytecode from its header and segment chain.
-    ///
-    /// Only meaningful for programs deployed at their bijection address — genesis-seeded
-    /// builtins, or anything created through the (removed) `ProgramDeploymentTransaction`.
-    /// A program deployed through `program_loader` at an arbitrary address must be resolved
-    /// through [`get_program_via`] with the real address instead.
+    /// Reconstructs a genesis-seeded builtin's bytecode from its header and segment chain at
+    /// `account_id` — a program deployed elsewhere via `program_loader` won't be found here.
     #[must_use]
-    pub fn get_program(&self, program_id: ProgramId) -> Option<(ProgramId, Vec<u8>)> {
-        get_program_via(AccountId::from(program_id), |account_id| {
-            self.get_account_by_id(account_id)
-        })
+    pub fn get_builtin_program(&self, account_id: AccountId) -> Option<(ProgramId, Vec<u8>)> {
+        crate::program::resolve_program(account_id, |id| self.loader_shard(id))
     }
 
     /// The real `image_id` of whatever program is deployed at `account_id`, or `None` if there
@@ -321,7 +368,12 @@ impl V03State {
     /// [`ProgramImageClaim`]: lee_core::ProgramImageClaim
     #[must_use]
     pub fn get_program_image_id(&self, account_id: AccountId) -> Option<ProgramId> {
-        get_program_via(account_id, |id| self.get_account_by_id(id)).map(|(image_id, _)| image_id)
+        get_program_via(account_id, |id| self.loader_shard(id)).map(|(image_id, _)| image_id)
+    }
+
+    pub(crate) fn loader_shard(&self, account_id: AccountId) -> Option<&ShardData> {
+        self.get_account_by_id_ref(account_id)
+            .map(|account| account.data.shard(PROGRAM_LOADER_ACCOUNT_ID))
     }
 
     #[must_use]
@@ -341,8 +393,7 @@ impl V03State {
     /// (base builtins plus any directly-seeded accounts) separately from their own
     /// configs, so a divergence there would otherwise go unnoticed. Both nodes log
     /// this at startup; equal values mean the two genesis states agree. Entries are
-    /// sorted by id before hashing, so the value does not depend on `HashMap`
-    /// iteration order.
+    /// sorted by id before hashing, so the value does not depend on iteration order.
     #[must_use]
     pub fn genesis_fingerprint(&self) -> [u8; 32] {
         use sha2::{Digest as _, Sha256};
@@ -394,7 +445,7 @@ impl V03State {
             if self.private_state.1.contains(nullifier) {
                 return Err(LeeError::InvalidInput("Nullifier already seen".to_owned()));
             }
-            if !self.private_state.0.root_history.contains(digest) {
+            if !self.is_known_commitment_root(digest) {
                 return Err(LeeError::InvalidInput(
                     "Unrecognized commitment set digest".to_owned(),
                 ));
@@ -402,27 +453,34 @@ impl V03State {
         }
         Ok(())
     }
+
+    /// Whether `digest` is a root the commitment tree has actually had at some point.
+    pub(crate) fn is_known_commitment_root(&self, digest: &CommitmentSetDigest) -> bool {
+        self.private_state.0.root_history.contains(digest)
+    }
 }
 
 #[cfg(any(test, feature = "test-utils"))]
 impl V03State {
     pub fn force_insert_account(&mut self, account_id: AccountId, account: Account) {
-        self.public_state.insert(account_id, account);
+        self.public_state.insert_mut(account_id, account);
     }
 }
 
-/// The deterministic `AccountId` a genesis-seeded builtin's single segment lives at, derived
-/// from the header's own bijection address.
-///
-/// Only `insert_program` needs this — a live `program_loader` deploy has a real signer and picks
-/// its own segment addresses instead, since genesis has no signer to ask.
-fn genesis_segment_account_id(header_account_id: AccountId) -> AccountId {
+/// The deterministic `AccountId` a genesis-seeded builtin's `index`-th segment lives at.
+/// Only `insert_program` needs this — a live deploy has a real signer to pick addresses instead.
+fn genesis_segment_account_id(header_account_id: AccountId, index: usize) -> AccountId {
     use sha2::{Digest as _, Sha256};
     const GENESIS_SEGMENT_ID_PREFIX: &[u8; 32] = b"/LEE/v0.3/AccountId/GenesisSeg/\x00";
 
     let mut hasher = Sha256::new();
     hasher.update(GENESIS_SEGMENT_ID_PREFIX);
     hasher.update(header_account_id.as_ref());
+    hasher.update(
+        u32::try_from(index)
+            .expect("segment count fits in u32")
+            .to_le_bytes(),
+    );
     AccountId::new(hasher.finalize().into())
 }
 

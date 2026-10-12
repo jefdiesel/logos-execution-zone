@@ -14,7 +14,7 @@ use integration_tests::{
     verify_commitment_is_in_state,
 };
 use key_protocol::key_management::key_tree::chain_index::ChainIndex;
-use lee::AccountId;
+use lee::{Account, AccountId};
 use sequencer_service_rpc::RpcClient as _;
 use tokio::test;
 use wallet::cli::{
@@ -81,7 +81,7 @@ async fn sync_private_account_with_non_zero_chain_index() -> Result<()> {
         .wallet()
         .get_account_private(to_account_id)
         .context("Failed to get recipient's private account")?;
-    assert_eq!(to_res_acc.balance, 100);
+    assert_eq!(to_res_acc.data.native_balance().unwrap(), 100);
 
     log::info!("Successfully transferred");
 
@@ -155,12 +155,8 @@ async fn restore_keys_from_seed() -> Result<()> {
     assert_public_account_restored(&ctx, to_account_id3, "Acc 3");
     assert_public_account_restored(&ctx, to_account_id4, "Acc 4");
 
-    // Funding does not write data, so recipients stays unowned.
-    assert_eq!(acc1.account.program_owner, lee::AccountId::default());
-    assert_eq!(acc2.account.program_owner, lee::AccountId::default());
-
-    assert_eq!(acc1.account.balance, 100);
-    assert_eq!(acc2.account.balance, 101);
+    assert_eq!(acc1.account.data, Account::funded(100).data);
+    assert_eq!(acc2.account.data, Account::funded(101).data);
 
     log::info!("Tree checks passed, testing restored accounts can transact");
 

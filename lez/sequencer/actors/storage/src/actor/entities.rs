@@ -2,7 +2,9 @@ use borsh::{BorshDeserialize, BorshSerialize};
 use common::{
     HashType,
     block::{BlockMeta, PeerChainTip},
+    transaction::TxEvents,
 };
+use lee::AccountId;
 use lee_core::BlockId;
 
 use crate::actor::{
@@ -25,9 +27,6 @@ pub type CrossZoneMessageKey = [u8; 32];
 /// Zone id of a cross-zone peer, which doubles as the id of its channel.
 pub type PeerZoneKey = [u8; 32];
 
-/// The zone-sdk `MsgId` of a channel inscription, as the raw bytes it wraps.
-pub type MsgId = [u8; 32];
-
 /// Families group entities by how they are written, not by what they mean:
 /// types sharing one are still stored under disjoint keys.
 #[derive(strum::IntoStaticStr, enum_iterator::Sequence)]
@@ -40,6 +39,10 @@ pub enum ColumnFamily {
     Meta,
     /// Small records deleted as the work they track settles.
     Pending,
+    /// Many small records, contains various maps.
+    BlockMeta,
+    /// Block events.
+    Events,
 }
 
 impl db::ColumnFamilies for ColumnFamily {
@@ -47,12 +50,12 @@ impl db::ColumnFamilies for ColumnFamily {
         let mut options = rocksdb::Options::default();
 
         match *self {
-            Self::Block => {
+            Self::Block | Self::BlockMeta => {
                 // Written in bursts of whole blocks, so more memtables to fill
                 // while one flushes.
                 options.set_max_write_buffer_number(4);
             }
-            Self::State => {
+            Self::State | Self::Events => {
                 // A whole state is rewritten on every update. Blob files keep
                 // those values out of compaction, which would otherwise copy
                 // every one of them through each level.
@@ -113,6 +116,8 @@ impl db::Storable<ColumnFamily> for FinalSnapshot {
 #[derive(BorshSerialize, BorshDeserialize)]
 pub struct ZoneCheckpoint {
     pub bytes: Vec<u8>,
+    /// The channel sequence this checkpoint was minted at.
+    pub seq: u64,
 }
 
 impl db::Storable<ColumnFamily> for ZoneCheckpoint {
@@ -151,31 +156,17 @@ impl db::Storable<ColumnFamily> for ZoneAnchor {
     const TYPE_NAME: &'static str = db::type_name!(ZoneAnchor);
 }
 
-/// The `MsgId` of the newest channel inscription processed, block or not: the
-/// parent the next produced block is pinned on.
+/// The serialized unfinalized channel view the head is folded from.
 #[derive(BorshSerialize, BorshDeserialize)]
-pub struct ChannelCursor {
-    pub msg_id: MsgId,
+pub struct ChannelView {
+    pub bytes: Vec<u8>,
 }
 
-impl db::Storable<ColumnFamily> for ChannelCursor {
+impl db::Storable<ColumnFamily> for ChannelView {
     type Key = SingletonKey;
 
     const COLUMN_FAMILY: ColumnFamily = ColumnFamily::Meta;
-    const TYPE_NAME: &'static str = db::type_name!(ChannelCursor);
-}
-
-/// The highest block id this sequencer must not inscribe on the channel again.
-#[derive(BorshSerialize, BorshDeserialize)]
-pub struct PublishedHighWater {
-    pub block_id: BlockId,
-}
-
-impl db::Storable<ColumnFamily> for PublishedHighWater {
-    type Key = SingletonKey;
-
-    const COLUMN_FAMILY: ColumnFamily = ColumnFamily::Meta;
-    const TYPE_NAME: &'static str = db::type_name!(PublishedHighWater);
+    const TYPE_NAME: &'static str = db::type_name!(ChannelView);
 }
 
 /// An L1 deposit event observed but not yet seen finalized.
@@ -356,4 +347,81 @@ impl db::Storable<ColumnFamily> for CrossZonePeerTip {
 
     const COLUMN_FAMILY: ColumnFamily = ColumnFamily::Meta;
     const TYPE_NAME: &'static str = db::type_name!(CrossZonePeerTip);
+}
+
+/// The map entry between block hashes and block ids.
+#[derive(BorshSerialize, BorshDeserialize)]
+pub struct BlockHashToBlockIdMappingDestination {
+    pub block_id: BlockId,
+}
+
+impl db::Storable<ColumnFamily> for BlockHashToBlockIdMappingDestination {
+    type Key = HashType;
+
+    const COLUMN_FAMILY: ColumnFamily = ColumnFamily::BlockMeta;
+    const TYPE_NAME: &'static str = db::type_name!(BlockHashToBlockIdMappingDestination);
+}
+
+/// The map key between account id and block id, which affect this account.
+#[derive(Debug)]
+pub struct AccountIdToBlockIdKey {
+    // There can not be 2 fields here, because we need to implement AsRef<[u8]>.
+    pub key_bytes: [u8; 32 + 8],
+}
+
+impl AccountIdToBlockIdKey {
+    pub fn new(account_id: AccountId, index: u64) -> Self {
+        let mut key_bytes = [0; 32 + 8];
+
+        key_bytes[..32].copy_from_slice(account_id.as_ref());
+        #[expect(clippy::big_endian_bytes, reason = "We use big endian for `u64` in DB")]
+        key_bytes[32..].copy_from_slice(index.to_be_bytes().as_ref());
+
+        Self { key_bytes }
+    }
+}
+
+impl AsRef<[u8]> for AccountIdToBlockIdKey {
+    fn as_ref(&self) -> &[u8] {
+        self.key_bytes.as_ref()
+    }
+}
+
+/// The map entry between account id and block id, which affect this account.
+#[derive(BorshSerialize, BorshDeserialize)]
+pub struct AccountIdToBlockIdDestination {
+    pub block_id: BlockId,
+}
+
+impl db::Storable<ColumnFamily> for AccountIdToBlockIdDestination {
+    type Key = AccountIdToBlockIdKey;
+
+    const COLUMN_FAMILY: ColumnFamily = ColumnFamily::BlockMeta;
+    const TYPE_NAME: &'static str = db::type_name!(AccountIdToBlockIdDestination);
+}
+
+/// The metadata entry to store length of map for some account id.
+#[derive(BorshSerialize, BorshDeserialize)]
+pub struct AccountIdToBlockIdMetaLen {
+    pub length: u64,
+}
+
+impl db::Storable<ColumnFamily> for AccountIdToBlockIdMetaLen {
+    type Key = AccountId;
+
+    const COLUMN_FAMILY: ColumnFamily = ColumnFamily::Meta;
+    const TYPE_NAME: &'static str = db::type_name!(AccountIdToBlockIdMetaLen);
+}
+
+/// The map entry between tx hashes and block ids.
+#[derive(BorshSerialize, BorshDeserialize)]
+pub struct BlockEvents {
+    pub events: Vec<TxEvents>,
+}
+
+impl db::Storable<ColumnFamily> for BlockEvents {
+    type Key = BigEndian<BlockId>;
+
+    const COLUMN_FAMILY: ColumnFamily = ColumnFamily::Events;
+    const TYPE_NAME: &'static str = db::type_name!(BlockEvents);
 }

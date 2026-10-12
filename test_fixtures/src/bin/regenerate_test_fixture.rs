@@ -7,6 +7,7 @@ use std::{collections::HashSet, path::Path, sync::Arc};
 
 use anyhow::{Context as _, Result};
 use kameo::actor::Spawn as _;
+use logos_blockchain_key_management_system_service::keys::UnsecuredEd25519Key;
 use sequencer_storage_actor::{
     StorageActor,
     protocol::{
@@ -17,7 +18,8 @@ use sequencer_storage_actor::{
 use test_fixtures::{
     config,
     setup::{
-        SequencerSetup, fund_private_accounts, prebuilt_sequencer_db_dump_path, setup_bedrock_node,
+        SequencerSetup, fund_private_accounts, prebuilt_sequencer_db_circuit_id_path,
+        prebuilt_sequencer_db_dump_path, privacy_preserving_circuit_id_stamp, setup_bedrock_node,
         setup_wallet,
     },
 };
@@ -59,18 +61,19 @@ async fn generate_prebuilt_fixture(dest: &Path) -> Result<()> {
     let (sequencer_handle, temp_sequencer_dir) =
         SequencerSetup::new(config::SequencerPartialConfig::default(), bedrock_addr)
             .with_genesis(genesis)
-            .with_bedrock_signing_key(config::SEQUENCER_BEDROCK_SIGNING_KEY)
+            .with_bedrock_signing_key(UnsecuredEd25519Key::from_bytes(
+                &config::BEDROCK_SIGNING_KEY,
+            ))
             .setup()
             .await
             .context("Failed to setup Sequencer for fixture generation")?;
 
     let (mut wallet, _temp_wallet_dir, _wallet_password) = setup_wallet(
-        &[sequencer_handle.addr()],
+        &sequencer_handle.addr(),
         &initial_public_accounts,
         &initial_private_accounts,
         WalletConfigOverrides::default(),
     )
-    .await
     .context("Failed to setup wallet for fixture generation")?;
 
     fund_private_accounts(
@@ -122,7 +125,7 @@ async fn generate_prebuilt_fixture(dest: &Path) -> Result<()> {
         .ask(AtomicUpdate {
             checkpoint: None,
             blocks: vec![],
-            channel_cursor: None,
+            channel_view: None,
             head_tip: Some(tip.clone()),
             head_state: Arc::clone(&state),
             final_snapshot: Some((state, tip)),
@@ -134,7 +137,7 @@ async fn generate_prebuilt_fixture(dest: &Path) -> Result<()> {
             consumed_withdrawals: HashSet::new(),
             new_withdraw_intents: HashSet::new(),
             zone_anchor: None,
-            lower_published_high_water: None,
+            events: vec![],
         })
         .await
         .context("Failed to stamp the fixture final snapshot at the tip")?;
@@ -152,6 +155,14 @@ async fn generate_prebuilt_fixture(dest: &Path) -> Result<()> {
     }
     std::fs::write(dest, dump.bytes)
         .with_context(|| format!("Failed to write fixture dump to {}", dest.display()))?;
+
+    let stamp_path = prebuilt_sequencer_db_circuit_id_path();
+    std::fs::write(&stamp_path, privacy_preserving_circuit_id_stamp()).with_context(|| {
+        format!(
+            "Failed to write fixture circuit id to {}",
+            stamp_path.display()
+        )
+    })?;
 
     Ok(())
 }

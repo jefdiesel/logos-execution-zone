@@ -4,9 +4,9 @@
 #[cfg(test)]
 use std::collections::HashMap;
 
-use lee::AccountId;
 #[cfg(test)]
 use lee::{Account, PrivateKey, PublicKey, V03State, ValidatedStateDiff};
+use lee::{AccountId, ProgramShardSelector};
 
 use crate::{
     HashType,
@@ -16,28 +16,18 @@ use crate::{
 
 // Helpers
 
-#[must_use]
-pub fn sequencer_sign_key_for_testing() -> lee::PrivateKey {
-    lee::PrivateKey::try_new([37; 32]).unwrap()
-}
-
 /// The test block-producer's reward account.
 #[must_use]
 pub fn producer_account_for_testing() -> AccountId {
     AccountId::from(&lee::PublicKey::new_from_private_key(
-        &sequencer_sign_key_for_testing(),
+        &lee::PrivateKey::try_new([37; 32]).unwrap(),
     ))
 }
 
-/// The test block-producer's reward account as a claimed genesis-seed entry, for
-/// stores that seed their state before any block credits fees to it.
+/// The test block producer's reward account and its initial state.
 #[must_use]
-pub fn claimed_producer_seed() -> (AccountId, lee::Account) {
-    let account = lee::Account {
-        program_owner: programs::authenticated_transfer().id().into(),
-        ..lee::Account::default()
-    };
-    (producer_account_for_testing(), account)
+pub fn producer_seed() -> (AccountId, lee::Account) {
+    (producer_account_for_testing(), lee::Account::default())
 }
 
 /// A syntactically valid `Public` transaction. Its contents are irrelevant to the
@@ -88,11 +78,11 @@ pub fn produce_dummy_block(
 ) -> Block {
     transactions.push(LeeTransaction::Public(fee_invocation(
         fee_core::BlockFeeSummary::default(),
-        lee::AccountId::from(&lee::PublicKey::new_from_private_key(
-            &sequencer_sign_key_for_testing(),
-        )),
+        0,
+        producer_account_for_testing(),
     )));
     transactions.push(LeeTransaction::Public(clock_invocation(
+        id,
         id.saturating_mul(100),
     )));
 
@@ -103,19 +93,19 @@ pub fn produce_dummy_block(
         transactions,
     };
 
-    block_data.into_pending_block(&sequencer_sign_key_for_testing())
+    block_data.into_pending_block()
 }
 
 #[must_use]
 pub fn produce_dummy_empty_transaction() -> LeeTransaction {
-    let program_id = programs::authenticated_transfer().id().into();
-    let account_ids = vec![];
+    let program_id = lee_core::native_token::NATIVE_TOKEN_PROGRAM_ID;
+    let shard_selectors = vec![];
     let nonces = vec![];
     let message = lee::public_transaction::Message::try_new(
         program_id,
-        account_ids,
+        shard_selectors,
         nonces,
-        authenticated_transfer_core::Instruction::Transfer { amount: 0 },
+        lee_core::native_token::Instruction::Transfer { amount: 0 },
     )
     .unwrap();
     let private_key = lee::PrivateKey::try_new([1; 32]).unwrap();
@@ -160,14 +150,17 @@ pub fn create_transaction_native_token_transfer_with_fees(
     signing_key: &lee::PrivateKey,
     fee_declaration: lee::FeeDeclaration,
 ) -> LeeTransaction {
-    let account_ids = vec![from, to];
+    let shard_selectors = vec![
+        ProgramShardSelector::native_balance(from),
+        ProgramShardSelector::native_balance(to),
+    ];
     let nonces = vec![nonce.into()];
-    let program_id = programs::authenticated_transfer().id().into();
+    let program_id = lee_core::native_token::NATIVE_TOKEN_PROGRAM_ID;
     let message = lee::public_transaction::Message::try_new_with_fees(
         program_id,
-        account_ids,
+        shard_selectors,
         nonces,
-        authenticated_transfer_core::Instruction::Transfer {
+        lee_core::native_token::Instruction::Transfer {
             amount: balance_to_move,
         },
         fee_declaration,
@@ -193,10 +186,13 @@ pub fn create_transaction_native_token_transfer_without_fee(
     signing_key: &lee::PrivateKey,
 ) -> LeeTransaction {
     let message = lee::public_transaction::Message::try_new(
-        programs::authenticated_transfer().id().into(),
-        vec![from, to],
+        lee_core::native_token::NATIVE_TOKEN_PROGRAM_ID,
+        vec![
+            ProgramShardSelector::native_balance(from),
+            ProgramShardSelector::native_balance(to),
+        ],
         vec![nonce.into()],
-        authenticated_transfer_core::Instruction::Transfer {
+        lee_core::native_token::Instruction::Transfer {
             amount: balance_to_move,
         },
     )

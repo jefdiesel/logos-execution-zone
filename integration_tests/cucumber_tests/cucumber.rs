@@ -19,9 +19,7 @@ use integration_tests::cucumber::{
     },
     world::CucumberWorld,
 };
-use logos_blockchain_testing_framework::{
-    hash_str, is_truthy_env, reap_all_stale_port_blocks, release_reserved_port_block,
-};
+use logos_blockchain_testing_framework::{hash_str, is_truthy_env, release_reserved_port_block};
 use tracing::{info, warn};
 use wallet::SUPPRESS_VERBOSE_PRINTS;
 
@@ -42,7 +40,6 @@ fn main() -> anyhow::Result<()> {
 
 async fn async_main() -> anyhow::Result<()> {
     integration_tests::cucumber::default::init_tracing();
-    reap_all_stale_port_blocks();
     info!(target: TARGET, "args: {:?}", std::env::args());
 
     let scenario_attempts: ScenarioAttempts = Arc::new(Mutex::new(HashMap::new()));
@@ -73,8 +70,8 @@ async fn async_main() -> anyhow::Result<()> {
                 writer::Coloring::Never,
                 Verbosity::ShowWorldAndDocString,
             ))
-                .tee::<CucumberWorld, _>(writer::JUnit::for_tee(junit_xml_file, 0))
-                .normalized(),
+            .tee::<CucumberWorld, _>(writer::JUnit::for_tee(junit_xml_file, 0))
+            .normalized(),
         )
         // Sets a hook, executed on each Scenario before running all its Steps, including Background
         // ones.
@@ -119,7 +116,8 @@ async fn async_main() -> anyhow::Result<()> {
                     if let Some(parent) = path.parent() {
                         let _unused = std::fs::create_dir_all(parent);
                     }
-                    let _initial_debug_write = std::fs::write(&path, world.full_debug_info_string());
+                    let _initial_debug_write =
+                        std::fs::write(&path, world.full_debug_info_string());
 
                     let teardown_result = world.stop_runtime().await;
                     if let Err(error) = &teardown_result {

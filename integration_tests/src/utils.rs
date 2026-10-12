@@ -1,22 +1,20 @@
 use std::time::Duration;
 
 use anyhow::{Context as _, Result, ensure};
+use common::HashType;
+use kameo::actor::ActorRef;
 use key_protocol::key_management::key_tree::chain_index::ChainIndex;
-use lee_core::account::AccountId;
+use lee_core::account::{AccountId, ProgramShardSelector};
 use log::info;
-use sequencer_core::{
-    block_publisher::{Ed25519PublicKey, read_channel_state},
-    config::BedrockConfig,
-};
+use sequencer_bedrock_actor::{BedrockActor, protocol::GetAccreditedKeys};
+use sequencer_core::Ed25519PublicKey;
 use sequencer_service_rpc::{RpcClient as _, SequencerClient};
-use test_fixtures::{TIME_TO_WAIT_FOR_BLOCK_SECONDS, TestContext, verify_commitment_is_in_state};
+use test_fixtures::{TestContext, verify_commitment_is_in_state};
 use wallet::{
     cli::{
         CliAccountMention, Command, SubcommandReturnValue,
         account::{AccountSubcommand, NewSubcommand},
-        programs::{
-            native_token_transfer::AuthTransferSubcommand, token::TokenProgramAgnosticSubcommand,
-        },
+        programs::native_token_transfer::AuthTransferSubcommand,
     },
     storage::key_chain::FoundPrivateAccount,
 };
@@ -44,19 +42,32 @@ where
         .with_context(|| format!("Timed out waiting for {what}"))?
 }
 
+/// Waits until the sequencer reports `tx_hash` in a block.
+pub async fn wait_for_inclusion(ctx: &TestContext, tx_hash: HashType) -> Result<()> {
+    wait_until(&format!("transaction {tx_hash} to be included"), || async {
+        Ok(ctx
+            .sequencer_client()
+            .get_transaction(tx_hash)
+            .await?
+            .is_some())
+    })
+    .await
+}
+
 /// The channel's accredited keys, sorted, plus whose turn the tip was written on.
 pub async fn committee(
-    config: &BedrockConfig,
+    observer: &ActorRef<BedrockActor>,
 ) -> Result<(Vec<[u8; 32]>, Option<Ed25519PublicKey>)> {
-    let Some(state) = read_channel_state(config).await? else {
+    let Some(accredited) = observer
+        .ask(GetAccreditedKeys)
+        .await
+        .context("Failed to read the channel's accredited keys")?
+    else {
         return Ok((Vec::new(), None));
     };
-    let turn = state
-        .accredited_keys
-        .get(usize::from(state.tip_sequencer))
-        .copied();
-    let mut keys: Vec<_> = state
-        .accredited_keys
+    let turn = accredited.whose_turn();
+    let mut keys: Vec<_> = accredited
+        .keys
         .iter()
         .map(Ed25519PublicKey::to_bytes)
         .collect();
@@ -125,52 +136,10 @@ pub async fn send(
         to_npk: None,
         to_vpk: None,
         to_keys: None,
-        to_identifier: Some(0),
+        to_identifier: Some(lee_core::Identifier::ZERO),
         amount,
     });
     wallet::cli::execute_subcommand(ctx.wallet_mut(), command).await?;
-    Ok(())
-}
-
-/// Create a token (New) and wait for the block to be included.
-pub async fn create_token(
-    ctx: &mut TestContext,
-    definition_account_id: CliAccountMention,
-    supply_account_id: CliAccountMention,
-    name: impl Into<String>,
-    total_supply: u128,
-) -> anyhow::Result<()> {
-    let subcommand = TokenProgramAgnosticSubcommand::New {
-        definition_account_id,
-        supply_account_id,
-        name: name.into(),
-        total_supply,
-    };
-    wallet::cli::execute_subcommand(ctx.wallet_mut(), Command::Token(subcommand)).await?;
-    info!("Waiting for next block creation");
-    tokio::time::sleep(Duration::from_secs(TIME_TO_WAIT_FOR_BLOCK_SECONDS)).await;
-    Ok(())
-}
-
-/// Send tokens and wait for the block to be included.
-pub async fn token_send(
-    ctx: &mut TestContext,
-    from: CliAccountMention,
-    to: CliAccountMention,
-    amount: u128,
-) -> anyhow::Result<()> {
-    let subcommand = TokenProgramAgnosticSubcommand::Send {
-        from,
-        to: Some(to),
-        to_npk: None,
-        to_vpk: None,
-        to_keys: None,
-        to_identifier: Some(0),
-        amount,
-    };
-    wallet::cli::execute_subcommand(ctx.wallet_mut(), Command::Token(subcommand)).await?;
-    info!("Waiting for next block creation");
-    tokio::time::sleep(Duration::from_secs(TIME_TO_WAIT_FOR_BLOCK_SECONDS)).await;
     Ok(())
 }
 
@@ -185,6 +154,16 @@ pub async fn account_balance(ctx: &TestContext, account_id: AccountId) -> anyhow
 /// Fetch the full account state for `account_id` from the sequencer.
 pub async fn get_account(ctx: &TestContext, account_id: AccountId) -> anyhow::Result<lee::Account> {
     Ok(ctx.sequencer_client().get_account(account_id).await?)
+}
+
+pub async fn get_account_view(
+    ctx: &TestContext,
+    shard_selector: ProgramShardSelector,
+) -> anyhow::Result<lee::Account> {
+    Ok(ctx
+        .sequencer_client()
+        .get_account_view(shard_selector)
+        .await?)
 }
 
 /// Fetch the current commitment for `account_id` and assert it is present in the sequencer state.

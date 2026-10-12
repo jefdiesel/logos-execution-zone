@@ -4,12 +4,14 @@ use common::{HashType, transaction::LeeTransaction};
 use kameo::Reply;
 use lee_core::{
     BlockId, Commitment,
-    account::{Account, AccountId},
+    account::{Account, AccountId, ProgramShardSelector},
 };
 pub use sequencer_storage_actor::protocol::{CrossZoneMessageKey, DeadLetterRequeue};
 
 /// The widest range a [`GetBlockRange`] may span.
 pub const MAX_BLOCK_RANGE_LEN: usize = 1024;
+
+pub type ChannelId = [u8; 32];
 
 #[derive(Copy, Clone)]
 pub struct ProduceBlock;
@@ -114,17 +116,16 @@ pub struct GetAccount {
     pub account_id: AccountId,
 }
 
+pub struct GetAccountView {
+    pub shard_selector: ProgramShardSelector,
+}
+
 #[derive(Reply)]
 pub struct GetAccountReply {
     pub account: Account,
 }
 
 pub struct GetChannelId;
-
-#[derive(Reply)]
-pub struct GetChannelIdReply {
-    pub channel_id: [u8; 32],
-}
 
 pub struct GetCrossZoneDeadLetters;
 
@@ -141,4 +142,14 @@ pub struct RequeueCrossZoneDeadLetter {
 #[derive(Reply)]
 pub struct RequeueCrossZoneDeadLetterReply {
     pub outcome: sequencer_storage_actor::protocol::DeadLetterRequeue,
+}
+
+pub struct GetBlockByHash {
+    pub block_hash: HashType,
+}
+
+pub struct GetAccountTransactions {
+    pub account_id: AccountId,
+    pub offset: u64,
+    pub limit: u64,
 }

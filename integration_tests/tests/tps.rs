@@ -16,15 +16,15 @@ use bytesize::ByteSize;
 use common::transaction::LeeTransaction;
 use integration_tests::config::SequencerPartialConfig;
 use lee::{
-    Account, AccountId, PrivacyPreservingTransaction, PrivateKey, PublicKey, PublicTransaction,
+    Account, AccountId, PrivacyPreservingTransaction, PrivateKey, ProgramShardSelector,
+    ProvingInput, PublicKey, PublicTransaction,
     privacy_preserving_transaction::{self as pptx, circuit},
     program::Program,
     public_transaction as putx,
 };
 use lee_core::{
-    AuthorizationSecretKey, DUMMY_COMMITMENT_HASH, InputAccountIdentity, MembershipProof,
-    NullifierPublicKey, NullifierSecretKey, NullifierWitness, PrivateWitness, WitnessKind,
-    account::{AccountWithMetadata, Nonce, data::Data},
+    AuthorizationSecretKey, DUMMY_COMMITMENT_HASH, Identifier, MembershipProof, NullifierPublicKey,
+    NullifierSecretKey, NullifierWitness, PrivateWitness, WitnessKind, account::Nonce,
     encryption::ViewingPublicKey,
 };
 use sequencer_core::config::GenesisAction;
@@ -82,17 +82,19 @@ impl TpsTestManager {
     /// Build a batch of public transactions to submit to the node.
     pub fn build_public_txs(&self) -> Vec<PublicTransaction> {
         // Create valid public transactions
-        let program = programs::authenticated_transfer();
         let public_txs: Vec<PublicTransaction> = self
             .public_keypairs
             .windows(2)
             .map(|pair| {
                 let amount: u128 = 1;
                 let message = putx::Message::try_new_with_fees(
-                    program.id().into(),
-                    [pair[0].1, pair[1].1].to_vec(),
+                    lee_core::native_token::NATIVE_TOKEN_PROGRAM_ID,
+                    vec![
+                        ProgramShardSelector::native_balance(pair[0].1),
+                        ProgramShardSelector::native_balance(pair[1].1),
+                    ],
                     [Nonce(0_u128)].to_vec(),
-                    authenticated_transfer_core::Instruction::Transfer { amount },
+                    lee_core::native_token::Instruction::Transfer { amount },
                     // A generous max_fee (a ceiling, not the fee paid) so the
                     // base-fee rise this test's own sustained load causes cannot
                     // push the reserve past it and drop later txs.
@@ -195,7 +197,7 @@ pub async fn tps_test() -> Result<()> {
 
     let tx_processed = tx_hashes.len();
     let actual_tps = tx_processed as u64 / time_elapsed;
-    log::info!("Processed {tx_processed} transactions in {time_elapsed:?} ({actual_tps} TPS)",);
+    log::info!("Processed {tx_processed} transactions in {time_elapsed:?} ({actual_tps} TPS)");
 
     assert_eq!(tx_processed, num_transactions);
 
@@ -235,30 +237,22 @@ pub async fn tps_test() -> Result<()> {
 /// multiple times with the purpose of testing the node's processing performance.
 #[expect(dead_code, reason = "No idea if we need this, should we remove it?")]
 fn build_privacy_transaction() -> PrivacyPreservingTransaction {
-    let program = programs::authenticated_transfer();
     let sender_ask = AuthorizationSecretKey([1; 32]);
     let sender_nsk = NullifierSecretKey::from(&sender_ask);
     let sender_vpk = ViewingPublicKey::from_seed(&[99_u8; 32], &[100_u8; 32]);
     let sender_npk = NullifierPublicKey::from(&sender_nsk);
-    let sender_pre = AccountWithMetadata::new(
-        Account {
-            balance: 100,
-            nonce: Nonce(0xdead_beef),
-            program_owner: program.id().into(),
-            data: Data::default(),
-        },
-        true,
-        AccountId::for_regular_private_account(&sender_npk, &sender_vpk, 0),
-    );
+    let sender_id =
+        AccountId::for_regular_private_account(&sender_npk, &sender_vpk, Identifier::ZERO);
+    let sender_account = Account {
+        nonce: Nonce(0xdead_beef),
+        ..Account::funded(100)
+    };
     let recipient_ask = AuthorizationSecretKey([2; 32]);
     let recipient_nsk = NullifierSecretKey::from(&recipient_ask);
     let recipient_vpk = ViewingPublicKey::from_seed(&[101_u8; 32], &[102_u8; 32]);
     let recipient_npk = NullifierPublicKey::from(&recipient_nsk);
-    let recipient_pre = AccountWithMetadata::new(
-        Account::default(),
-        true,
-        AccountId::for_regular_private_account(&recipient_npk, &recipient_vpk, 0),
-    );
+    let recipient_id =
+        AccountId::for_regular_private_account(&recipient_npk, &recipient_vpk, Identifier::ZERO);
 
     let balance_to_move: u128 = 1;
     let proof: MembershipProof = (
@@ -269,39 +263,48 @@ fn build_privacy_transaction() -> PrivacyPreservingTransaction {
         ]],
     );
     let (output, proof) = circuit::execute_and_prove(
-        vec![sender_pre, recipient_pre],
-        Program::serialize_instruction(authenticated_transfer_core::Instruction::Transfer {
-            amount: balance_to_move,
-        })
-        .unwrap(),
-        vec![
-            InputAccountIdentity::Private(PrivateWitness {
-                vpk: sender_vpk,
-                random_seed: [0; 32],
-                identifier: 0,
-                kind: WitnessKind::Regular {
-                    ask: Some(sender_ask),
+        ProvingInput {
+            shard_selectors: vec![
+                ProgramShardSelector::native_balance(sender_id),
+                ProgramShardSelector::native_balance(recipient_id),
+            ],
+            private_witnesses: vec![
+                PrivateWitness {
+                    vpk: sender_vpk,
+                    random_seed: [0; 32],
+                    identifier: Identifier::ZERO,
+                    kind: WitnessKind::Regular {
+                        ask: Some(sender_ask),
+                    },
+                    nullifier: NullifierWitness::Update {
+                        account: sender_account,
+                        view_tag: 0,
+                        nsk: sender_nsk,
+                        membership_proof: proof,
+                    },
                 },
-                nullifier: NullifierWitness::Update {
-                    view_tag: 0,
-                    nsk: sender_nsk,
-                    membership_proof: proof,
+                PrivateWitness {
+                    vpk: recipient_vpk,
+                    random_seed: [0; 32],
+                    identifier: Identifier::ZERO,
+                    kind: WitnessKind::Regular {
+                        ask: Some(recipient_ask),
+                    },
+                    nullifier: NullifierWitness::Init {
+                        npk: recipient_npk,
+                        commitment_root: DUMMY_COMMITMENT_HASH,
+                    },
                 },
-            }),
-            InputAccountIdentity::Private(PrivateWitness {
-                vpk: recipient_vpk,
-                random_seed: [0; 32],
-                identifier: 0,
-                kind: WitnessKind::Regular {
-                    ask: Some(recipient_ask),
+            ],
+            instruction_data: Program::serialize_instruction(
+                lee_core::native_token::Instruction::Transfer {
+                    amount: balance_to_move,
                 },
-                nullifier: NullifierWitness::Init {
-                    npk: recipient_npk,
-                    commitment_root: DUMMY_COMMITMENT_HASH,
-                },
-            }),
-        ],
-        &program.into(),
+            )
+            .unwrap(),
+            ..Default::default()
+        },
+        &lee::privacy_preserving_transaction::circuit::ProgramWithDependencies::native(),
     )
     .unwrap();
     let message = pptx::message::Message::from_circuit_output(vec![], output);

@@ -3,14 +3,16 @@ use std::{
     fs,
     net::SocketAddr,
     path::{Path, PathBuf},
+    sync::OnceLock,
+    time::Duration,
 };
 
 use anyhow::{Context as _, Result, bail};
 use indexer_service::{ChannelId, IndexerHandle};
 use lee::{AccountId, PrivateKey, PublicKey};
 use log::{debug, warn};
-use sequencer_core::block_publisher::ED25519_SECRET_KEY_SIZE;
-use sequencer_service::{GenesisAction, SequencerHandle};
+use logos_blockchain_key_management_system_service::keys::UnsecuredEd25519Key;
+use sequencer_service::{GenesisAction, SequencerConfig, SequencerHandle};
 use sequencer_service_rpc::{SequencerClient, SequencerClientBuilder};
 use sequencer_storage_actor::{StorageActor, protocol::DbDump};
 use tempfile::TempDir;
@@ -28,6 +30,12 @@ use crate::{
     private_mention, public_mention,
 };
 
+/// How long a test's RPC call waits for an answer. Well above jsonrpsee's 60s
+/// default, which a just-restarted sequencer on a loaded CI runner has been
+/// observed to blow through on the first read: tests bound their own waiting,
+/// and one slow answer should not be the thing that fails them.
+const RPC_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
+
 #[derive(Debug)]
 pub struct SequencerSetup {
     partial: config::SequencerPartialConfig,
@@ -35,7 +43,7 @@ pub struct SequencerSetup {
     channel_id: ChannelId,
     genesis_transactions: Option<Vec<GenesisAction>>,
     cross_zone: Option<sequencer_core::config::CrossZoneConfig>,
-    bedrock_signing_key: Option<[u8; ED25519_SECRET_KEY_SIZE]>,
+    bedrock_signing_key: Option<UnsecuredEd25519Key>,
     gossip: Option<sequencer_core::config::GossipConfig>,
 }
 
@@ -89,7 +97,7 @@ impl SequencerSetup {
     /// before boot, so tests know the sequencer's public key in advance (e.g.
     /// to accredit a committee member that has not started yet).
     #[must_use]
-    pub const fn with_bedrock_signing_key(mut self, key: [u8; ED25519_SECRET_KEY_SIZE]) -> Self {
+    pub fn with_bedrock_signing_key(mut self, key: UnsecuredEd25519Key) -> Self {
         self.bedrock_signing_key = Some(key);
         self
     }
@@ -124,6 +132,18 @@ impl SequencerSetup {
     }
 
     async fn setup_owned(self, home: PathBuf) -> Result<SequencerHandle> {
+        sequencer_service::run(
+            self.prepare_sequencers_config(home)?,
+            SocketAddr::from(([127, 0, 0, 1], 0)),
+        )
+        .await
+        .context("Failed to run Sequencer Service")
+    }
+
+    /// Prepare just config for sequencer, without running the service.
+    ///
+    /// Useful for cases, where you want to run service manually.
+    pub fn prepare_sequencers_config(self, home: PathBuf) -> Result<SequencerConfig> {
         let Self {
             partial,
             bedrock_addr,
@@ -139,10 +159,12 @@ impl SequencerSetup {
         let bedrock_signing_key = bedrock_signing_key.or_else(|| {
             genesis_transactions
                 .is_none()
-                .then_some(config::SEQUENCER_BEDROCK_SIGNING_KEY)
+                .then_some(UnsecuredEd25519Key::from_bytes(
+                    &config::BEDROCK_SIGNING_KEY,
+                ))
         });
-        if let Some(key_bytes) = bedrock_signing_key {
-            std::fs::write(home.join("bedrock_signing_key"), key_bytes)
+        if let Some(key) = &bedrock_signing_key {
+            std::fs::write(home.join("bedrock_signing_key"), key.as_bytes())
                 .context("Failed to write pre-generated bedrock signing key")?;
         }
         // Pinned like the bedrock key: the prebuilt dump stakes this account.
@@ -170,20 +192,17 @@ impl SequencerSetup {
 
         let config = config::sequencer_config(
             partial,
-            home.clone(),
+            home,
             bedrock_addr,
             channel_id,
             config::bedrock_funding_key(),
             genesis_transactions,
             cross_zone,
-            bedrock_signing_key,
             gossip,
         )
         .context("Failed to create Sequencer config")?;
 
-        sequencer_service::run(config, SocketAddr::from(([127, 0, 0, 1], 0)))
-            .await
-            .context("Failed to run Sequencer Service")
+        Ok(config)
     }
 }
 
@@ -193,8 +212,37 @@ pub fn prebuilt_sequencer_db_dump_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/prebuilt_sequencer_db.dump")
 }
 
+/// Circuit id the committed dump was generated with (`just regenerate-test-fixture`).
+#[must_use]
+pub fn prebuilt_sequencer_db_circuit_id_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/prebuilt_sequencer_db.circuit_id")
+}
+
+/// Hex form of the privacy-preserving circuit id this build embeds.
+#[must_use]
+pub fn privacy_preserving_circuit_id_stamp() -> String {
+    lee::PRIVACY_PRESERVING_CIRCUIT_ID
+        .map(|word| format!("{word:08x}"))
+        .join("")
+}
+
 /// Load and deserialize the committed prebuilt-database dump.
 fn load_prebuilt_dump() -> Result<DbDump> {
+    let stamp_path = prebuilt_sequencer_db_circuit_id_path();
+    let stamped = fs::read_to_string(&stamp_path).with_context(|| {
+        format!(
+            "Failed to read fixture circuit id at {}",
+            stamp_path.display()
+        )
+    })?;
+    let expected = privacy_preserving_circuit_id_stamp();
+    if stamped.trim() != expected {
+        bail!(
+            "Prebuilt fixture was generated for circuit {}, this build embeds {expected}. Run `just regenerate-test-fixture`.",
+            stamped.trim()
+        );
+    }
+
     let path = prebuilt_sequencer_db_dump_path();
     let bytes = std::fs::read(&path)
         .with_context(|| format!("Failed to read prebuilt db dump at {}", path.display()))?;
@@ -206,6 +254,7 @@ pub fn sequencer_client(addr: SocketAddr) -> Result<SequencerClient> {
     let url = config::addr_to_url(config::UrlProtocol::Http, addr)
         .context("Failed to build sequencer URL")?;
     SequencerClientBuilder::default()
+        .request_timeout(RPC_REQUEST_TIMEOUT)
         .build(url)
         .context("Failed to build sequencer client")
 }
@@ -246,6 +295,42 @@ fn locked_logos_bedrock_node_revision() -> Result<String> {
     }
 }
 
+fn bedrock_platform_for_docker_arch(arch: &str) -> Option<&'static str> {
+    match arch.trim() {
+        "amd64" | "x86_64" => Some("linux-x86_64"),
+        "arm64" | "aarch64" => Some("linux-aarch64"),
+        _ => None,
+    }
+}
+
+fn docker_daemon_platform() -> Option<&'static str> {
+    static PLATFORM: OnceLock<Option<&'static str>> = OnceLock::new();
+    *PLATFORM.get_or_init(|| {
+        let output = std::process::Command::new("docker")
+            .args(["info", "--format", "{{.Architecture}}"])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        bedrock_platform_for_docker_arch(&String::from_utf8_lossy(&output.stdout))
+    })
+}
+
+fn ensure_node_runs_on_docker_daemon(
+    target_platform: &str,
+    daemon_platform: Option<&str>,
+) -> Result<()> {
+    if let Some(daemon_platform) = daemon_platform
+        && daemon_platform != target_platform
+    {
+        bail!(
+            "Resolved Bedrock node targets {target_platform}, but the Docker daemon runs {daemon_platform}, so the node cannot execute in the Bedrock container. Run `just resolve-bedrock-node`."
+        );
+    }
+    Ok(())
+}
+
 fn validate_resolved_bedrock_node(resolved_directory: &Path) -> Result<()> {
     let metadata_path = resolved_directory.join("metadata.json");
     let metadata: serde_json::Value = serde_json::from_str(
@@ -266,6 +351,7 @@ fn validate_resolved_bedrock_node(resolved_directory: &Path) -> Result<()> {
             "Resolved Bedrock node targets {target_platform}, but Docker-backed tests require a Linux node. Run `just resolve-bedrock-node`."
         );
     }
+    ensure_node_runs_on_docker_daemon(target_platform, docker_daemon_platform())?;
 
     let locked_revision = locked_logos_bedrock_node_revision()?;
     if resolved_revision != locked_revision {
@@ -294,11 +380,12 @@ pub async fn setup_bedrock_node() -> Result<(DockerCompose, SocketAddr)> {
     )?;
 
     let mut compose = DockerCompose::with_auto_client(&[bedrock_compose_path])
-            .await
-            .context("Failed to setup docker compose for Bedrock")?
-            .with_build(true)
-            // Setting port to 0 to avoid conflicts between parallel tests, actual port will be retrieved after container is up
-            .with_env("PORT", "0");
+        .await
+        .context("Failed to setup docker compose for Bedrock")?
+        .with_build(true)
+        // Setting port to 0 to avoid conflicts between parallel tests, actual port will be
+        // retrieved after container is up
+        .with_env("PORT", "0");
 
     #[expect(
         clippy::items_after_statements,
@@ -403,8 +490,8 @@ pub async fn setup_indexer_at(
     .context("Failed to run Indexer Service")
 }
 
-pub async fn setup_wallet(
-    sequencer_addrs: &[SocketAddr],
+pub fn setup_wallet(
+    sequencer_addr: &SocketAddr,
     initial_public_accounts: &[(PrivateKey, u128)],
     initial_private_accounts: &[InitialPrivateAccountForWallet],
     config_overrides: WalletConfigOverrides,
@@ -412,27 +499,25 @@ pub async fn setup_wallet(
     let temp_wallet_dir =
         tempfile::tempdir().context("Failed to create temp dir for wallet home")?;
     let (wallet, _state_dir, password) = setup_wallet_at(
-        sequencer_addrs,
+        sequencer_addr,
         initial_public_accounts,
         initial_private_accounts,
         config_overrides,
         temp_wallet_dir.path(),
-    )
-    .await?;
+    )?;
 
     Ok((wallet, temp_wallet_dir, password))
 }
 
 /// Set up the wallet in an explicit home directory owned by the caller.
-pub async fn setup_wallet_at(
-    sequencer_addrs: &[SocketAddr],
+pub fn setup_wallet_at(
+    sequencer_addr: &SocketAddr,
     initial_public_accounts: &[(PrivateKey, u128)],
     initial_private_accounts: &[InitialPrivateAccountForWallet],
     config_overrides: WalletConfigOverrides,
     home: &Path,
 ) -> Result<(WalletCore, PathBuf, String)> {
-    let config =
-        config::wallet_config(sequencer_addrs).context("Failed to create Wallet config")?;
+    let config = config::wallet_config(sequencer_addr).context("Failed to create Wallet config")?;
     let config_serialized =
         serde_json::to_string_pretty(&config).context("Failed to serialize Wallet config")?;
 
@@ -442,17 +527,14 @@ pub async fn setup_wallet_at(
     std::fs::write(&config_path, config_serialized).context("Failed to write wallet config")?;
 
     let storage_path = home.join("storage.json");
-    let metrics_path = home.join("metrics.json");
 
     let wallet_password = "test_pass".to_owned();
     let (mut wallet, _mnemonic) = WalletCore::new_init_storage(
         config_path,
         storage_path,
-        metrics_path,
         Some(config_overrides),
         &wallet_password,
     )
-    .await
     .context("Failed to init wallet")?;
 
     for (private_key, _balance) in initial_public_accounts {
@@ -528,4 +610,51 @@ pub async fn sync_wallet_from_prebuilt(wallet: &mut WalletCore) -> Result<()> {
         .context("Failed to sync wallet from prebuilt chain")?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{bedrock_platform_for_docker_arch, ensure_node_runs_on_docker_daemon};
+
+    #[test]
+    fn maps_docker_architectures_to_resolved_platforms() {
+        assert_eq!(
+            bedrock_platform_for_docker_arch("x86_64"),
+            Some("linux-x86_64")
+        );
+        assert_eq!(
+            bedrock_platform_for_docker_arch("amd64"),
+            Some("linux-x86_64")
+        );
+        assert_eq!(
+            bedrock_platform_for_docker_arch("aarch64\n"),
+            Some("linux-aarch64")
+        );
+        assert_eq!(
+            bedrock_platform_for_docker_arch("arm64"),
+            Some("linux-aarch64")
+        );
+        assert_eq!(bedrock_platform_for_docker_arch("riscv64"), None);
+    }
+
+    #[test]
+    fn accepts_a_node_the_daemon_can_execute() {
+        assert!(ensure_node_runs_on_docker_daemon("linux-aarch64", Some("linux-aarch64")).is_ok());
+    }
+
+    #[test]
+    fn rejects_a_node_the_daemon_cannot_execute() {
+        let error = ensure_node_runs_on_docker_daemon("linux-x86_64", Some("linux-aarch64"))
+            .expect_err("a node built for another architecture is rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("Docker daemon runs linux-aarch64")
+        );
+    }
+
+    #[test]
+    fn skips_the_check_for_an_unknown_daemon() {
+        assert!(ensure_node_runs_on_docker_daemon("linux-x86_64", None).is_ok());
+    }
 }

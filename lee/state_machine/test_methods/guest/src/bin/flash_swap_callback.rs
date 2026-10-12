@@ -24,9 +24,9 @@
 //! called by any program. In production, a callback would typically verify the caller
 //! if it needs to trust the context it is called from.
 
-use lee_core::program::{
-    AccountStateDiff, ChainedCall, PdaSeed, ProgramCall, ProgramInput, ProgramOutput,
-    read_lee_call, respond_unsupported_call,
+use lee_core::{
+    native_token::custody_transfer,
+    program::{PdaSeed, Plan, ProgramCall, read_program_call},
 };
 
 #[derive(borsh::BorshSerialize, borsh::BorshDeserialize)]
@@ -34,60 +34,33 @@ pub struct CallbackInstruction {
     /// If true, return the borrowed funds to the vault (happy path).
     /// If false, keep the funds (simulates a malicious callback, triggers rollback).
     pub return_funds: bool,
-    pub token_program_id: lee_core::account::AccountId,
     pub amount: u128,
 }
 
 fn main() {
-    let call = read_lee_call::<CallbackInstruction>();
-    let ProgramCall::Execute(
-        ProgramInput {
-            self_account_id,
-            caller_account_id, // not enforced in this callback
-            pre_states,
-            instruction,
-        },
-        instruction_data,
-    ) = call
-    else {
-        respond_unsupported_call(call);
+    let ProgramCall::Plan(input, instruction) = read_program_call::<CallbackInstruction>() else {
+        panic!("flash_swap_callback emits no effect to apply")
     };
 
-    // pre_states[0] = vault (after transfer out), pre_states[1] = receiver (after transfer out)
-    let Ok([vault_pre, receiver_pre]) = <[_; 2]>::try_from(pre_states) else {
+    // accounts[0] = vault, accounts[1] = receiver
+    let Ok([vault, receiver]) = <[_; 2]>::try_from(input.accounts.clone()) else {
         panic!("Callback requires exactly 2 accounts: vault, receiver");
     };
 
-    let mut chained_calls = Vec::new();
-
+    // The callback itself makes no direct state changes, so it emits no effect of its own.
+    let mut plan = Plan::new(&input);
     if instruction.return_funds {
         // Happy path: return the borrowed funds via a token transfer (receiver → vault).
         // The receiver is a PDA of this callback program (seed = [1_u8; 32]).
-        let transfer_instruction =
-            borsh::to_vec(&instruction.amount).expect("transfer instruction serialization");
-
-        chained_calls.push(ChainedCall {
-            program_account_id: instruction.token_program_id,
-            pre_state_ids: vec![receiver_pre.account_id, vault_pre.account_id],
-            instruction_data: transfer_instruction,
-            pda_seeds: vec![PdaSeed::new([1_u8; 32])],
-        });
+        plan.call(custody_transfer(
+            receiver.account_id,
+            PdaSeed::new([1; 32]),
+            vault.account_id,
+            instruction.amount,
+        ));
     }
     // Malicious path (return_funds = false): emit no chained calls.
     // The vault balance will not be restored, so the invariant check in the initiator
     // will panic, rolling back the entire transaction including the initial transfer out.
-
-    // The callback itself makes no direct state changes, accounts pass through unchanged.
-    // All mutations go through the token program via chained calls.
-    ProgramOutput::new(
-        self_account_id,
-        caller_account_id,
-        instruction_data,
-        vec![
-            AccountStateDiff::unchanged(vault_pre),
-            AccountStateDiff::unchanged(receiver_pre),
-        ],
-    )
-    .with_chained_calls(chained_calls)
-    .write();
+    plan.write()
 }

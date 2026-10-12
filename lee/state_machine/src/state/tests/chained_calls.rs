@@ -1,3 +1,5 @@
+use test_guest_core::ChainCall;
+
 use super::*;
 
 #[test]
@@ -7,29 +9,27 @@ fn public_chained_call() {
     let from = AccountId::from(&PublicKey::new_from_private_key(&key));
     let to = AccountId::new([2; 32]);
     let initial_balance = 1000;
-    let initial_data = [(from, initial_balance), (to, 0)];
     let mut state = V03State::new()
-        .with_public_accounts(public_state_from_balances(&initial_data))
-        .with_test_programs();
+        .with_public_account_balances([(from, initial_balance), (to, 0)])
+        .with_programs([crate::test_methods::chain_caller()]);
     let from_key = key;
     let amount: u128 = 37;
-    let instruction: (u128, ProgramId, u32, Option<PdaSeed>) = (
-        amount,
-        crate::test_methods::simple_balance_transfer().id(),
-        2,
-        None,
-    );
+    let instruction = ChainCall::new(
+        NATIVE_TOKEN_PROGRAM_ID,
+        Program::serialize_instruction(NativeInstruction::Transfer { amount }).unwrap(),
+    )
+    .repeated(2);
 
-    let expected_to_post = Account {
-        program_owner: crate::test_methods::simple_balance_transfer().id().into(),
-        balance: amount * 2, // The `chain_caller` chains the program twice
-        ..Account::default()
-    };
+    // The `chain_caller` chains the program twice
+    let expected_to_post = Account::funded(amount * 2);
 
     let message = public_transaction::Message::try_new(
-        program.id().into(),
-        vec![to, from], // The chain_caller program permutes the account order in the chain
-        // call
+        AccountId::from_builtin_program(program.id()),
+        // The chain_caller program permutes the account order in the chain call.
+        vec![
+            ProgramShardSelector::native_balance(to),
+            ProgramShardSelector::native_balance(from),
+        ],
         vec![Nonce(0)],
         instruction,
     )
@@ -42,7 +42,10 @@ fn public_chained_call() {
     let from_post = state.get_account_by_id(from);
     let to_post = state.get_account_by_id(to);
     // The `chain_caller` program calls the program twice
-    assert_eq!(from_post.balance, initial_balance - 2 * amount);
+    assert_eq!(
+        from_post.data.native_balance(),
+        Ok(initial_balance - 2 * amount)
+    );
     assert_eq!(to_post, expected_to_post);
 }
 
@@ -53,23 +56,26 @@ fn execution_fails_if_chained_calls_exceeds_depth() {
     let from = AccountId::from(&PublicKey::new_from_private_key(&key));
     let to = AccountId::new([2; 32]);
     let initial_balance = 100;
-    let initial_data = [(from, initial_balance), (to, 0)];
     let mut state = V03State::new()
-        .with_public_accounts(public_state_from_balances(&initial_data))
-        .with_test_programs();
+        .with_public_account_balances([(from, initial_balance), (to, 0)])
+        .with_programs([crate::test_methods::chain_caller()]);
     let from_key = key;
     let amount: u128 = 0;
-    let instruction: (u128, ProgramId, u32, Option<PdaSeed>) = (
-        amount,
-        crate::test_methods::simple_balance_transfer().id(),
+    let instruction = ChainCall::new(
+        NATIVE_TOKEN_PROGRAM_ID,
+        Program::serialize_instruction(NativeInstruction::Transfer { amount }).unwrap(),
+    )
+    .repeated(
         u32::try_from(MAX_NUMBER_CHAINED_CALLS).expect("MAX_NUMBER_CHAINED_CALLS fits in u32") + 1,
-        None,
     );
 
     let message = public_transaction::Message::try_new(
-        program.id().into(),
-        vec![to, from], // The chain_caller program permutes the account order in the chain
-        // call
+        AccountId::from_builtin_program(program.id()),
+        // The chain_caller program permutes the account order in the chain call.
+        vec![
+            ProgramShardSelector::native_balance(to),
+            ProgramShardSelector::native_balance(from),
+        ],
         vec![Nonce(0)],
         instruction,
     )
@@ -88,30 +94,30 @@ fn execution_fails_if_chained_calls_exceeds_depth() {
 fn execution_that_requires_authentication_of_a_program_derived_account_id_succeeds() {
     let chain_caller = crate::test_methods::chain_caller();
     let pda_seed = PdaSeed::new([37; 32]);
-    let from = AccountId::for_public_pda(&AccountId::from(chain_caller.id()), &pda_seed);
+    let from = AccountId::for_public_pda(
+        &AccountId::from_builtin_program(chain_caller.id()),
+        &pda_seed,
+    );
     let to = AccountId::new([2; 32]);
     let initial_balance = 1000;
-    let initial_data = [(from, initial_balance), (to, 0)];
     let mut state = V03State::new()
-        .with_public_accounts(public_state_from_balances(&initial_data))
-        .with_test_programs();
+        .with_public_account_balances([(from, initial_balance), (to, 0)])
+        .with_programs([crate::test_methods::chain_caller()]);
     let amount: u128 = 58;
-    let instruction: (u128, ProgramId, u32, Option<PdaSeed>) = (
-        amount,
-        crate::test_methods::simple_balance_transfer().id(),
-        1,
-        Some(pda_seed),
-    );
+    let instruction = ChainCall::new(
+        NATIVE_TOKEN_PROGRAM_ID,
+        Program::serialize_instruction(NativeInstruction::Transfer { amount }).unwrap(),
+    )
+    .delegating(pda_seed);
 
-    let expected_to_post = Account {
-        program_owner: crate::test_methods::simple_balance_transfer().id().into(),
-        balance: amount, // The `chain_caller` chains the program twice
-        ..Account::default()
-    };
+    let expected_to_post = Account::funded(amount);
     let message = public_transaction::Message::try_new(
-        chain_caller.id().into(),
-        vec![to, from], // The chain_caller program permutes the account order in the chain
-        // call
+        AccountId::from_builtin_program(chain_caller.id()),
+        // The chain_caller program permutes the account order in the chain call.
+        vec![
+            ProgramShardSelector::native_balance(to),
+            ProgramShardSelector::native_balance(from),
+        ],
         vec![],
         instruction,
     )
@@ -123,47 +129,94 @@ fn execution_that_requires_authentication_of_a_program_derived_account_id_succee
 
     let from_post = state.get_account_by_id(from);
     let to_post = state.get_account_by_id(to);
-    assert_eq!(from_post.balance, initial_balance - amount);
+    assert_eq!(
+        from_post.data.native_balance(),
+        Ok(initial_balance - amount)
+    );
     assert_eq!(to_post, expected_to_post);
 }
 
 #[test]
-fn credit_within_chain_call_leaves_the_recipient_unowned() {
-    // This test calls the transfer program through the chain_caller program. The transfer is
-    // made from an initialized sender to an uninitialized recipient.
+fn a_pda_seed_delegated_to_one_sibling_does_not_leak_to_another() {
+    let delegator = crate::test_methods::selective_pda_delegator();
+    let callee = crate::test_methods::auth_asserting_noop();
+    let sibling = crate::test_methods::auth_asserting_noop();
+
+    let seed = PdaSeed::new([77; 32]);
+    let delegator_id = AccountId::from_builtin_program(delegator.id());
+    let pda_id = AccountId::for_public_pda(&delegator_id, &seed);
+
+    let mut state = V03State::new()
+        .with_public_account_balances([(pda_id, 0)])
+        .with_test_programs();
+
+    // `callee` gets the PDA's account_id *and* the matching `pda_seeds` — real delegation.
+    // `sibling` gets only the account_id (via `include_pda = true`), no `pda_seeds` — it sees
+    // `is_authorized == false` and panics on it (`auth_asserting_noop`).
+    let instruction: (
+        PdaSeed,
+        ProgramId,
+        InstructionData,
+        Option<(ProgramId, bool)>,
+    ) = (
+        seed,
+        callee.id(),
+        Program::serialize_instruction(()).unwrap(),
+        Some((sibling.id(), true)),
+    );
+
+    let message = public_transaction::Message::try_new(
+        delegator_id,
+        vec![ProgramShardSelector::native_balance(pda_id)],
+        vec![],
+        instruction,
+    )
+    .unwrap();
+    let witness_set = public_transaction::WitnessSet::for_message(&message, &[]);
+    let tx = PublicTransaction::new(message, witness_set);
+
+    let result = state.transition_from_public_transaction(&tx, 1, 0);
+    assert!(
+        result.is_err(),
+        "a sibling handed the PDA's account_id but no pda_seeds must not see it as authorized, \
+         but got: {result:?}"
+    );
+}
+
+#[test]
+fn a_credit_leaves_a_stranger_shard_at_the_recipient_untouched() {
     let chain_caller = crate::test_methods::chain_caller();
     let from_key = PrivateKey::try_new([1; 32]).unwrap();
     let from = AccountId::from(&PublicKey::new_from_private_key(&from_key));
-    let initial_balance = 100;
-    let initial_data = [(from, initial_balance)];
-    let mut state = V03State::new()
-        .with_public_accounts(public_state_from_balances(&initial_data))
-        .with_test_programs();
     let to_key = PrivateKey::try_new([2; 32]).unwrap();
     let to = AccountId::from(&PublicKey::new_from_private_key(&to_key));
+    let stranger = AccountId::new([9; 32]);
+    let stranger_data: ShardData = b"stranger".to_vec().try_into().unwrap();
+    let initial_balance = 100;
     let amount: u128 = 37;
-
-    // Check the recipient is an uninitialized account
-    assert_eq!(state.get_account_by_id(to), Account::default());
-
-    let expected_to_post = Account {
-        balance: amount,
-        nonce: Nonce(1),
-        ..Account::default()
-    };
+    let mut state = V03State::new()
+        .with_public_accounts([
+            (from, Account::funded(initial_balance)),
+            (
+                to,
+                Account::default().with_shard(stranger, stranger_data.clone()),
+            ),
+        ])
+        .with_programs([crate::test_methods::chain_caller()]);
 
     // The transaction executes the chain_caller program, which internally calls the
-    // `simple_balance_transfer` program
-    let instruction: (u128, ProgramId, u32, Option<PdaSeed>) = (
-        amount,
-        crate::test_methods::simple_balance_transfer().id(),
-        1,
-        None,
+    // native token program
+    let instruction = ChainCall::new(
+        NATIVE_TOKEN_PROGRAM_ID,
+        Program::serialize_instruction(NativeInstruction::Transfer { amount }).unwrap(),
     );
     let message = public_transaction::Message::try_new(
-        chain_caller.id().into(),
-        vec![to, from], // The chain_caller program permutes the account order in the chain
-        // call
+        AccountId::from_builtin_program(chain_caller.id()),
+        // The chain_caller program permutes the account order in the chain call.
+        vec![
+            ProgramShardSelector::native_balance(to),
+            ProgramShardSelector::native_balance(from),
+        ],
         vec![Nonce(0), Nonce(0)],
         instruction,
     )
@@ -173,10 +226,17 @@ fn credit_within_chain_call_leaves_the_recipient_unowned() {
 
     state.transition_from_public_transaction(&tx, 1, 0).unwrap();
 
-    let from_post = state.get_account_by_id(from);
-    let to_post = state.get_account_by_id(to);
-    assert_eq!(from_post.balance, initial_balance - amount);
-    assert_eq!(to_post, expected_to_post);
+    assert_eq!(
+        state.get_account_by_id(from).data.native_balance(),
+        Ok(initial_balance - amount)
+    );
+    assert_eq!(
+        state.get_account_by_id(to),
+        Account {
+            nonce: Nonce(1),
+            ..Account::funded(amount).with_shard(stranger, stranger_data)
+        }
+    );
 }
 
 #[test_case::test_case(1; "single call")]
@@ -184,33 +244,21 @@ fn credit_within_chain_call_leaves_the_recipient_unowned() {
 fn private_chained_call(number_of_calls: u32) {
     // Arrange
     let chain_caller = crate::test_methods::chain_caller();
-    let simple_transfers = crate::test_methods::simple_balance_transfer();
     let from_keys = test_private_account_keys_1();
     let to_keys = test_private_account_keys_2();
     let initial_balance = 100;
-    let from_account = AccountWithMetadata::new(
-        Account {
-            program_owner: simple_transfers.id().into(),
-            balance: initial_balance,
-            ..Account::default()
-        },
-        true,
-        (&from_keys.npk(), &from_keys.vpk(), 0),
-    );
-    let to_account = AccountWithMetadata::new(
-        Account {
-            program_owner: simple_transfers.id().into(),
-            ..Account::default()
-        },
-        true,
-        (&to_keys.npk(), &to_keys.vpk(), 0),
-    );
+    let from_pre = Account::funded(initial_balance);
+    let to_pre = Account::default();
 
-    let from_account_id =
-        AccountId::for_regular_private_account(&from_keys.npk(), &from_keys.vpk(), 0);
-    let to_account_id = AccountId::for_regular_private_account(&to_keys.npk(), &to_keys.vpk(), 0);
-    let from_commitment = Commitment::new(&from_account_id, &from_account.account);
-    let to_commitment = Commitment::new(&to_account_id, &to_account.account);
+    let from_account_id = AccountId::for_regular_private_account(
+        &from_keys.npk(),
+        &from_keys.vpk(),
+        Identifier::ZERO,
+    );
+    let to_account_id =
+        AccountId::for_regular_private_account(&to_keys.npk(), &to_keys.vpk(), Identifier::ZERO);
+    let from_commitment = Commitment::new(&from_account_id, &from_pre);
+    let to_commitment = Commitment::new(&to_account_id, &to_pre);
     let from_init_nullifier = Nullifier::for_account_initialization(&from_account_id);
     let to_init_nullifier = Nullifier::for_account_initialization(&to_account_id);
     let mut state = V03State::new()
@@ -218,74 +266,63 @@ fn private_chained_call(number_of_calls: u32) {
             (from_commitment, from_init_nullifier),
             (to_commitment, to_init_nullifier),
         ])
-        .with_test_programs();
+        .with_programs([crate::test_methods::chain_caller()]);
     let amount: u128 = 37;
-    let instruction: (u128, ProgramId, u32, Option<PdaSeed>) = (
-        amount,
-        crate::test_methods::simple_balance_transfer().id(),
-        number_of_calls,
-        None,
+    let instruction = ChainCall::new(
+        NATIVE_TOKEN_PROGRAM_ID,
+        Program::serialize_instruction(NativeInstruction::Transfer { amount }).unwrap(),
+    )
+    .repeated(number_of_calls);
+
+    let program_with_deps = ProgramWithDependencies::new(
+        chain_caller.clone(),
+        AccountId::from_builtin_program(chain_caller.id()),
+        HashMap::new(),
     );
-
-    let mut dependencies = HashMap::new();
-
-    dependencies.insert(simple_transfers.id().into(), simple_transfers);
-    let program_with_deps =
-        ProgramWithDependencies::new(chain_caller.clone(), chain_caller.id().into(), dependencies);
 
     let from_new_nonce = Nonce::default().private_account_nonce_increment(&from_keys.nsk());
     let to_new_nonce = Nonce::default().private_account_nonce_increment(&to_keys.nsk());
 
     let from_expected_post = Account {
-        balance: initial_balance - u128::from(number_of_calls) * amount,
         nonce: from_new_nonce,
-        ..from_account.account.clone()
+        ..Account::funded(initial_balance - u128::from(number_of_calls) * amount)
     };
     let from_expected_commitment = Commitment::new(&from_account_id, &from_expected_post);
 
     let to_expected_post = Account {
-        balance: u128::from(number_of_calls) * amount,
         nonce: to_new_nonce,
-        ..to_account.account.clone()
+        ..Account::funded(u128::from(number_of_calls) * amount)
     };
     let to_expected_commitment = Commitment::new(&to_account_id, &to_expected_post);
 
     // Act
     let (output, proof) = execute_and_prove(
-        vec![to_account, from_account],
-        Program::serialize_instruction(instruction).unwrap(),
-        vec![
-            InputAccountIdentity::Private(PrivateWitness {
-                vpk: from_keys.vpk(),
-                random_seed: [0; 32],
-                identifier: 0,
-                kind: WitnessKind::Regular {
-                    ask: Some(from_keys.ask),
-                },
-                nullifier: NullifierWitness::Update {
-                    view_tag: 0,
-                    nsk: from_keys.nsk(),
-                    membership_proof: state
+        ProvingInput {
+            shard_selectors: vec![
+                ProgramShardSelector::native_balance(to_account_id),
+                ProgramShardSelector::native_balance(from_account_id),
+            ],
+            private_witnesses: vec![
+                update_witness(
+                    &from_keys,
+                    Identifier::ZERO,
+                    from_pre,
+                    state
                         .get_proof_for_commitment(&from_commitment)
                         .expect("from's commitment must be in state"),
-                },
-            }),
-            InputAccountIdentity::Private(PrivateWitness {
-                vpk: to_keys.vpk(),
-                random_seed: [0; 32],
-                identifier: 0,
-                kind: WitnessKind::Regular {
-                    ask: Some(to_keys.ask),
-                },
-                nullifier: NullifierWitness::Update {
-                    view_tag: 0,
-                    nsk: to_keys.nsk(),
-                    membership_proof: state
+                ),
+                update_witness(
+                    &to_keys,
+                    Identifier::ZERO,
+                    to_pre,
+                    state
                         .get_proof_for_commitment(&to_commitment)
                         .expect("to's commitment must be in state"),
-                },
-            }),
-        ],
+                ),
+            ],
+            instruction_data: Program::serialize_instruction(instruction).unwrap(),
+            ..Default::default()
+        },
         &program_with_deps,
     )
     .unwrap();

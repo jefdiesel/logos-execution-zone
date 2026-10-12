@@ -18,8 +18,10 @@ use std::{collections::BTreeMap, str::FromStr, time::Duration};
 
 use common::HashType;
 use lee::{Account, AccountId, program::Program};
-use lee_core::program::{InstructionData, ProgramId};
-use logos_blockchain_key_management_system_service::keys::Ed25519Key;
+use lee_core::{
+    native_token,
+    program::{InstructionData, ProgramId},
+};
 use sequencer_stake_core::SequencerKey;
 
 use crate::cucumber::error::StepError;
@@ -318,76 +320,42 @@ enum RawStakeInstruction {
     Stake {
         sequencer_key: [u8; 32],
         amount: u128,
-        mover_account_id: AccountId,
-        mover_instruction_data: InstructionData,
+        has_record: bool,
     },
 }
 
 /// Derives the sequencer key for a fixed seed through the shared fixture
 /// derivation, keeping every test sequencer key on one derivation path.
 fn sequencer_key_from_seed(seed: u32) -> SequencerKey {
-    let signing_key = crate::config::sequencer_signing_key_from_seed(seed);
-    let bytes = Ed25519Key::from_bytes(&signing_key).public_key().to_bytes();
+    let bytes = crate::config::sequencer_signing_key_from_seed(seed)
+        .public_key()
+        .to_bytes();
     SequencerKey::new(bytes).expect("a Bedrock public key is a valid Ed25519 public key")
 }
 
-/// Serialized `authenticated_transfer::Transfer` moving `amount`.
+/// Serialized native `Transfer` moving `amount`.
 pub fn transfer_instruction(amount: u128) -> Result<InstructionData, StepError> {
-    Program::serialize_instruction(authenticated_transfer_core::Instruction::Transfer { amount })
-        .map_err(|error| StepError::LogicalError {
-            message: format!("failed to serialize the mover instruction: {error}"),
-        })
-}
-
-/// Serialized `sequencer_stake::Stake` for `sequencer_key` through the
-/// `authenticated_transfer` mover.
-pub fn stake_instruction(
-    sequencer_key: SequencerKey,
-    amount: u128,
-) -> Result<InstructionData, StepError> {
-    stake_instruction_with_mover(
-        sequencer_key,
-        amount,
-        programs::authenticated_transfer().id().into(),
-        transfer_instruction(amount)?,
+    Program::serialize_instruction(native_token::Instruction::Transfer { amount }).map_err(
+        |error| StepError::LogicalError {
+            message: format!("failed to serialize the transfer instruction: {error}"),
+        },
     )
 }
 
-/// Serialized `sequencer_stake::Stake` for `sequencer_key` driven by an
-/// arbitrary mover.
-///
-/// The mover is the program `Stake` chains into, with the funding and stake
-/// funds accounts, to move `amount` into the funds account;
-/// `authenticated_transfer` is the default, but `Stake` is generic over it.
-/// A program is addressed by its account: a compiled-in program's image id
-/// mapped to an account id, or the header account a runtime deployment claimed.
-pub fn stake_instruction_with_mover(
+/// Serialized `sequencer_stake::Stake` for `sequencer_key`; `has_record` says
+/// whether the ownership account already holds a stake record.
+pub fn stake_instruction(
     sequencer_key: SequencerKey,
     amount: u128,
-    mover_account_id: AccountId,
-    mover_instruction_data: InstructionData,
+    has_record: bool,
 ) -> Result<InstructionData, StepError> {
     Program::serialize_instruction(sequencer_stake_core::Instruction::Stake {
         sequencer_key,
         amount,
-        mover_account_id,
-        mover_instruction_data,
+        has_record,
     })
     .map_err(|error| StepError::LogicalError {
         message: format!("failed to serialize the Stake instruction: {error}"),
-    })
-}
-
-/// Serialized `token::NewFungibleDefinition`. Its two accounts, the definition
-/// and the holding account, both receive data, and a data write is what
-/// claims a default-owned account for the writing program.
-pub fn token_definition_instruction() -> Result<InstructionData, StepError> {
-    Program::serialize_instruction(token_core::Instruction::NewFungibleDefinition {
-        name: "stake-scenario-token".to_owned(),
-        total_supply: 1,
-    })
-    .map_err(|error| StepError::LogicalError {
-        message: format!("failed to serialize the token definition instruction: {error}"),
     })
 }
 
@@ -405,27 +373,6 @@ pub fn chain_caller_instruction(
     )
 }
 
-/// Serialized instruction for the `simple_balance_transfer` test program: a
-/// bare `u128` amount it moves from its first account into its second.
-pub fn simple_balance_transfer_instruction(amount: u128) -> Result<InstructionData, StepError> {
-    Program::serialize_instruction(amount).map_err(|error| StepError::LogicalError {
-        message: format!("failed to serialize the simple_balance_transfer instruction: {error}"),
-    })
-}
-
-/// Serialized `sequencer_stake::ConfirmStake` expecting
-/// `expected_balance_after` on the stake funds account.
-pub fn confirm_stake_instruction(
-    expected_balance_after: u128,
-) -> Result<InstructionData, StepError> {
-    Program::serialize_instruction(sequencer_stake_core::Instruction::ConfirmStake {
-        expected_balance_after,
-    })
-    .map_err(|error| StepError::LogicalError {
-        message: format!("failed to serialize the ConfirmStake instruction: {error}"),
-    })
-}
-
 /// Serialized `Stake` carrying `key_bytes` in the `SequencerKey` position
 /// (case P-24).
 pub fn raw_stake_instruction(
@@ -435,8 +382,7 @@ pub fn raw_stake_instruction(
     Program::serialize_instruction(RawStakeInstruction::Stake {
         sequencer_key: key_bytes,
         amount,
-        mover_account_id: programs::authenticated_transfer().id().into(),
-        mover_instruction_data: transfer_instruction(amount)?,
+        has_record: false,
     })
     .map_err(|error| StepError::LogicalError {
         message: format!("failed to serialize the raw Stake instruction: {error}"),
@@ -462,8 +408,7 @@ fn assert_raw_stake_layout_matches(amount: u128) -> Result<(), StepError> {
     let expected = sequencer_stake_core::Instruction::Stake {
         sequencer_key: control_key,
         amount,
-        mover_account_id: programs::authenticated_transfer().id().into(),
-        mover_instruction_data: transfer_instruction(amount)?,
+        has_record: false,
     };
     if decoded != expected {
         return Err(StepError::LogicalError {

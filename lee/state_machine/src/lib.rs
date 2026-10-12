@@ -6,20 +6,24 @@
 pub use fees::{FeeDeclaration, SignedMessage, is_fee_authorized};
 pub use lee_core::{
     GENESIS_BLOCK_ID, SharedSecretKey,
-    account::{Account, AccountId, Balance, Cycles, Data, Fee, Gas},
+    account::{
+        Account, AccountData, AccountId, Balance, Cycles, Fee, Gas, ProgramShardSelector, ShardData,
+    },
     encryption::EphemeralPublicKey,
-    program::ProgramId,
+    native_token,
+    program::{AccountMeta, ProgramId},
 };
 pub use privacy_preserving_circuit::{
     PRIVACY_PRESERVING_CIRCUIT_ELF, PRIVACY_PRESERVING_CIRCUIT_ID,
 };
 pub use privacy_preserving_transaction::{
-    PrivacyPreservingTransaction, circuit::execute_and_prove,
+    PrivacyPreservingTransaction,
+    circuit::{ProvingInput, execute_and_prove},
 };
 pub use public_transaction::PublicTransaction;
 pub use signature::{PrivateKey, PublicKey, Signature};
 pub use state::V03State;
-pub use validated_state_diff::{ExecutionOutcome, ValidatedStateDiff};
+pub use validated_state_diff::{ExecutionCharge, ValidatedStateDiff};
 
 pub mod encoding;
 pub mod error;
@@ -34,6 +38,13 @@ mod state;
 pub mod test_utils;
 mod validated_state_diff;
 
+/// Not a guarantee: a `[profile.release] debug-assertions = true` override slips past this.
+#[cfg(all(feature = "test-utils", not(debug_assertions)))]
+compile_error!(
+    "`test-utils` exposes validation-bypassing state-mutation helpers and must never be \
+     enabled in a release build."
+);
+
 mod privacy_preserving_circuit {
     include!(concat!(
         env!("OUT_DIR"),
@@ -46,14 +57,6 @@ mod test_methods {
     use std::borrow::Cow;
 
     use crate::program::Program;
-
-    #[must_use]
-    pub const fn simple_balance_transfer() -> Program {
-        Program::new_unchecked(
-            test_methods::SIMPLE_BALANCE_TRANSFER_ID,
-            Cow::Borrowed(test_methods::SIMPLE_BALANCE_TRANSFER_ELF),
-        )
-    }
 
     #[cfg(feature = "prove")]
     #[must_use]
@@ -106,46 +109,6 @@ mod test_methods {
     }
 
     #[must_use]
-    pub const fn minter() -> Program {
-        Program::new_unchecked(
-            test_methods::MINTER_ID,
-            Cow::Borrowed(test_methods::MINTER_ELF),
-        )
-    }
-
-    #[must_use]
-    pub const fn squatter() -> Program {
-        Program::new_unchecked(
-            test_methods::SQUATTER_ID,
-            Cow::Borrowed(test_methods::SQUATTER_ELF),
-        )
-    }
-
-    #[must_use]
-    pub const fn acquire_and_forward() -> Program {
-        Program::new_unchecked(
-            test_methods::ACQUIRE_AND_FORWARD_ID,
-            Cow::Borrowed(test_methods::ACQUIRE_AND_FORWARD_ELF),
-        )
-    }
-
-    #[must_use]
-    pub const fn acquire_then_fund() -> Program {
-        Program::new_unchecked(
-            test_methods::ACQUIRE_THEN_FUND_ID,
-            Cow::Borrowed(test_methods::ACQUIRE_THEN_FUND_ELF),
-        )
-    }
-
-    #[must_use]
-    pub const fn burner() -> Program {
-        Program::new_unchecked(
-            test_methods::BURNER_ID,
-            Cow::Borrowed(test_methods::BURNER_ELF),
-        )
-    }
-
-    #[must_use]
     pub const fn auth_asserting_noop() -> Program {
         Program::new_unchecked(
             test_methods::AUTH_ASSERTING_NOOP_ID,
@@ -166,6 +129,14 @@ mod test_methods {
         Program::new_unchecked(
             test_methods::SELECTIVE_PDA_DELEGATOR_ID,
             Cow::Borrowed(test_methods::SELECTIVE_PDA_DELEGATOR_ELF),
+        )
+    }
+
+    #[must_use]
+    pub const fn shard_forwarder() -> Program {
+        Program::new_unchecked(
+            test_methods::SHARD_FORWARDER_ID,
+            Cow::Borrowed(test_methods::SHARD_FORWARDER_ELF),
         )
     }
 
@@ -255,15 +226,6 @@ mod test_methods {
     }
 
     #[must_use]
-    #[inline]
-    pub const fn simple_transfer_proxy() -> Program {
-        Program::new_unchecked(
-            test_methods::SIMPLE_TRANSFER_PROXY_ID,
-            Cow::Borrowed(test_methods::SIMPLE_TRANSFER_PROXY_ELF),
-        )
-    }
-
-    #[must_use]
     pub const fn references_undeclared_account() -> Program {
         Program::new_unchecked(
             test_methods::REFERENCES_UNDECLARED_ACCOUNT_ID,
@@ -296,10 +258,42 @@ mod test_methods {
     }
 
     #[must_use]
-    pub const fn reordering_transfer() -> Program {
+    pub const fn native_spender() -> Program {
         Program::new_unchecked(
-            test_methods::REORDERING_TRANSFER_ID,
-            Cow::Borrowed(test_methods::REORDERING_TRANSFER_ELF),
+            test_methods::NATIVE_SPENDER_ID,
+            Cow::Borrowed(test_methods::NATIVE_SPENDER_ELF),
+        )
+    }
+
+    #[must_use]
+    pub const fn forges_apply_echo() -> Program {
+        Program::new_unchecked(
+            test_methods::FORGES_APPLY_ECHO_ID,
+            Cow::Borrowed(test_methods::FORGES_APPLY_ECHO_ELF),
+        )
+    }
+
+    #[must_use]
+    pub const fn chains_from_apply() -> Program {
+        Program::new_unchecked(
+            test_methods::CHAINS_FROM_APPLY_ID,
+            Cow::Borrowed(test_methods::CHAINS_FROM_APPLY_ELF),
+        )
+    }
+
+    #[must_use]
+    pub const fn reordering_writer() -> Program {
+        Program::new_unchecked(
+            test_methods::REORDERING_WRITER_ID,
+            Cow::Borrowed(test_methods::REORDERING_WRITER_ELF),
+        )
+    }
+
+    #[must_use]
+    pub const fn scripted_applier() -> Program {
+        Program::new_unchecked(
+            test_methods::SCRIPTED_APPLIER_ID,
+            Cow::Borrowed(test_methods::SCRIPTED_APPLIER_ELF),
         )
     }
 }

@@ -5,6 +5,6 @@ edition = "2024"
 license = { workspace = true }
 
 [dependencies]
-authenticated_transfer_core = { workspace = true, features = ["image_id"] }
+borsh.workspace = true
 fee_core.workspace = true
 lee_core.workspace = true

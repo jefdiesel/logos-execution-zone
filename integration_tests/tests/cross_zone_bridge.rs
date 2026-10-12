@@ -24,7 +24,7 @@ use integration_tests::{
     indexer_client::IndexerClient,
 };
 use lee::{
-    AccountId, PrivateKey, PublicKey, PublicTransaction,
+    AccountId, PrivateKey, ProgramShardSelector, PublicKey, PublicTransaction,
     public_transaction::{Message, WitnessSet},
 };
 use sequencer_core::config::{CrossZoneConfig, CrossZonePeer, CrossZoneRoute, GenesisAction};
@@ -52,16 +52,15 @@ async fn lock_on_zone_a_mints_wrapped_token_on_zone_b() -> Result<()> {
     let holder_key = PrivateKey::try_new([7; 32]).expect("valid key");
     let holder_id = AccountId::from(&PublicKey::new_from_private_key(&holder_key));
 
-    let wrapped_token_id: AccountId = programs::wrapped_token().id().into();
+    let wrapped_token_id = programs::wrapped_token_account_id();
     let cross_zone = CrossZoneConfig {
         peers: vec![CrossZonePeer {
             channel_id: *channel_a.as_ref(),
             allowed_routes: vec![CrossZoneRoute {
-                src_account_id: programs::bridge_lock().id().into(),
+                src_account_id: programs::bridge_lock_account_id(),
                 target_account_id: wrapped_token_id,
                 mint_cap: None,
             }],
-            expected_block_signing_pubkeys: Vec::new(),
             min_committee_size: 0,
         }],
         source_authority: None,
@@ -124,19 +123,26 @@ async fn lock_on_zone_a_mints_wrapped_token_on_zone_b() -> Result<()> {
     // Conservation: the mint on B must be backed by an equal lock on A. The lock
     // has already landed (it preceded delivery), so zone A reflects the debit and
     // escrow now.
-    let escrow_id = bridge_lock_core::escrow_account_id(programs::bridge_lock().id().into());
-    let escrowed = seq_client_a.get_account(escrow_id).await?.balance;
+    let escrow_id = bridge_lock_core::escrow_account_id(programs::bridge_lock_account_id());
+    let escrowed = seq_client_a
+        .get_account(escrow_id)
+        .await?
+        .data
+        .native_balance()
+        .unwrap();
     assert_eq!(
         escrowed, LOCK_AMOUNT,
         "zone A escrow must hold the locked amount"
     );
     let remaining = seq_client_a
         .get_account(bridge_lock_core::holding_account_id(
-            programs::bridge_lock().id().into(),
+            programs::bridge_lock_account_id(),
             &holder_id.into_value(),
         ))
         .await?
-        .balance;
+        .data
+        .native_balance()
+        .unwrap();
     assert_eq!(
         remaining,
         u128::from(INITIAL_BALANCE) - LOCK_AMOUNT,
@@ -150,7 +156,7 @@ async fn lock_on_zone_a_mints_wrapped_token_on_zone_b() -> Result<()> {
     wait_for_balance(
         ind_client_a,
         bridge_lock_core::holding_account_id(
-            programs::bridge_lock().id().into(),
+            programs::bridge_lock_account_id(),
             &holder_id.into_value(),
         ),
         u128::from(INITIAL_BALANCE) - LOCK_AMOUNT,
@@ -170,9 +176,9 @@ fn build_lock_tx(
     holder_id: AccountId,
     target_zone: [u8; 32],
 ) -> LeeTransaction {
-    let bridge_lock_id: AccountId = programs::bridge_lock().id().into();
-    let wrapped_token_id: AccountId = programs::wrapped_token().id().into();
-    let outbox_id: AccountId = programs::cross_zone_outbox().id().into();
+    let bridge_lock_id = programs::bridge_lock_account_id();
+    let wrapped_token_id = programs::wrapped_token_account_id();
+    let outbox_id = programs::cross_zone_outbox_account_id();
     let ordinal = 0;
 
     let mint = wrapped_token_core::Instruction::Mint {
@@ -182,8 +188,14 @@ fn build_lock_tx(
     let payload = borsh::to_vec(&mint).expect("serialize mint");
 
     let target_accounts = vec![
-        wrapped_token_core::config_account_id(wrapped_token_id).into_value(),
-        wrapped_token_core::holding_account_id(wrapped_token_id, &RECIPIENT).into_value(),
+        ProgramShardSelector::new(
+            wrapped_token_core::config_account_id(wrapped_token_id),
+            wrapped_token_id,
+        ),
+        ProgramShardSelector::new(
+            wrapped_token_core::holding_account_id(wrapped_token_id, &RECIPIENT),
+            wrapped_token_id,
+        ),
     ];
     let lock = bridge_lock_core::Instruction::Lock {
         amount: LOCK_AMOUNT,
@@ -195,14 +207,20 @@ fn build_lock_tx(
     };
 
     let accounts = vec![
-        bridge_lock_core::config_account_id(bridge_lock_id),
-        holder_id,
-        bridge_lock_core::holding_account_id(
-            programs::bridge_lock().id().into(),
-            &holder_id.into_value(),
+        ProgramShardSelector::new(
+            bridge_lock_core::config_account_id(bridge_lock_id),
+            bridge_lock_id,
         ),
-        bridge_lock_core::escrow_account_id(bridge_lock_id),
-        outbox_pda(outbox_id, bridge_lock_id, &target_zone, ordinal),
+        ProgramShardSelector::native_balance(holder_id),
+        ProgramShardSelector::native_balance(bridge_lock_core::holding_account_id(
+            programs::bridge_lock_account_id(),
+            &holder_id.into_value(),
+        )),
+        ProgramShardSelector::native_balance(bridge_lock_core::escrow_account_id(bridge_lock_id)),
+        ProgramShardSelector::new(
+            outbox_pda(outbox_id, bridge_lock_id, &target_zone, ordinal),
+            outbox_id,
+        ),
     ];
     // One nonce per signature: the holder signs, at its genesis nonce 0. The
     // lock is fee-exempt (cross-zone outbound traffic), so it carries no fee
@@ -226,8 +244,8 @@ async fn wait_for_balance(
     let wait = async {
         loop {
             let held = indexer_service_rpc::RpcClient::get_account(&**indexer, account_id).await?;
-            if held.balance == expected {
-                return Ok::<u128, anyhow::Error>(held.balance);
+            if held.data.balance() == Some(expected) {
+                return Ok::<u128, anyhow::Error>(held.data.balance().unwrap());
             }
             tokio::time::sleep(Duration::from_secs(3)).await;
         }
@@ -242,11 +260,18 @@ async fn wait_for_mint(indexer: &IndexerClient, holding_id: AccountId) -> Result
     let account_id = indexer_service_protocol::AccountId {
         value: holding_id.into_value(),
     };
+    let wrapped_token_id = indexer_service_protocol::AccountId {
+        value: programs::wrapped_token_account_id().into_value(),
+    };
     let wait = async {
         loop {
             let account =
                 indexer_service_rpc::RpcClient::get_account(&**indexer, account_id).await?;
-            let balance = wrapped_token_core::read_balance(&account.data.0);
+            let balance = account
+                .data
+                .shards
+                .get(&wrapped_token_id)
+                .map_or(0, |data| wrapped_token_core::read_balance(&data.0));
             if balance != 0 {
                 return Ok::<u128, anyhow::Error>(balance);
             }

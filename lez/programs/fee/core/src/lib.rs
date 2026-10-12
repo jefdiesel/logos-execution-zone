@@ -15,6 +15,8 @@ const FEE_STATE_SEED: [u8; 32] = *b"/LEZ/v0.3/FeeSeed/State/0000000/";
 const FEE_ESCROW_SEED: [u8; 32] = *b"/LEZ/v0.3/FeeSeed/Escrow/000000/";
 const FEE_INBOX_SEED: [u8; 32] = *b"/LEZ/v0.3/FeeSeed/Inbox/0000000/";
 
+pub const FEE_NAME: [u8; 3] = *b"fee";
+
 /// Per-block fee summary carried as the fee invocation's instruction and
 /// validated byte-for-byte by the transition.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
@@ -31,13 +33,23 @@ pub enum Instruction {
     /// Block-tail distribution: apply the market update, drain the inbox (base
     /// revenue to escrow, tips to the producer), and pay the smoothed payout.
     ///
-    /// Accounts: `[state, escrow, inbox, producer]`.
-    Distribute(BlockFeeSummary),
+    /// Accounts: `[state, escrow, inbox, producer]`; `state` is named under this program's
+    /// shard, the rest are balance-only. `payout` is the producer's smoothed share.
+    /// [`state::FeeState::apply_block`] returns.
+    Distribute {
+        summary: BlockFeeSummary,
+        payout: Balance,
+    },
     /// Per-transaction refund: return `amount` (the unspent part of the reserve)
     /// from the inbox to the payer.
     ///
-    /// Accounts: `[inbox, payer]`.
+    /// Accounts: `[inbox, payer]`, both balance-only.
     Refund { amount: Balance },
+}
+
+#[must_use]
+pub fn fee_account_id() -> AccountId {
+    AccountId::from_builtin_program_name(&FEE_NAME)
 }
 
 #[must_use]
@@ -55,7 +67,7 @@ pub const fn fee_inbox_seed() -> PdaSeed {
     PdaSeed::new(FEE_INBOX_SEED)
 }
 
-/// The fee-state account: base fees, payout window, and carry live in its `data`.
+/// The fee-state account, which stores base fees, the payout window, and carry.
 #[must_use]
 pub fn compute_fee_state_account_id(fee_account_id: AccountId) -> AccountId {
     AccountId::for_public_pda(&fee_account_id, &fee_state_seed())

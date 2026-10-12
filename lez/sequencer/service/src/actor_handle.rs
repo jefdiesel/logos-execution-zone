@@ -22,12 +22,16 @@ impl<T: kameo::Actor> ActorHandle<T> {
         &self.full_name
     }
 
+    pub const fn actor_ref(&self) -> &ActorRef<T> {
+        &self.actor_ref
+    }
+
     pub async fn shutdown(self) {
         let full_name = self.full_name();
         info!("Stopping {full_name} actor...");
 
         if let Err(err) = self.actor_ref.stop_gracefully().await {
-            error!("Failed to gracefully stop actor {full_name}: {err}",);
+            error!("Failed to gracefully stop actor {full_name}: {err}");
         }
         self.actor_ref.wait_for_shutdown_with_result(|_| ()).await;
 

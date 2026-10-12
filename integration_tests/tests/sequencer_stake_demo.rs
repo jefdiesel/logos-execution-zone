@@ -11,21 +11,15 @@ use anyhow::{Context as _, Result};
 use integration_tests::{account_balance, get_account, new_account};
 use lee::{AccountId, PrivateKey, PublicKey, program::Program};
 use log::info;
-use logos_blockchain_core::mantle::ops::channel::Ed25519PublicKey;
-use logos_blockchain_key_management_system_service::keys::Ed25519Key;
-use logos_blockchain_zone_sdk::{
-    CommonHttpClient,
-    adapter::{Node as _, NodeHttpClient},
-};
+use logos_blockchain_key_management_system_service::keys::{Ed25519Key, UnsecuredEd25519Key};
+use sequencer_bedrock_actor::protocol::GetAccreditedKeys;
 use sequencer_core::config::GenesisAction;
 use sequencer_service_rpc::RpcClient as _;
 use test_fixtures::{
     MultiZoneTestContextBuilder, TestContext, ZoneTestContextBuilder,
-    config::{
-        MultiNodeTestContextConfig, SequencerPartialConfig, UrlProtocol, addr_to_url,
-        bedrock_channel_id,
-    },
+    config::{MultiNodeTestContextConfig, SequencerPartialConfig, bedrock_channel_id},
     setup::{SequencerSetup, sequencer_client},
+    spawn_channel_observer,
 };
 use tokio::test;
 use wallet::AccountIdentity;
@@ -89,17 +83,21 @@ async fn stake_transaction_joins_the_bedrock_committee() -> Result<()> {
 
     let funds_id = system_accounts::stake_funds_account_id(&ownership_id);
 
-    let mover_instruction_data =
-        Program::serialize_instruction(authenticated_transfer_core::Instruction::Transfer {
-            amount: u128::from(funding_balance),
-        })
-        .context("Failed to serialize mover instruction")?;
+    let config_id = system_accounts::sequencer_stake_config_account_id();
+    let stake_id = programs::sequencer_stake_account_id();
+    // The proposal is read off the chain the stake is about to land on, the way `submit_stake`
+    // builds it: it is checked against the account it describes.
+    let has_record = !get_account(&ctx, ownership_id)
+        .await
+        .context("Failed to read the stake ownership account")?
+        .data
+        .shard(stake_id)
+        .is_empty();
     let stake_instruction_data =
         Program::serialize_instruction(sequencer_stake_core::Instruction::Stake {
             sequencer_key: demo_stake_key,
             amount: u128::from(funding_balance),
-            mover_account_id: programs::authenticated_transfer().id().into(),
-            mover_instruction_data,
+            has_record,
         })
         .context("Failed to serialize Stake instruction")?;
 
@@ -107,35 +105,36 @@ async fn stake_transaction_joins_the_bedrock_committee() -> Result<()> {
         "Submitting Stake transaction for sequencer key {}",
         hex::encode(demo_sequencer_key.to_bytes())
     );
-    let config_id = system_accounts::sequencer_stake_config_account_id();
     ctx.wallet()
         .send_pub_tx(
             vec![
-                AccountIdentity::Public(funding_id),
-                AccountIdentity::Public(ownership_id),
-                AccountIdentity::PublicNoSign(funds_id),
-                AccountIdentity::PublicNoSign(config_id),
+                AccountIdentity::Public(funding_id).balance(),
+                AccountIdentity::Public(ownership_id).select_program_shard(stake_id),
+                AccountIdentity::PublicNoSign(funds_id).balance(),
+                AccountIdentity::PublicNoSign(config_id).select_program_shard(stake_id),
             ],
             stake_instruction_data,
-            programs::sequencer_stake().id().into(),
+            stake_id,
         )
         .await
         .map_err(|err| anyhow::anyhow!("Failed to submit Stake transaction: {err:?}"))?;
 
     info!("Waiting for the Stake transaction's block to land");
     poll_until("stake to take ownership", 30, || async {
-        Ok(get_account(&ctx, ownership_id).await?.program_owner
-            == programs::sequencer_stake().id().into())
+        Ok(!get_account(&ctx, ownership_id)
+            .await?
+            .data
+            .shard(stake_id)
+            .is_empty())
     })
     .await?;
 
     let ownership_account = get_account(&ctx, ownership_id)
         .await
         .context("Failed to read the stake ownership account")?;
-    assert_eq!(
-        ownership_account.program_owner,
-        programs::sequencer_stake().id().into(),
-        "ownership account should now be owned by sequencer_stake"
+    assert!(
+        !ownership_account.data.shard(stake_id).is_empty(),
+        "ownership account should now hold a sequencer_stake record"
     );
     let staked_balance = account_balance(&ctx, funds_id).await?;
     assert_eq!(
@@ -143,49 +142,45 @@ async fn stake_transaction_joins_the_bedrock_committee() -> Result<()> {
         u128::from(funding_balance),
         "the funds PDA should hold the staked balance"
     );
-    let record = sequencer_stake_core::StakeRecord::from_bytes(ownership_account.data.as_ref())
-        .context("ownership account data did not decode as a StakeRecord")?;
+    let record = sequencer_stake_core::StakeRecord::from_bytes(
+        ownership_account.data.shard(stake_id).as_ref(),
+    )
+    .context("ownership account data did not decode as a StakeRecord")?;
     assert_eq!(record.sequencer_key, demo_stake_key);
     info!(
         "Ownership account confirmed: {staked_balance} staked for sequencer key {}",
         hex::encode(record.sequencer_key)
     );
 
-    let bedrock_url = addr_to_url(UrlProtocol::Http, ctx.bedrock_addr())
-        .context("Failed to build the Bedrock node URL")?;
-    let node = NodeHttpClient::new(CommonHttpClient::new(None), bedrock_url);
+    let observer = spawn_channel_observer(ctx.bedrock_addr(), bedrock_channel_id()).await?;
 
     // The committee-config update is a separate tx from the block's own
     // publish, so it may land a moment later — poll a few times before failing.
-    let mut channel_state = None;
+    let mut committee = None;
     for _ in 0..10 {
-        let state = node
-            .channel_state(bedrock_channel_id())
+        let accredited = observer
+            .ask(GetAccreditedKeys)
             .await
-            .context("Failed to read Bedrock channel state")?
+            .context("Failed to read the channel's accredited keys")?
             .context("Bedrock channel does not exist")?;
-        if state
-            .accredited_keys
-            .iter()
-            .any(|key: &Ed25519PublicKey| *key == demo_sequencer_key)
-        {
-            channel_state = Some(state);
+        if accredited.keys.contains(&demo_sequencer_key) {
+            committee = Some(accredited);
             break;
         }
         tokio::time::sleep(Duration::from_secs(3)).await;
     }
-    let channel_state = channel_state.context(
+    let committee = committee.context(
         "demo sequencer key should have been discovered and accredited after the Stake transaction",
     )?;
     info!(
         "Bedrock channel now accredits {} key(s), including the demo sequencer key — self-join complete",
-        channel_state.accredited_keys.len()
+        committee.keys.len()
     );
 
     // Only now start a node behind the key, against a channel that already has a chain.
     let (joiner, _joiner_home) = SequencerSetup::new(fast_blocks(), ctx.bedrock_addr())
         .with_channel_id(bedrock_channel_id())
-        .with_bedrock_signing_key(JOINER_SIGNING_KEY)
+        .with_bedrock_signing_key(UnsecuredEd25519Key::from_bytes(&JOINER_SIGNING_KEY))
         .joining_existing_channel()
         .setup()
         .await
@@ -202,17 +197,13 @@ async fn stake_transaction_joins_the_bedrock_committee() -> Result<()> {
 
     // A tip past `joined_at` under the demo key is a block this node built.
     poll_until("the joining sequencer to build a block on its turn", 180, {
-        let node = &node;
+        let observer = &observer;
         let ctx = &ctx;
         move || async move {
-            let Some(state) = node.channel_state(bedrock_channel_id()).await? else {
+            let Some(accredited) = observer.ask(GetAccreditedKeys).await? else {
                 return Ok(false);
             };
-            let turn = state
-                .accredited_keys
-                .get(usize::from(state.tip_sequencer))
-                .copied();
-            Ok(turn == Some(demo_sequencer_key)
+            Ok(accredited.whose_turn() == Some(demo_sequencer_key)
                 && ctx.sequencer_client().get_last_block_id().await? > joined_at)
         }
     })
@@ -249,20 +240,27 @@ async fn stake_transaction_joins_the_bedrock_committee() -> Result<()> {
     // Unstake recipient is freely chosen during the request.
     let destination_id = funding_id;
 
+    let requested_at = ctx
+        .sequencer_client()
+        .get_last_block_id()
+        .await?
+        .saturating_add(sequencer_stake_core::UNSTAKE_REQUEST_WINDOW);
     let unstake_request_data =
         Program::serialize_instruction(sequencer_stake_core::Instruction::UnstakeRequest {
+            sequencer_key: demo_stake_key,
             amount: u128::from(funding_balance),
             destination: destination_id,
+            requested_at,
         })
         .context("Failed to serialize UnstakeRequest instruction")?;
     ctx.wallet()
         .send_pub_tx(
             vec![
-                AccountIdentity::Public(ownership_id),
-                AccountIdentity::PublicNoSign(config_id),
+                AccountIdentity::Public(ownership_id).select_program_shard(stake_id),
+                AccountIdentity::PublicNoSign(config_id).select_program_shard(stake_id),
             ],
             unstake_request_data,
-            programs::sequencer_stake().id().into(),
+            stake_id,
         )
         .await
         .map_err(|err| anyhow::anyhow!("Failed to submit UnstakeRequest transaction: {err:?}"))?;
@@ -274,16 +272,12 @@ async fn stake_transaction_joins_the_bedrock_committee() -> Result<()> {
     // normal Bedrock confirmation latency.
     let mut removed = false;
     for _ in 0..30 {
-        let state = node
-            .channel_state(bedrock_channel_id())
+        let accredited = observer
+            .ask(GetAccreditedKeys)
             .await
-            .context("Failed to read Bedrock channel state")?
+            .context("Failed to read the channel's accredited keys")?
             .context("Bedrock channel does not exist")?;
-        if !state
-            .accredited_keys
-            .iter()
-            .any(|key: &Ed25519PublicKey| *key == demo_sequencer_key)
-        {
+        if !accredited.keys.contains(&demo_sequencer_key) {
             removed = true;
             break;
         }
@@ -308,12 +302,14 @@ async fn stake_transaction_joins_the_bedrock_committee() -> Result<()> {
         .await
         .context("Failed to read the ownership account after the release")?;
     assert_eq!(
-        drained_ownership_account.balance, 0,
+        drained_ownership_account.data.native_balance().unwrap(),
+        0,
         "the ownership account never custodies the stake"
     );
-    let drained_record =
-        sequencer_stake_core::StakeRecord::from_bytes(drained_ownership_account.data.as_ref())
-            .context("drained ownership account data did not decode as a StakeRecord")?;
+    let drained_record = sequencer_stake_core::StakeRecord::from_bytes(
+        drained_ownership_account.data.shard(stake_id).as_ref(),
+    )
+    .context("drained ownership account data did not decode as a StakeRecord")?;
     assert!(
         drained_record.pending_unstake.is_none(),
         "pending unstake should be cleared"
@@ -351,9 +347,13 @@ async fn stake_entry(
     let config_account = get_account(ctx, config_id)
         .await
         .context("Failed to read the sequencer_stake config account")?;
-    let config =
-        sequencer_stake_core::SequencerStakeConfig::from_bytes(config_account.data.as_ref())
-            .context("config account data did not decode as a SequencerStakeConfig")?;
+    let config = sequencer_stake_core::SequencerStakeConfig::from_bytes(
+        config_account
+            .data
+            .shard(programs::sequencer_stake_account_id())
+            .as_ref(),
+    )
+    .context("config account data did not decode as a SequencerStakeConfig")?;
     Ok(config.entries.get(&sequencer_key).copied())
 }
 

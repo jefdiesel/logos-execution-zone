@@ -16,7 +16,7 @@ use sequencer_gossip_actor::protocol::PublishTransaction;
 use sequencer_service_protocol::{
     Account, AccountId, Block, BlockId, ChannelId, Commitment, CommitmentSetDigest,
     CrossZoneDeadLetter, CrossZoneDeadLetterReport, CrossZoneDeadLetterRequeue, FeeStateQuote,
-    HashType, MembershipProof, Nonce, ProgramId,
+    HashType, MembershipProof, Nonce, ProgramId, ProgramShardSelector,
 };
 
 pub struct Service<E: ExecutorActorTrait> {
@@ -73,7 +73,7 @@ impl<E: ExecutorActorTrait> sequencer_service_rpc::RpcServer for Service<E> {
                 .map_err(|err| {
                     ErrorObjectOwned::owned(
                         ErrorCode::InvalidParams.code(),
-                        format!("{err:?}"),
+                        err.to_string(),
                         None::<()>,
                     )
                 })?;
@@ -200,6 +200,17 @@ impl<E: ExecutorActorTrait> sequencer_service_rpc::RpcServer for Service<E> {
             .map_err(map_infallible_error)
     }
 
+    async fn get_account_view(
+        &self,
+        shard_selector: ProgramShardSelector,
+    ) -> Result<Account, ErrorObjectOwned> {
+        self.executor_ref
+            .ask(sequencer_executor_actor::protocol::GetAccountView { shard_selector })
+            .await
+            .map(|reply| reply.account)
+            .map_err(map_infallible_error)
+    }
+
     async fn get_proofs_and_root(
         &self,
         commitments: Vec<Commitment>,
@@ -222,12 +233,6 @@ impl<E: ExecutorActorTrait> sequencer_service_rpc::RpcServer for Service<E> {
         // TODO: Get programs from state
         let mut program_ids = BTreeMap::new();
         program_ids.insert(
-            "authenticated_transfer".to_owned(),
-            programs::authenticated_transfer().id(),
-        );
-        program_ids.insert("token".to_owned(), programs::token().id());
-        program_ids.insert("amm".to_owned(), programs::amm().id());
-        program_ids.insert(
             "privacy_preserving_circuit".to_owned(),
             lee::PRIVACY_PRESERVING_CIRCUIT_ID,
         );
@@ -238,8 +243,8 @@ impl<E: ExecutorActorTrait> sequencer_service_rpc::RpcServer for Service<E> {
         self.executor_ref
             .ask(sequencer_executor_actor::protocol::GetChannelId)
             .await
-            .map(|reply| ChannelId(reply.channel_id))
-            .map_err(map_infallible_error)
+            .map(ChannelId)
+            .map_err(map_executor_error)
     }
 
     async fn get_cross_zone_dead_letters(
@@ -332,10 +337,11 @@ fn map_executor_error<M>(
                 None::<()>,
             ),
             handle_err @ (sequencer_executor_actor::error::Error::BackgroundTaskFinishedUnexpectedly
-            | sequencer_executor_actor::error::Error::BlockPublisherFinishedUnexpectedly
             | sequencer_executor_actor::error::Error::StorageRequestFailed(_)
+            | sequencer_executor_actor::error::Error::BedrockRequestFailed(_)
             | sequencer_executor_actor::error::Error::CrossZoneDeadLettersUnavailable(_)
-            | sequencer_executor_actor::error::Error::CrossZoneDeadLetterRequeueFailed(_)) => {
+            | sequencer_executor_actor::error::Error::CrossZoneDeadLetterRequeueFailed(_)
+            | sequencer_executor_actor::error::Error::SequencerStartFailed(_)) => {
                 internal_error(handle_err)
             }
         },

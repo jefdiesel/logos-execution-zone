@@ -4,9 +4,9 @@
 )]
 
 pub use circuit_io::{
-    DummyInput, InputAccountIdentity, NullifierWitness, PrivacyPreservingCircuitInput,
-    PrivacyPreservingCircuitOutput, PrivateAction, PrivateWitness, ProgramImageClaim, PublicAction,
-    WitnessKind,
+    DummyInput, NullifierWitness, PrivacyPreservingCircuitInput, PrivacyPreservingCircuitOutput,
+    PrivateAction, PrivateWitness, ProgramImageClaim, ProgramImageWitness, ProvenCall,
+    PublicAction, ShadowProgramWitness, WitnessKind,
 };
 pub use commitment::{
     Commitment, CommitmentSetDigest, DUMMY_COMMITMENT, DUMMY_COMMITMENT_HASH, MembershipProof,
@@ -18,7 +18,8 @@ pub use encryption::{
 };
 pub use frame::{from_frame, to_borsh_frame, to_frame};
 pub use nullifier::{
-    AuthorizationSecretKey, Identifier, Nullifier, NullifierPublicKey, NullifierSecretKey,
+    AuthorizationSecretKey, Identifier, IdentifierError, Nullifier, NullifierPublicKey,
+    NullifierSecretKey,
 };
 pub use program::PrivateAccountKind;
 
@@ -27,12 +28,12 @@ mod circuit_io;
 mod commitment;
 mod encoding;
 pub mod encryption;
+pub mod error;
+pub mod execution_state;
 mod frame;
+pub mod native_token;
 mod nullifier;
 pub mod program;
-
-#[cfg(feature = "host")]
-pub mod error;
 
 pub const GENESIS_BLOCK_ID: BlockId = 1;
 

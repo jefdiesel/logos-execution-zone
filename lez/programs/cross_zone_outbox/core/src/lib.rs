@@ -1,5 +1,8 @@
 use borsh::{BorshDeserialize, BorshSerialize};
-use lee_core::{account::AccountId, program::PdaSeed};
+use lee_core::{
+    account::{AccountId, ProgramShardSelector},
+    program::PdaSeed,
+};
 
 /// Versions the seed layout: bump on any change to its field list or offsets,
 /// so slots under an old layout can never be re-derived. Redundant with the
@@ -7,26 +10,24 @@ use lee_core::{account::AccountId, program::PdaSeed};
 /// but the two version different things.
 const OUTBOX_SEED_DOMAIN: [u8; 32] = *b"/LEZ/v0.3/CrossZoneOutbox/00001/";
 
+pub const CROSS_ZONE_OUTBOX_NAME: [u8; 17] = *b"cross_zone_outbox";
+
 /// Raw 32-byte zone (channel) id; the host maps it to the zone-sdk `ChannelId`.
 pub type ZoneId = [u8; 32];
 
 #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub enum Instruction {
-    /// Records an outbound cross-zone message as a write to a self-owned PDA.
+    /// Writes an outbound cross-zone message to the outbox shard at the slot PDA.
     ///
-    /// The slot is written once: a second `Emit` at the same
-    /// `(emitter, target_zone, ordinal)` fails the transaction rather than
-    /// replacing the record.
+    /// Each `(emitter, target_zone, ordinal)` slot can be written only once.
     ///
     /// Required accounts (1):
     /// - Outbox PDA account
     Emit {
         target_zone: ZoneId,
         target_account_id: AccountId,
-        /// Accounts the destination inbox must hand to the target program's
-        /// chained call. The emitter specifies them; the watcher forwards them
-        /// verbatim so the inbox stays target-agnostic.
-        target_accounts: Vec<[u8; 32]>,
+        /// Shard selectors forwarded unchanged to the target program.
+        target_accounts: Vec<ProgramShardSelector>,
         payload: Vec<u8>,
         ordinal: u32,
     },
@@ -48,7 +49,7 @@ pub struct OutboxRecord {
     pub target_zone: ZoneId,
     pub ordinal: u32,
     pub target_account_id: AccountId,
-    pub target_accounts: Vec<[u8; 32]>,
+    pub target_accounts: Vec<ProgramShardSelector>,
     pub payload: Vec<u8>,
 }
 
@@ -63,6 +64,11 @@ impl OutboxRecord {
     pub fn from_bytes(bytes: &[u8]) -> borsh::io::Result<Self> {
         borsh::from_slice(bytes)
     }
+}
+
+#[must_use]
+pub fn cross_zone_outbox_account_id() -> AccountId {
+    AccountId::from_builtin_program_name(&CROSS_ZONE_OUTBOX_NAME)
 }
 
 /// PDA holding one emitted message, keyed by the emitting program, the
@@ -145,7 +151,10 @@ mod tests {
             target_zone: [1; 32],
             ordinal: 7,
             target_account_id: AccountId::new([6; 32]),
-            target_accounts: vec![[9; 32]],
+            target_accounts: vec![ProgramShardSelector::new(
+                AccountId::new([9; 32]),
+                AccountId::new([6; 32]),
+            )],
             payload: b"payload".to_vec(),
         };
 

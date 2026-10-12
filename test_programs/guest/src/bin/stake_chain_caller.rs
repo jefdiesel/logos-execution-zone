@@ -1,56 +1,36 @@
 use lee_core::{
-    account::AccountId,
-    program::{
-        AccountStateDiff, ChainedCall, InstructionData, ProgramCall, ProgramInput, ProgramOutput,
-        read_lee_call, respond_unsupported_call,
-    },
+    account::{AccountId, ProgramShardSelector},
+    program::{ChainedCall, InstructionData, Plan, ProgramCall, read_program_call},
 };
 
 /// A program whose only job is to originate a chained call: it forwards a
 /// caller-supplied instruction to a caller-supplied program account, passing
-/// its own input accounts straight through. Used to reach the
-/// `caller_account_id` guards in programs that reject being invoked as a
-/// chained call — e.g. `sequencer_stake`'s `Stake` (top-level only) and
-/// `ConfirmStake` (self-chained only).
+/// its own input accounts straight through, shard selections included. Used to
+/// reach the `caller_account_id` guards in programs that reject being invoked
+/// as a chained call, e.g. `sequencer_stake`'s `Stake` (top-level only).
 type Instruction = (AccountId, InstructionData);
 
 fn main() {
-    let call = read_lee_call::<Instruction>();
-    let ProgramCall::Execute(
-        ProgramInput {
-            self_account_id,
-            caller_account_id,
-            pre_states,
-            instruction: (target_program_account_id, forwarded_instruction_data),
-        },
-        instruction_data,
-    ) = call
+    let ProgramCall::Plan(input, (target_program_account_id, forwarded_instruction_data)) =
+        read_program_call::<Instruction>()
     else {
-        respond_unsupported_call(call);
+        panic!("stake_chain_caller emits no effect to apply")
     };
 
-    // Forward the same accounts, in the same order, into the chained call. The
-    // callee sees this program as its `caller_account_id`.
-    let chained_call = ChainedCall {
+    // Forward the same accounts, in the same order and on the same shards, into
+    // the chained call. The callee sees this program as its `caller_account_id`.
+    // No effect of its own: this program exists only to be the caller of
+    // `target_program_account_id`, never to mutate state itself.
+    let mut plan = Plan::new(&input);
+    plan.call(ChainedCall {
         program_account_id: target_program_account_id,
-        pre_state_ids: pre_states.iter().map(|pre| pre.account_id).collect(),
+        shard_selectors: input
+            .accounts
+            .iter()
+            .map(ProgramShardSelector::from)
+            .collect(),
         instruction_data: forwarded_instruction_data,
         pda_seeds: Vec::new(),
-    };
-
-    // Leave every input account untouched; this program exists only to be the
-    // caller of `target_program_account_id`, never to mutate state itself.
-    let post_states = pre_states
-        .into_iter()
-        .map(AccountStateDiff::unchanged)
-        .collect();
-
-    ProgramOutput::new(
-        self_account_id,
-        caller_account_id,
-        instruction_data,
-        post_states,
-    )
-    .with_chained_calls(vec![chained_call])
-    .write();
+    });
+    plan.write();
 }

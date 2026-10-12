@@ -1,10 +1,10 @@
 use indexer_service_protocol::{
-    PrivacyPreservingMessage, PrivacyPreservingTransaction, PublicMessage, PublicTransaction,
-    WitnessSet,
+    PrivacyPreservingMessage, PrivacyPreservingTransaction, ProgramShardSelector, PublicMessage,
+    PublicTransaction, WitnessSet,
 };
 use leptos::prelude::*;
 
-use super::AccountNonceList;
+use super::ShardSelectorList;
 
 /// Public transaction details component
 #[component]
@@ -15,8 +15,8 @@ pub fn PublicTxDetails(tx: PublicTransaction) -> impl IntoView {
         witness_set,
     } = tx;
     let PublicMessage {
-        program_id,
-        account_ids,
+        program_account_id,
+        shard_selectors,
         nonces,
         instruction_data,
         fee,
@@ -26,9 +26,14 @@ pub fn PublicTxDetails(tx: PublicTransaction) -> impl IntoView {
         proof,
     } = witness_set;
 
-    let program_id_str = program_id.to_string();
+    let program_id_str = program_account_id.to_string();
     let proof_len = proof.map_or(0, |p| p.0.len());
     let signatures_count = signatures_and_public_keys.len();
+    let signer_nonces_str = nonces
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
     let (fee_payer_str, fee_amounts_str) = fee.map_or_else(
         || ("None (exempt)".to_owned(), "None (exempt)".to_owned()),
         |fee| {
@@ -69,10 +74,14 @@ pub fn PublicTxDetails(tx: PublicTransaction) -> impl IntoView {
                     <span class="info-label">"Gas Limit / Tip / Max Fee:"</span>
                     <span class="info-value">{fee_amounts_str}</span>
                 </div>
+                <div class="info-row">
+                    <span class="info-label">"Signer Nonces:"</span>
+                    <span class="info-value">{signer_nonces_str}</span>
+                </div>
             </div>
 
             <h3>"Accounts"</h3>
-            <AccountNonceList account_ids=account_ids nonces=nonces />
+            <ShardSelectorList shard_selectors=shard_selectors />
         </div>
     }
 }
@@ -93,11 +102,25 @@ pub fn PrivacyPreservingTxDetails(tx: PrivacyPreservingTransaction) -> impl Into
         timestamp_validity_window,
     } = message;
     let private_action_count = private_actions.len();
-    let public_account_ids: Vec<_> = public_actions
+    let public_account_count = public_actions.len();
+    // One row per effect, in the order settlement folds them: the same shard can appear twice.
+    let public_shard_selectors: Vec<_> = public_actions
         .into_iter()
-        .map(|action| action.account_id)
+        .flat_map(|action| {
+            action
+                .effects
+                .into_iter()
+                .map(move |effect| ProgramShardSelector {
+                    account_id: action.account_id,
+                    program_account_id: effect.shard_program_account_id,
+                })
+        })
         .collect();
-    let public_account_count = public_account_ids.len();
+    let signer_nonces_str = nonces
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
     let WitnessSet {
         signatures_and_public_keys: _,
         proof,
@@ -130,10 +153,14 @@ pub fn PrivacyPreservingTxDetails(tx: PrivacyPreservingTransaction) -> impl Into
                     <span class="info-label">"Timestamp Validity Window:"</span>
                     <span class="info-value">{timestamp_validity_window.to_string()}</span>
                 </div>
+                <div class="info-row">
+                    <span class="info-label">"Signer Nonces:"</span>
+                    <span class="info-value">{signer_nonces_str}</span>
+                </div>
             </div>
 
-            <h3>"Public Accounts"</h3>
-            <AccountNonceList account_ids=public_account_ids nonces=nonces />
+            <h3>"Public Effects"</h3>
+            <ShardSelectorList shard_selectors=public_shard_selectors />
         </div>
     }
 }

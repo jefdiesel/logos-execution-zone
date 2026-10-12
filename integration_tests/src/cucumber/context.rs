@@ -258,45 +258,44 @@ impl LezScenarioContext {
             .map_err(StepError::query_failed_boxed)
     }
 
-    /// Signs and submits a public transaction against a compiled-in program
-    /// through the scenario wallet.
+    /// Signs and submits a public transaction against an arbitrary program
+    /// through the scenario wallet, with the wallet picking the fee payer, if
+    /// any, from the signing accounts.
     pub async fn send_program_transaction(
         &self,
-        accounts: Vec<wallet::AccountIdentity>,
+        accounts: Vec<wallet::AccountMention>,
         instruction_data: lee_core::program::InstructionData,
-        program_id: lee_core::program::ProgramId,
+        program_id: lee::AccountId,
     ) -> Result<HashType, StepError> {
-        self.wallet()
-            .send_program_transaction(accounts, instruction_data, program_id)
+        self.send_program_transaction_paid_by(accounts, instruction_data, program_id, None)
             .await
-            .map_err(StepError::query_failed_boxed)
     }
 
     /// Signs and submits a public transaction against the program at
     /// `program_account_id` through the scenario wallet, paid by `payer` if
     /// given.
-    pub async fn send_program_account_transaction(
+    pub async fn send_program_transaction_paid_by(
         &self,
-        accounts: Vec<wallet::AccountIdentity>,
+        accounts: Vec<wallet::AccountMention>,
         instruction_data: lee_core::program::InstructionData,
         program_account_id: AccountId,
         payer: Option<AccountId>,
     ) -> Result<HashType, StepError> {
         self.wallet()
-            .send_program_account_transaction(accounts, instruction_data, program_account_id, payer)
+            .send_program_transaction_paid_by(accounts, instruction_data, program_account_id, payer)
             .await
             .map_err(StepError::query_failed_boxed)
     }
 
-    /// Deploys a program at runtime through the scenario wallet, paid by
+    /// Deploys `program` at runtime through the scenario wallet, paid by
     /// `payer`, and returns the header account the deployment claimed.
     pub async fn deploy_program(
         &self,
-        bytecode: Vec<u8>,
+        program: lee::program::Program,
         payer: AccountId,
     ) -> Result<AccountId, StepError> {
         self.wallet()
-            .deploy_program(bytecode, payer)
+            .deploy_program(program, payer)
             .await
             .map_err(StepError::query_failed_boxed)
     }
