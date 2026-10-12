@@ -31,6 +31,21 @@ use testnet_initial_state::initial_pub_accounts_private_keys;
 use tokio::test;
 use wallet::{AccountIdentity, WalletCore};
 
+/// The in-proof fee `payer` pays for a hand-built transaction without guest effects, priced at
+/// the head fee state.
+async fn private_fee_transfer(
+    wallet: &WalletCore,
+    payer: AccountId,
+) -> Result<lee_core::FeeTransfer> {
+    let quote = wallet.client().get_fee_state().await?;
+    Ok(lee_core::FeeTransfer {
+        payer,
+        recipient: system_accounts::fee_inbox_account_id(),
+        amount: fee_core::assess::private_fee_required(0, quote.base_fee_exec, quote.base_fee_stor),
+        height: quote.height,
+    })
+}
+
 /// Funds a private PDA by calling the native token program directly.
 #[expect(
     clippy::too_many_arguments,
@@ -82,7 +97,7 @@ async fn fund_private_pda(
             ..Default::default()
         },
         &ProgramWithDependencies::native(),
-        Some(wallet::private_fee_transfer(wallet.client(), sender, 0).await?),
+        Some(private_fee_transfer(wallet, sender).await?),
     )
     .map_err(|e| anyhow::anyhow!("circuit proving failed: {e}"))?;
 
@@ -102,7 +117,12 @@ async fn fund_private_pda(
 
 /// Spends from an owned private PDA to a fresh private-foreign recipient.
 ///
-/// Alice must own the PDA in the wallet (i.e. it must have been synced after a receive).
+/// Alice must own the PDA in the wallet (i.e. it must have been synced after a receive). The PDA
+/// cannot authorize the fee transfer, so `fee_payer`, an owned regular private account, pays it.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "test helper; grouping args for the sake of lint would obscure intent"
+)]
 async fn spend_private_pda(
     wallet: &WalletCore,
     pda_account_id: AccountId,
@@ -111,9 +131,10 @@ async fn spend_private_pda(
     seed: PdaSeed,
     amount: u128,
     spend_program: &ProgramWithDependencies,
+    fee_payer: AccountId,
 ) -> Result<()> {
     wallet
-        .send_privacy_preserving_tx(
+        .send_privacy_preserving_tx_with_pre_check(
             vec![
                 AccountIdentity::PrivateOwned(pda_account_id).balance(),
                 AccountIdentity::PrivateForeign {
@@ -126,6 +147,8 @@ async fn spend_private_pda(
             Program::serialize_instruction((seed, amount))
                 .context("failed to serialize pda_spend_proxy instruction")?,
             spend_program,
+            Some(fee_payer),
+            |_| Ok(()),
         )
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -352,6 +375,9 @@ async fn private_pda_family_members_receive_and_spend() -> Result<()> {
     let amount_spend_0: u128 = 13;
     let amount_spend_1: u128 = 37;
 
+    // The PDAs cannot pay the fee themselves; a funded private account of the same wallet does.
+    let fee_payer = ctx.existing_private_accounts()[0];
+
     log::info!("Alice spending from alice_pda_0");
     spend_private_pda(
         ctx.wallet_mut(),
@@ -361,6 +387,7 @@ async fn private_pda_family_members_receive_and_spend() -> Result<()> {
         seed,
         amount_spend_0,
         &spend_program,
+        fee_payer,
     )
     .await?;
 
@@ -373,6 +400,7 @@ async fn private_pda_family_members_receive_and_spend() -> Result<()> {
         seed,
         amount_spend_1,
         &spend_program,
+        fee_payer,
     )
     .await?;
 

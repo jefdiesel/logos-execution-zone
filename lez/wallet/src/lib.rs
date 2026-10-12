@@ -731,20 +731,32 @@ impl WalletCore {
         instruction_data: InstructionData,
         program: &ProgramWithDependencies,
     ) -> Result<(HashType, Vec<SharedSecretKey>), ExecutionFailureKind> {
-        self.send_privacy_preserving_tx_with_pre_check(accounts, instruction_data, program, |_| {
-            Ok(())
-        })
+        self.send_privacy_preserving_tx_with_pre_check(
+            accounts,
+            instruction_data,
+            program,
+            None,
+            |_| Ok(()),
+        )
         .await
     }
 
+    /// Sends a privacy-preserving transaction over `accounts`.
+    ///
+    /// The in-proof fee is paid by `fee_payer` if given: an owned private account that need not
+    /// be one of `accounts`. Otherwise the first authorized private account in `accounts` that
+    /// can afford the fee pays, falling back to the first public signer (see
+    /// [`AccountManager::fee_payer_account_id`]).
     pub async fn send_privacy_preserving_tx_with_pre_check(
         &self,
         accounts: Vec<AccountMention>,
         instruction_data: InstructionData,
         program: &ProgramWithDependencies,
+        fee_payer: Option<AccountId>,
         tx_pre_check: impl FnOnce(&[SelectedShard]) -> Result<(), ExecutionFailureKind>,
     ) -> Result<(HashType, Vec<SharedSecretKey>), ExecutionFailureKind> {
-        let mut acc_manager = account_manager::AccountManager::new(self, accounts).await?;
+        let mut acc_manager =
+            account_manager::AccountManager::new(self, accounts, fee_payer).await?;
 
         tx_pre_check(&acc_manager.selected_shards())?;
 
@@ -776,7 +788,13 @@ impl WalletCore {
             .sequencer_client
             .dry_run_private_effects(DeferredPublicActions(actions.clone()))
             .await?;
-        let payer = match acc_manager.private_fee_payer_account_id() {
+        let quote = self.sequencer_client.get_fee_state().await?;
+        let amount = fee_core::assess::private_fee_required(
+            effect_cycles,
+            quote.base_fee_exec,
+            quote.base_fee_stor,
+        );
+        let payer = match acc_manager.private_fee_payer_account_id(amount)? {
             Some(payer) => payer,
             None => acc_manager
                 .fee_payer_account_id(self)
@@ -787,7 +805,12 @@ impl WalletCore {
                     ))
                 })?,
         };
-        let fee = private_fee_transfer(&self.sequencer_client, payer, effect_cycles).await?;
+        let fee = lee_core::FeeTransfer {
+            payer,
+            recipient: system_accounts::fee_inbox_account_id(),
+            amount,
+            height: quote.height,
+        };
         if self.dry_run {
             let guest_effects = actions
                 .iter()
@@ -901,7 +924,7 @@ impl WalletCore {
             ));
         }
 
-        let mut acc_manager = account_manager::AccountManager::new(self, accounts).await?;
+        let mut acc_manager = account_manager::AccountManager::new(self, accounts, None).await?;
 
         tx_pre_check(&acc_manager.selected_shards())?;
 
@@ -1214,26 +1237,6 @@ impl WalletCore {
 )]
 pub const fn max_fee_for(gas_limit: u64) -> u128 {
     (gas_limit as u128 + ASSUMED_DATA_BYTES) * ASSUMED_BASE_FEE
-}
-
-/// The in-proof fee `payer` pays for a privacy-preserving transaction whose public effects
-/// meter `effect_cycles`, priced at the head fee state.
-pub async fn private_fee_transfer(
-    client: &SequencerClient,
-    payer: AccountId,
-    effect_cycles: u64,
-) -> Result<lee_core::FeeTransfer, ExecutionFailureKind> {
-    let quote = client.get_fee_state().await?;
-    Ok(lee_core::FeeTransfer {
-        payer,
-        recipient: system_accounts::fee_inbox_account_id(),
-        amount: fee_core::assess::private_fee_required(
-            effect_cycles,
-            quote.base_fee_exec,
-            quote.base_fee_stor,
-        ),
-        height: quote.height,
-    })
 }
 
 fn decrypt_note_at(

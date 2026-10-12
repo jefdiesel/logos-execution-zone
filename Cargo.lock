@@ -12423,6 +12423,7 @@ dependencies = [
  "bytesize",
  "common",
  "env_logger",
+ "fee_core",
  "futures",
  "hex",
  "indexer_service",
