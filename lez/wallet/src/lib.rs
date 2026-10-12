@@ -617,7 +617,7 @@ impl WalletCore {
             .context("Failed to create indexer client")?;
         indexer_service_rpc::RpcClient::get_transactions_by_account(
             &client,
-            account_id.into(),
+            indexer_service_protocol::AccountId::from(account_id),
             offset,
             limit,
         )
