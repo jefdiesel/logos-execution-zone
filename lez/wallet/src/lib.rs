@@ -778,8 +778,17 @@ impl WalletCore {
         };
 
         // Dry run first: the fee must cover the metered cost of the public effects, and the
-        // sequencer meters them on its head state.
-        let dry_run_input = input.clone();
+        // sequencer meters them on its head state. The dry run carries no fee call, so a payer
+        // outside the root call has nothing to witness in it.
+        let mut dry_run_input = input.clone();
+        let root_accounts: HashSet<AccountId> = dry_run_input
+            .shard_selectors
+            .iter()
+            .map(|selector| selector.account_id)
+            .collect();
+        dry_run_input
+            .private_witnesses
+            .retain(|witness| root_accounts.contains(&witness.account_id()));
         let dry_run_program = program.clone();
         let actions =
             tokio::task::spawn_blocking(move || lee::dry_run(&dry_run_input, &dry_run_program))
