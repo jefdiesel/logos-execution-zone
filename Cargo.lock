@@ -13795,6 +13795,8 @@ dependencies = [
  "hkdf 0.12.4",
  "humantime",
  "humantime-serde",
+ "indexer_service_protocol",
+ "indexer_service_rpc",
  "indicatif",
  "itertools 0.14.0",
  "key_protocol",

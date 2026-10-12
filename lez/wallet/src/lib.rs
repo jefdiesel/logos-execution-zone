@@ -17,6 +17,7 @@ use anyhow::{Context as _, Result};
 use bip39::Mnemonic;
 use common::{HashType, block::Block, transaction::LeeTransaction};
 use config::WalletConfig;
+use indexer_service_rpc::IndexerClientBuilder;
 use key_protocol::key_management::key_tree::chain_index::ChainIndex;
 use lee::{
     Account, AccountId, PrivacyPreservingTransaction, ProgramId, ProvingInput,
@@ -598,6 +599,32 @@ impl WalletCore {
             views: fetched,
             effect_settled: effect_settled(&self.sequencer_client, effects).await?,
         })
+    }
+
+    pub async fn get_transactions_by_account(
+        &self,
+        account_id: AccountId,
+        offset: u64,
+        limit: u64,
+    ) -> Result<Vec<LeeTransaction>> {
+        let indexer_addr = self
+            .config
+            .indexer_addr
+            .as_ref()
+            .context("No indexer endpoint is configured")?;
+        let client = IndexerClientBuilder::default()
+            .build(indexer_addr)
+            .context("Failed to create indexer client")?;
+        indexer_service_rpc::RpcClient::get_transactions_by_account(
+            &client,
+            account_id.into(),
+            offset,
+            limit,
+        )
+        .await?
+        .into_iter()
+        .map(|transaction| LeeTransaction::try_from(transaction).map_err(Into::into))
+        .collect()
     }
 
     /// Get public account.
