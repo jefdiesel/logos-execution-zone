@@ -27,6 +27,7 @@ use core_ffi::{
     primitives::types::{
         FfiBytes32, FfiIdentifier, FfiPrivateAccountKeys, FfiPublicAccountKey, account::FfiAccount,
     },
+    sequencer::SequencerServiceFFI,
     wallet::{
         FfiAccountIdWithPrivacy, FfiAccountIdentity, FfiAccountList, FfiAccountMention,
         FfiTransferResult, WalletHandle,
@@ -37,7 +38,9 @@ use core_ffi::{
 use integration_tests::{
     BlockingTestContext, TIME_TO_WAIT_FOR_BLOCK_SECONDS,
     config::{INITIAL_PRIVATE_BALANCES_FOR_WALLET, INITIAL_PUBLIC_BALANCES_FOR_WALLET},
-    ffi_helpers::{primitives as primitives_ffi_helpers, wallet::*},
+    ffi_helpers::{
+        primitives as primitives_ffi_helpers, sequencer as sequencer_ffi_helpers, wallet::*,
+    },
 };
 use lee::{Account, AccountId, PrivateKey, PublicKey, program::Program};
 use lee_core::{
@@ -82,10 +85,10 @@ fn ffi_balance(handle: *mut WalletHandle, account_id: &FfiBytes32, is_public: bo
 fn new_wallet_ffi_with_test_context_config(
     ctx: &BlockingTestContext,
     home: &Path,
+    sequencer: *const SequencerServiceFFI,
 ) -> Result<FfiCreateWalletOutput> {
     let config_path = home.join("wallet_config.json");
     let storage_path = home.join("storage.json");
-    let metrics_path = home.join("metrics.json");
     let mut config = ctx.ctx().wallet().config().to_owned();
     if let Some(config_overrides) = ctx.ctx().wallet().config_overrides().clone() {
         config.apply_overrides(config_overrides);
@@ -102,15 +105,14 @@ fn new_wallet_ffi_with_test_context_config(
 
     let config_path = CString::new(config_path.to_str().unwrap())?;
     let storage_path = CString::new(storage_path.to_str().unwrap())?;
-    let metrics_path = CString::new(metrics_path.to_str().unwrap())?;
     let password = CString::new(ctx.ctx().wallet_password())?;
 
     let create_wallet_result = unsafe {
         wallet_ffi_create_new(
             config_path.as_ptr(),
             storage_path.as_ptr(),
-            metrics_path.as_ptr(),
             password.as_ptr(),
+            sequencer,
         )
     };
 
@@ -163,26 +165,27 @@ fn new_wallet_ffi_with_test_context_config(
     Ok(create_wallet_result)
 }
 
-fn load_existing_ffi_wallet(home: &Path) -> Result<*mut WalletHandle> {
+fn load_existing_ffi_wallet(
+    home: &Path,
+    sequencer: *const SequencerServiceFFI,
+) -> Result<*mut WalletHandle> {
     let config_path = home.join("wallet_config.json");
     let storage_path = home.join("storage.json");
-    let metrics_path = home.join("metrics.json");
     let config_path = CString::new(config_path.to_str().unwrap())?;
     let storage_path = CString::new(storage_path.to_str().unwrap())?;
-    let metrics_path = CString::new(metrics_path.to_str().unwrap())?;
 
-    Ok(unsafe {
-        wallet_ffi_open(
-            config_path.as_ptr(),
-            storage_path.as_ptr(),
-            metrics_path.as_ptr(),
-        )
-    })
+    Ok(unsafe { wallet_ffi_open(config_path.as_ptr(), storage_path.as_ptr(), sequencer) })
 }
 
 #[test]
 fn wallet_ffi_create_public_accounts() -> Result<()> {
-    let ctx = BlockingTestContext::new_default()?;
+    let sequencer_ffi_helpers::JoiningSetup {
+        ctx,
+        node: _,
+        ownership_id: _,
+        sequencer_ffi: sequencer_ffi_res,
+        sequencer_home: _,
+    } = sequencer_ffi_helpers::joining_setup()?;
     let n_accounts = 10;
 
     // Create `n_accounts` public accounts with wallet FFI
@@ -193,7 +196,11 @@ fn wallet_ffi_create_public_accounts() -> Result<()> {
         let FfiCreateWalletOutput {
             wallet: wallet_ffi_handle,
             mnemonic: _,
-        } = new_wallet_ffi_with_test_context_config(&ctx, home.path())?;
+        } = new_wallet_ffi_with_test_context_config(
+            &ctx,
+            home.path(),
+            sequencer_ffi_res.value.cast_const(),
+        )?;
         for _ in 0..n_accounts {
             let mut out_account_id = FfiBytes32::from_bytes([0; 32]);
             wallet_ffi_create_account_public(wallet_ffi_handle, &raw mut out_account_id).unwrap();
@@ -218,12 +225,23 @@ fn wallet_ffi_create_public_accounts() -> Result<()> {
         "Zero account ID returned"
     );
 
+    // SAFETY: sequencer_ffi created by FFI, it is valid.
+    unsafe {
+        sequencer_ffi_helpers::sequencer_ffi_stop_sequencer(sequencer_ffi_res.value);
+    }
+
     Ok(())
 }
 
 #[test]
 fn wallet_ffi_create_private_accounts() -> Result<()> {
-    let ctx = BlockingTestContext::new_default()?;
+    let sequencer_ffi_helpers::JoiningSetup {
+        ctx,
+        node: _,
+        ownership_id: _,
+        sequencer_ffi: sequencer_ffi_res,
+        sequencer_home: _,
+    } = sequencer_ffi_helpers::joining_setup()?;
     let n_accounts = 10;
     // Create `n_accounts` receiving keys with wallet FFI
     let new_npks_ffi = unsafe {
@@ -233,7 +251,7 @@ fn wallet_ffi_create_private_accounts() -> Result<()> {
         let FfiCreateWalletOutput {
             wallet: wallet_ffi_handle,
             mnemonic: _,
-        } = new_wallet_ffi_with_test_context_config(&ctx, home.path())?;
+        } = new_wallet_ffi_with_test_context_config(&ctx, home.path(), sequencer_ffi_res.value)?;
         for _ in 0..n_accounts {
             let mut out_keys = FfiPrivateAccountKeys::default();
             wallet_ffi_create_private_accounts_key(wallet_ffi_handle, &raw mut out_keys).unwrap();
@@ -253,19 +271,30 @@ fn wallet_ffi_create_private_accounts() -> Result<()> {
         "Zero NPK returned"
     );
 
+    // SAFETY: sequencer_ffi created by FFI, it is valid.
+    unsafe {
+        sequencer_ffi_helpers::sequencer_ffi_stop_sequencer(sequencer_ffi_res.value);
+    }
+
     Ok(())
 }
 
 #[test]
 fn wallet_ffi_save_and_load_persistent_storage() -> Result<()> {
-    let ctx = BlockingTestContext::new_default()?;
+    let sequencer_ffi_helpers::JoiningSetup {
+        ctx,
+        node: _,
+        ownership_id: _,
+        sequencer_ffi: sequencer_ffi_res,
+        sequencer_home: _,
+    } = sequencer_ffi_helpers::joining_setup()?;
     let home = tempfile::tempdir()?;
     // Create a receiving key and save
     let first_npk = unsafe {
         let FfiCreateWalletOutput {
             wallet: wallet_ffi_handle,
             mnemonic: _,
-        } = new_wallet_ffi_with_test_context_config(&ctx, home.path())?;
+        } = new_wallet_ffi_with_test_context_config(&ctx, home.path(), sequencer_ffi_res.value)?;
         let mut out_keys = FfiPrivateAccountKeys::default();
         wallet_ffi_create_private_accounts_key(wallet_ffi_handle, &raw mut out_keys).unwrap();
         let npk = out_keys.nullifier_public_key.data;
@@ -277,7 +306,7 @@ fn wallet_ffi_save_and_load_persistent_storage() -> Result<()> {
 
     // After loading, creating a new key should yield a different NPK (state was persisted)
     let second_npk = unsafe {
-        let wallet_ffi_handle = load_existing_ffi_wallet(home.path())?;
+        let wallet_ffi_handle = load_existing_ffi_wallet(home.path(), sequencer_ffi_res.value)?;
         let mut out_keys = FfiPrivateAccountKeys::default();
         wallet_ffi_create_private_accounts_key(wallet_ffi_handle, &raw mut out_keys).unwrap();
         let npk = out_keys.nullifier_public_key.data;
@@ -293,19 +322,30 @@ fn wallet_ffi_save_and_load_persistent_storage() -> Result<()> {
         "Keys should differ after state was persisted"
     );
 
+    // SAFETY: sequencer_ffi created by FFI, it is valid.
+    unsafe {
+        sequencer_ffi_helpers::sequencer_ffi_stop_sequencer(sequencer_ffi_res.value);
+    }
+
     Ok(())
 }
 
 #[test]
 fn test_wallet_ffi_list_accounts() -> Result<()> {
-    let ctx = BlockingTestContext::new_default()?;
+    let sequencer_ffi_helpers::JoiningSetup {
+        ctx,
+        node: _,
+        ownership_id: _,
+        sequencer_ffi: sequencer_ffi_res,
+        sequencer_home: _,
+    } = sequencer_ffi_helpers::joining_setup()?;
     // Create the wallet FFI and track which account IDs were created as public/private
     let (wallet_ffi_handle, created_public_ids) = unsafe {
         let home = tempfile::tempdir()?;
         let FfiCreateWalletOutput {
             wallet: handle,
             mnemonic: _,
-        } = new_wallet_ffi_with_test_context_config(&ctx, home.path())?;
+        } = new_wallet_ffi_with_test_context_config(&ctx, home.path(), sequencer_ffi_res.value)?;
         let mut public_ids: Vec<[u8; 32]> = Vec::new();
 
         // Create 5 public accounts and 5 receiving keys
@@ -362,18 +402,29 @@ fn test_wallet_ffi_list_accounts() -> Result<()> {
         wallet_ffi_destroy(wallet_ffi_handle);
     }
 
+    // SAFETY: sequencer_ffi created by FFI, it is valid.
+    unsafe {
+        sequencer_ffi_helpers::sequencer_ffi_stop_sequencer(sequencer_ffi_res.value);
+    }
+
     Ok(())
 }
 
 #[test]
 fn test_wallet_ffi_get_balance_public() -> Result<()> {
-    let ctx = BlockingTestContext::new_default()?;
+    let sequencer_ffi_helpers::JoiningSetup {
+        ctx,
+        node: _,
+        ownership_id: _,
+        sequencer_ffi: sequencer_ffi_res,
+        sequencer_home: _,
+    } = sequencer_ffi_helpers::joining_setup()?;
     let account_id: AccountId = ctx.ctx().existing_public_accounts()[0];
     let home = tempfile::tempdir()?;
     let FfiCreateWalletOutput {
         wallet: wallet_ffi_handle,
         mnemonic: _,
-    } = new_wallet_ffi_with_test_context_config(&ctx, home.path())?;
+    } = new_wallet_ffi_with_test_context_config(&ctx, home.path(), sequencer_ffi_res.value)?;
 
     let balance = unsafe {
         let mut out_balance: [u8; 16] = [0; 16];
@@ -395,18 +446,29 @@ fn test_wallet_ffi_get_balance_public() -> Result<()> {
         wallet_ffi_destroy(wallet_ffi_handle);
     }
 
+    // SAFETY: sequencer_ffi created by FFI, it is valid.
+    unsafe {
+        sequencer_ffi_helpers::sequencer_ffi_stop_sequencer(sequencer_ffi_res.value);
+    }
+
     Ok(())
 }
 
 #[test]
 fn test_wallet_ffi_get_account_public() -> Result<()> {
-    let ctx = BlockingTestContext::new_default()?;
+    let sequencer_ffi_helpers::JoiningSetup {
+        ctx,
+        node: _,
+        ownership_id: _,
+        sequencer_ffi: sequencer_ffi_res,
+        sequencer_home: _,
+    } = sequencer_ffi_helpers::joining_setup()?;
     let account_id: AccountId = ctx.ctx().existing_public_accounts()[0];
     let home = tempfile::tempdir()?;
     let FfiCreateWalletOutput {
         wallet: wallet_ffi_handle,
         mnemonic: _,
-    } = new_wallet_ffi_with_test_context_config(&ctx, home.path())?;
+    } = new_wallet_ffi_with_test_context_config(&ctx, home.path(), sequencer_ffi_res.value)?;
     let mut out_account = FfiAccount::default();
 
     let account: Account = unsafe {
@@ -505,18 +567,29 @@ fn test_wallet_ffi_get_account_public() -> Result<()> {
 
     log::info!("Successfully retrieved account with correct details");
 
+    // SAFETY: sequencer_ffi created by FFI, it is valid.
+    unsafe {
+        sequencer_ffi_helpers::sequencer_ffi_stop_sequencer(sequencer_ffi_res.value);
+    }
+
     Ok(())
 }
 
 #[test]
 fn test_wallet_ffi_get_account_private() -> Result<()> {
-    let ctx = BlockingTestContext::new_default()?;
+    let sequencer_ffi_helpers::JoiningSetup {
+        ctx,
+        node: _,
+        ownership_id: _,
+        sequencer_ffi: sequencer_ffi_res,
+        sequencer_home: _,
+    } = sequencer_ffi_helpers::joining_setup()?;
     let account_id: AccountId = ctx.ctx().existing_private_accounts()[0];
     let home = tempfile::tempdir()?;
     let FfiCreateWalletOutput {
         wallet: wallet_ffi_handle,
         mnemonic: _,
-    } = new_wallet_ffi_with_test_context_config(&ctx, home.path())?;
+    } = new_wallet_ffi_with_test_context_config(&ctx, home.path(), sequencer_ffi_res.value)?;
     let mut out_account = FfiAccount::default();
 
     let account: Account = unsafe {
@@ -544,18 +617,29 @@ fn test_wallet_ffi_get_account_private() -> Result<()> {
 
     log::info!("Successfully retrieved account with correct details");
 
+    // SAFETY: sequencer_ffi created by FFI, it is valid.
+    unsafe {
+        sequencer_ffi_helpers::sequencer_ffi_stop_sequencer(sequencer_ffi_res.value);
+    }
+
     Ok(())
 }
 
 #[test]
 fn test_wallet_ffi_get_public_account_keys() -> Result<()> {
-    let ctx = BlockingTestContext::new_default()?;
+    let sequencer_ffi_helpers::JoiningSetup {
+        ctx,
+        node: _,
+        ownership_id: _,
+        sequencer_ffi: sequencer_ffi_res,
+        sequencer_home: _,
+    } = sequencer_ffi_helpers::joining_setup()?;
     let account_id: AccountId = ctx.ctx().existing_public_accounts()[0];
     let home = tempfile::tempdir()?;
     let FfiCreateWalletOutput {
         wallet: wallet_ffi_handle,
         mnemonic: _,
-    } = new_wallet_ffi_with_test_context_config(&ctx, home.path())?;
+    } = new_wallet_ffi_with_test_context_config(&ctx, home.path(), sequencer_ffi_res.value)?;
     let mut out_key = FfiPublicAccountKey::default();
 
     let key: PublicKey = unsafe {
@@ -586,18 +670,29 @@ fn test_wallet_ffi_get_public_account_keys() -> Result<()> {
         wallet_ffi_destroy(wallet_ffi_handle);
     }
 
+    // SAFETY: sequencer_ffi created by FFI, it is valid.
+    unsafe {
+        sequencer_ffi_helpers::sequencer_ffi_stop_sequencer(sequencer_ffi_res.value);
+    }
+
     Ok(())
 }
 
 #[test]
 fn test_wallet_ffi_get_private_account_keys() -> Result<()> {
-    let ctx = BlockingTestContext::new_default()?;
+    let sequencer_ffi_helpers::JoiningSetup {
+        ctx,
+        node: _,
+        ownership_id: _,
+        sequencer_ffi: sequencer_ffi_res,
+        sequencer_home: _,
+    } = sequencer_ffi_helpers::joining_setup()?;
     let account_id: AccountId = ctx.ctx().existing_private_accounts()[0];
     let home = tempfile::tempdir()?;
     let FfiCreateWalletOutput {
         wallet: wallet_ffi_handle,
         mnemonic: _,
-    } = new_wallet_ffi_with_test_context_config(&ctx, home.path())?;
+    } = new_wallet_ffi_with_test_context_config(&ctx, home.path(), sequencer_ffi_res.value)?;
     let mut keys = FfiPrivateAccountKeys::default();
 
     unsafe {
@@ -631,6 +726,11 @@ fn test_wallet_ffi_get_private_account_keys() -> Result<()> {
     }
 
     log::info!("Successfully retrieved account keys");
+
+    // SAFETY: sequencer_ffi created by FFI, it is valid.
+    unsafe {
+        sequencer_ffi_helpers::sequencer_ffi_stop_sequencer(sequencer_ffi_res.value);
+    }
 
     Ok(())
 }
@@ -677,12 +777,18 @@ fn wallet_ffi_base58_to_account_id() -> Result<()> {
 
 #[test]
 fn wallet_ffi_public_credit_creates_only_the_native_shard() -> Result<()> {
-    let ctx = BlockingTestContext::new_default()?;
+    let sequencer_ffi_helpers::JoiningSetup {
+        ctx,
+        node: _,
+        ownership_id: _,
+        sequencer_ffi: sequencer_ffi_res,
+        sequencer_home: _,
+    } = sequencer_ffi_helpers::joining_setup()?;
     let home = tempfile::tempdir()?;
     let FfiCreateWalletOutput {
         wallet: wallet_ffi_handle,
         mnemonic: _,
-    } = new_wallet_ffi_with_test_context_config(&ctx, home.path())?;
+    } = new_wallet_ffi_with_test_context_config(&ctx, home.path(), sequencer_ffi_res.value)?;
 
     // Create a new uninitialized public account
     let mut out_account_id = FfiBytes32::from_bytes([0; 32]);
@@ -735,17 +841,28 @@ fn wallet_ffi_public_credit_creates_only_the_native_shard() -> Result<()> {
         wallet_ffi_destroy(wallet_ffi_handle);
     }
 
+    // SAFETY: sequencer_ffi created by FFI, it is valid.
+    unsafe {
+        sequencer_ffi_helpers::sequencer_ffi_stop_sequencer(sequencer_ffi_res.value);
+    }
+
     Ok(())
 }
 
 #[test]
 fn test_wallet_ffi_transfer_public() -> Result<()> {
-    let ctx = BlockingTestContext::new_default()?;
+    let sequencer_ffi_helpers::JoiningSetup {
+        ctx,
+        node: _,
+        ownership_id: _,
+        sequencer_ffi: sequencer_ffi_res,
+        sequencer_home: _,
+    } = sequencer_ffi_helpers::joining_setup()?;
     let home = tempfile::tempdir()?;
     let FfiCreateWalletOutput {
         wallet: wallet_ffi_handle,
         mnemonic: _,
-    } = new_wallet_ffi_with_test_context_config(&ctx, home.path())?;
+    } = new_wallet_ffi_with_test_context_config(&ctx, home.path(), sequencer_ffi_res.value)?;
     let from: FfiBytes32 = ctx.ctx().existing_public_accounts()[0].into();
     let to: FfiBytes32 = ctx.ctx().existing_public_accounts()[1].into();
     let amount: [u8; 16] = 100_u128.to_le_bytes();
@@ -805,17 +922,28 @@ fn test_wallet_ffi_transfer_public() -> Result<()> {
         wallet_ffi_destroy(wallet_ffi_handle);
     }
 
+    // SAFETY: sequencer_ffi created by FFI, it is valid.
+    unsafe {
+        sequencer_ffi_helpers::sequencer_ffi_stop_sequencer(sequencer_ffi_res.value);
+    }
+
     Ok(())
 }
 
 #[test]
 fn test_wallet_ffi_transfer_shielded() -> Result<()> {
-    let ctx = BlockingTestContext::new_default()?;
+    let sequencer_ffi_helpers::JoiningSetup {
+        ctx,
+        node: _,
+        ownership_id: _,
+        sequencer_ffi: sequencer_ffi_res,
+        sequencer_home: _,
+    } = sequencer_ffi_helpers::joining_setup()?;
     let home = tempfile::tempdir()?;
     let FfiCreateWalletOutput {
         wallet: wallet_ffi_handle,
         mnemonic: _,
-    } = new_wallet_ffi_with_test_context_config(&ctx, home.path())?;
+    } = new_wallet_ffi_with_test_context_config(&ctx, home.path(), sequencer_ffi_res.value)?;
     let from: FfiBytes32 = ctx.ctx().existing_public_accounts()[0].into();
     let (to, to_keys) = unsafe {
         let mut out_keys = FfiPrivateAccountKeys::default();
@@ -879,17 +1007,28 @@ fn test_wallet_ffi_transfer_shielded() -> Result<()> {
         wallet_ffi_destroy(wallet_ffi_handle);
     }
 
+    // SAFETY: sequencer_ffi created by FFI, it is valid.
+    unsafe {
+        sequencer_ffi_helpers::sequencer_ffi_stop_sequencer(sequencer_ffi_res.value);
+    }
+
     Ok(())
 }
 
 #[test]
 fn test_wallet_ffi_transfer_deshielded() -> Result<()> {
-    let ctx = BlockingTestContext::new_default()?;
+    let sequencer_ffi_helpers::JoiningSetup {
+        ctx,
+        node: _,
+        ownership_id: _,
+        sequencer_ffi: sequencer_ffi_res,
+        sequencer_home: _,
+    } = sequencer_ffi_helpers::joining_setup()?;
     let home = tempfile::tempdir()?;
     let FfiCreateWalletOutput {
         wallet: wallet_ffi_handle,
         mnemonic: _,
-    } = new_wallet_ffi_with_test_context_config(&ctx, home.path())?;
+    } = new_wallet_ffi_with_test_context_config(&ctx, home.path(), sequencer_ffi_res.value)?;
     let from: FfiBytes32 = ctx.ctx().existing_private_accounts()[0].into();
     let to: FfiBytes32 = ctx.ctx().existing_public_accounts()[0].into();
     let amount: [u8; 16] = 100_u128.to_le_bytes();
@@ -946,17 +1085,28 @@ fn test_wallet_ffi_transfer_deshielded() -> Result<()> {
         wallet_ffi_destroy(wallet_ffi_handle);
     }
 
+    // SAFETY: sequencer_ffi created by FFI, it is valid.
+    unsafe {
+        sequencer_ffi_helpers::sequencer_ffi_stop_sequencer(sequencer_ffi_res.value);
+    }
+
     Ok(())
 }
 
 #[test]
 fn test_wallet_ffi_transfer_private() -> Result<()> {
-    let ctx = BlockingTestContext::new_default()?;
+    let sequencer_ffi_helpers::JoiningSetup {
+        ctx,
+        node: _,
+        ownership_id: _,
+        sequencer_ffi: sequencer_ffi_res,
+        sequencer_home: _,
+    } = sequencer_ffi_helpers::joining_setup()?;
     let home = tempfile::tempdir()?;
     let FfiCreateWalletOutput {
         wallet: wallet_ffi_handle,
         mnemonic: _,
-    } = new_wallet_ffi_with_test_context_config(&ctx, home.path())?;
+    } = new_wallet_ffi_with_test_context_config(&ctx, home.path(), sequencer_ffi_res.value)?;
 
     let from: FfiBytes32 = ctx.ctx().existing_private_accounts()[0].into();
     let (to, to_keys) = unsafe {
@@ -1026,17 +1176,28 @@ fn test_wallet_ffi_transfer_private() -> Result<()> {
         wallet_ffi_destroy(wallet_ffi_handle);
     }
 
+    // SAFETY: sequencer_ffi created by FFI, it is valid.
+    unsafe {
+        sequencer_ffi_helpers::sequencer_ffi_stop_sequencer(sequencer_ffi_res.value);
+    }
+
     Ok(())
 }
 
 #[test]
 fn restore_keys_from_seed_ffi() -> Result<()> {
-    let ctx = BlockingTestContext::new_default()?;
+    let sequencer_ffi_helpers::JoiningSetup {
+        ctx,
+        node: _,
+        ownership_id: _,
+        sequencer_ffi: sequencer_ffi_res,
+        sequencer_home: _,
+    } = sequencer_ffi_helpers::joining_setup()?;
     let home = tempfile::tempdir()?;
     let FfiCreateWalletOutput {
         wallet: wallet_ffi_handle,
         mnemonic,
-    } = new_wallet_ffi_with_test_context_config(&ctx, home.path())?;
+    } = new_wallet_ffi_with_test_context_config(&ctx, home.path(), sequencer_ffi_res.value)?;
 
     let mnemonic = unsafe { CString::from_raw(mnemonic) };
 
@@ -1319,6 +1480,11 @@ fn restore_keys_from_seed_ffi() -> Result<()> {
 
     log::info!("Accounts restored");
 
+    // SAFETY: sequencer_ffi created by FFI, it is valid.
+    unsafe {
+        sequencer_ffi_helpers::sequencer_ffi_stop_sequencer(sequencer_ffi_res.value);
+    }
+
     Ok(())
 }
 
@@ -1394,12 +1560,18 @@ const fn mention(identity: FfiAccountIdentity, program: AccountId) -> FfiAccount
 
 #[test]
 fn test_wallet_ffi_transfer_generic_public() -> Result<()> {
-    let ctx = BlockingTestContext::new_default()?;
+    let sequencer_ffi_helpers::JoiningSetup {
+        ctx,
+        node: _,
+        ownership_id: _,
+        sequencer_ffi: sequencer_ffi_res,
+        sequencer_home: _,
+    } = sequencer_ffi_helpers::joining_setup()?;
     let home = tempfile::tempdir()?;
     let FfiCreateWalletOutput {
         wallet: wallet_ffi_handle,
         mnemonic: _,
-    } = new_wallet_ffi_with_test_context_config(&ctx, home.path())?;
+    } = new_wallet_ffi_with_test_context_config(&ctx, home.path(), sequencer_ffi_res.value)?;
     let from: FfiBytes32 = ctx.ctx().existing_public_accounts()[0].into();
     let to: FfiBytes32 = ctx.ctx().existing_public_accounts()[1].into();
     let amount = 100_u128;
@@ -1508,17 +1680,28 @@ fn test_wallet_ffi_transfer_generic_public() -> Result<()> {
         wallet_ffi_destroy(wallet_ffi_handle);
     }
 
+    // SAFETY: sequencer_ffi created by FFI, it is valid.
+    unsafe {
+        sequencer_ffi_helpers::sequencer_ffi_stop_sequencer(sequencer_ffi_res.value);
+    }
+
     Ok(())
 }
 
 #[test]
 fn test_wallet_ffi_transfer_generic_private() -> Result<()> {
-    let ctx = BlockingTestContext::new_default()?;
+    let sequencer_ffi_helpers::JoiningSetup {
+        ctx,
+        node: _,
+        ownership_id: _,
+        sequencer_ffi: sequencer_ffi_res,
+        sequencer_home: _,
+    } = sequencer_ffi_helpers::joining_setup()?;
     let home = tempfile::tempdir()?;
     let FfiCreateWalletOutput {
         wallet: wallet_ffi_handle,
         mnemonic: _,
-    } = new_wallet_ffi_with_test_context_config(&ctx, home.path())?;
+    } = new_wallet_ffi_with_test_context_config(&ctx, home.path(), sequencer_ffi_res.value)?;
     let from = ctx.ctx().existing_private_accounts()[0].into();
     let to: FfiBytes32 = ctx.ctx().existing_private_accounts()[1].into();
     let native_token_program = NATIVE_TOKEN_PROGRAM_ID;
@@ -1630,17 +1813,28 @@ fn test_wallet_ffi_transfer_generic_private() -> Result<()> {
         wallet_ffi_destroy(wallet_ffi_handle);
     }
 
+    // SAFETY: sequencer_ffi created by FFI, it is valid.
+    unsafe {
+        sequencer_ffi_helpers::sequencer_ffi_stop_sequencer(sequencer_ffi_res.value);
+    }
+
     Ok(())
 }
 
 #[test]
 fn test_wallet_ffi_single_label() -> Result<()> {
-    let ctx = BlockingTestContext::new_default()?;
+    let sequencer_ffi_helpers::JoiningSetup {
+        ctx,
+        node: _,
+        ownership_id: _,
+        sequencer_ffi: sequencer_ffi_res,
+        sequencer_home: _,
+    } = sequencer_ffi_helpers::joining_setup()?;
     let home = tempfile::tempdir()?;
     let FfiCreateWalletOutput {
         wallet: wallet_ffi_handle,
         mnemonic: _,
-    } = new_wallet_ffi_with_test_context_config(&ctx, home.path())?;
+    } = new_wallet_ffi_with_test_context_config(&ctx, home.path(), sequencer_ffi_res.value)?;
 
     let mut out_account_id_1 = FfiBytes32::from_bytes([0; 32]);
     unsafe {
@@ -1679,17 +1873,28 @@ fn test_wallet_ffi_single_label() -> Result<()> {
         wallet_ffi_destroy(wallet_ffi_handle);
     }
 
+    // SAFETY: sequencer_ffi created by FFI, it is valid.
+    unsafe {
+        sequencer_ffi_helpers::sequencer_ffi_stop_sequencer(sequencer_ffi_res.value);
+    }
+
     Ok(())
 }
 
 #[test]
 fn test_wallet_ffi_more_labels() -> Result<()> {
-    let ctx = BlockingTestContext::new_default()?;
+    let sequencer_ffi_helpers::JoiningSetup {
+        ctx,
+        node: _,
+        ownership_id: _,
+        sequencer_ffi: sequencer_ffi_res,
+        sequencer_home: _,
+    } = sequencer_ffi_helpers::joining_setup()?;
     let home = tempfile::tempdir()?;
     let FfiCreateWalletOutput {
         wallet: wallet_ffi_handle,
         mnemonic: _,
-    } = new_wallet_ffi_with_test_context_config(&ctx, home.path())?;
+    } = new_wallet_ffi_with_test_context_config(&ctx, home.path(), sequencer_ffi_res.value)?;
 
     let mut out_account_id_1 = FfiBytes32::from_bytes([0; 32]);
     unsafe {
@@ -1753,6 +1958,11 @@ fn test_wallet_ffi_more_labels() -> Result<()> {
         primitives_ffi_helpers::primitives_ffi_free_cstring(lab_2);
         primitives_ffi_helpers::primitives_ffi_free_cstring(lab_3);
         wallet_ffi_destroy(wallet_ffi_handle);
+    }
+
+    // SAFETY: sequencer_ffi created by FFI, it is valid.
+    unsafe {
+        sequencer_ffi_helpers::sequencer_ffi_stop_sequencer(sequencer_ffi_res.value);
     }
 
     Ok(())

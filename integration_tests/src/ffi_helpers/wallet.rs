@@ -5,6 +5,7 @@ use core_ffi::{
     primitives::types::{
         FfiBytes32, FfiIdentifier, FfiPrivateAccountKeys, FfiPublicAccountKey, account::FfiAccount,
     },
+    sequencer::SequencerServiceFFI,
     wallet::{
         FfiAccountIdWithPrivacy, FfiAccountIdentity, FfiAccountList, FfiAccountMention,
         FfiTransferResult, WalletHandle,
@@ -18,14 +19,14 @@ unsafe extern "C" {
     pub fn wallet_ffi_create_new(
         config_path: *const c_char,
         storage_path: *const c_char,
-        metrics_path: *const c_char,
         password: *const c_char,
+        sequencer: *const SequencerServiceFFI,
     ) -> FfiCreateWalletOutput;
 
     pub fn wallet_ffi_open(
         config_path: *const c_char,
         storage_path: *const c_char,
-        metrics_path: *const c_char,
+        sequencer: *const SequencerServiceFFI,
     ) -> *mut WalletHandle;
 
     pub fn wallet_ffi_destroy(handle: *mut WalletHandle);

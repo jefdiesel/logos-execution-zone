@@ -1939,17 +1939,20 @@ enum FfiOperationError wallet_ffi_free_label_list(struct LabelList *label_list);
  * - `config_path`: Path to the wallet configuration file (JSON)
  * - `storage_path`: Path where wallet data will be stored
  * - `password`: Password for encrypting the wallet seed
+ * - `sequencer`: Valid pointer into `SequencerServiceFFI`
  *
  * # Returns
  * - Result, which contains opaque wallet handle and mnemonic words on success
  * - Result with null pointers on error (call `wallet_ffi_get_last_error()` for details)
  *
  * # Safety
- * All string parameters must be valid null-terminated UTF-8 strings.
+ * All string parameters must be valid null-terminated UTF-8 strings. Sequencer pointer must be
+ * valid.
  */
 struct FfiCreateWalletOutput wallet_ffi_create_new(const char *config_path,
                                                    const char *storage_path,
-                                                   const char *password);
+                                                   const char *password,
+                                                   const struct SequencerServiceFFI *sequencer);
 
 /**
  * Open an existing wallet from storage.
@@ -1959,15 +1962,19 @@ struct FfiCreateWalletOutput wallet_ffi_create_new(const char *config_path,
  * # Parameters
  * - `config_path`: Path to the wallet configuration file (JSON)
  * - `storage_path`: Path to the wallet storage (JSON)
+ * - `sequencer`: Valid pointer into `SequencerServiceFFI`
  *
  * # Returns
  * - Opaque wallet handle on success
  * - Null pointer on error (call `wallet_ffi_get_last_error()` for details)
  *
  * # Safety
- * All string parameters must be valid null-terminated UTF-8 strings.
+ * All string parameters must be valid null-terminated UTF-8 strings. Sequencer pointer must be
+ * valid.
  */
-struct WalletHandle *wallet_ffi_open(const char *config_path, const char *storage_path);
+struct WalletHandle *wallet_ffi_open(const char *config_path,
+                                     const char *storage_path,
+                                     const struct SequencerServiceFFI *sequencer);
 
 /**
  * Destroy a wallet handle and free its resources.

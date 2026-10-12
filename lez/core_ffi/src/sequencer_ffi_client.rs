@@ -18,6 +18,12 @@ use crate::{
 #[derive(Clone)]
 pub struct SequencerServiceFFIWrapper(Arc<*const SequencerServiceFFI>);
 
+impl SequencerServiceFFIWrapper {
+    pub fn wrap(sequencer: *const SequencerServiceFFI) -> Self {
+        Self(Arc::new(sequencer))
+    }
+}
+
 impl WalletSequencerClient for SequencerServiceFFIWrapper {
     fn from_config(_config: &wallet::config::WalletConfig) -> Result<Self> {
         anyhow::bail!("Not intended way");
