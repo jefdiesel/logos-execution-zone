@@ -273,6 +273,29 @@ mod tests {
                 },
                 ..register_operation([8; 32], program_account, participant)
             });
+        storage
+            .referral_mut()
+            .record_operation(referral::PendingOperation {
+                operation: referral::OperationKind::CollectCredits {
+                    participant,
+                    notes: vec![lee::AccountId::new([6; 32])],
+                    epoch: 4,
+                    active_digest: [5; 32],
+                },
+                ..register_operation([9; 32], program_account, participant)
+            });
+        storage
+            .referral_mut()
+            .publications
+            .push(referral::Publication {
+                program_account,
+                epoch: 4,
+                active: BTreeSet::from([referral_core::NodeId::new([7; 32])]),
+            });
+        storage
+            .referral_mut()
+            .history_offsets
+            .insert(program_account, 11);
 
         let temp_dir = tempfile::tempdir().unwrap();
         let storage_path = temp_dir.path().join("storage.json");
