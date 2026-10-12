@@ -311,24 +311,16 @@ mod tests {
         program_account: lee::AccountId,
         participant: lee::AccountId,
     ) -> referral::PendingOperation {
-        let key = lee::PrivateKey::new_os_random();
-        let message = lee::public_transaction::Message::try_new(
-            program_account,
-            vec![lee::ProgramShardSelector::native_balance(
-                lee::AccountId::new([4; 32]),
-            )],
-            vec![lee_core::account::Nonce::default()],
-            referral_core::Instruction::Publish {
-                epoch: 0,
-                active: BTreeSet::new(),
-            },
-        )
-        .unwrap();
-        let witness_set = lee::public_transaction::WitnessSet::for_message(&message, &[&key]);
-        let transaction = common::transaction::LeeTransaction::Public(lee::PublicTransaction::new(
-            message,
-            witness_set,
-        ));
+        let message = lee::privacy_preserving_transaction::message::Message {
+            nonces: vec![lee_core::account::Nonce::default()],
+            ..lee::privacy_preserving_transaction::message::Message::default()
+        };
+        let witness_set = lee::privacy_preserving_transaction::witness_set::WitnessSet::for_message(
+            &message,
+            lee::privacy_preserving_transaction::circuit::Proof::from_inner(vec![1, 2, 3]),
+            &[],
+        );
+        let transaction = lee::PrivacyPreservingTransaction::new(message, witness_set);
 
         referral::PendingOperation {
             reference,
