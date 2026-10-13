@@ -186,7 +186,7 @@ pub async fn indexer_client(addr: SocketAddr) -> Result<IndexerClient> {
 /// Bedrock numbers slots from the genesis time, and the indexer reads the
 /// channel slot range from genesis on, so a stale genesis time leaves it
 /// walking empty slots long after the test deadline.
-fn fresh_deployment_settings(template: &Path) -> Result<PathBuf> {
+pub fn fresh_deployment_settings(template: &Path) -> Result<PathBuf> {
     use logos_blockchain_binary_codec::canonical::{BinaryDecodeExt as _, BinaryEncode as _};
     use logos_blockchain_core::{
         block::genesis::GenesisBlock,

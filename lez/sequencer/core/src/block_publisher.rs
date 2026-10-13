@@ -183,8 +183,6 @@ impl BlockPublisherTrait for ZoneSdkPublisher {
 
         let zone_sdk_config = ZoneSdkSequencerConfig {
             resubmit_interval,
-            // Zero disables the pending-tx expiry, recovering the pre-expiry sdk behavior.
-            stale_refund_slots: 0,
             ..ZoneSdkSequencerConfig::new(FundingConfig {
                 funding_pk: config.funding_key,
                 // Withdraw change goes back to the funding key.
