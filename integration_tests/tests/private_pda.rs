@@ -375,8 +375,9 @@ async fn private_pda_family_members_receive_and_spend() -> Result<()> {
     let amount_spend_0: u128 = 13;
     let amount_spend_1: u128 = 37;
 
-    // The PDAs cannot pay the fee themselves; a funded private account of the same wallet does.
-    let fee_payer = ctx.existing_private_accounts()[0];
+    // The PDAs cannot pay the fee themselves; funded private accounts of the same wallet do. One
+    // per spend: the spends are built back-to-back, and a payer's note is spent by the first.
+    let fee_payers = ctx.existing_private_accounts();
 
     log::info!("Alice spending from alice_pda_0");
     spend_private_pda(
@@ -387,7 +388,7 @@ async fn private_pda_family_members_receive_and_spend() -> Result<()> {
         seed,
         amount_spend_0,
         &spend_program,
-        fee_payer,
+        fee_payers[0],
     )
     .await?;
 
@@ -400,7 +401,7 @@ async fn private_pda_family_members_receive_and_spend() -> Result<()> {
         seed,
         amount_spend_1,
         &spend_program,
-        fee_payer,
+        fee_payers[1],
     )
     .await?;
 
