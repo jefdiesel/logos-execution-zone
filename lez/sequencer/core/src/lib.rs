@@ -296,7 +296,11 @@ impl<S: StorageActorTrait, B: BedrockActorTrait> SequencerCore<S, B> {
 
         storage_ref
             // No need for events on first block
-            .ask(AtomicUpdate::from_block(block, Arc::new(state), genesis_events))
+            .ask(AtomicUpdate::from_block(
+                block,
+                Arc::new(state),
+                genesis_events,
+            ))
             .await
             .expect("Failed to seed the database with the genesis block");
 
@@ -717,11 +721,8 @@ impl<S: StorageActorTrait, B: BedrockActorTrait> SequencerCore<S, B> {
         on_lineage: bool,
         slot: Slot,
     ) -> Result<()> {
-        let head_before: HashSet<HashType> = chain
-            .head_blocks()
-            .iter()
-            .map(|block| block.header.hash)
-            .collect();
+        let head_before: HashSet<HashType> =
+            chain.head_blocks().map(|block| block.header.hash).collect();
         let was_empty = chain.final_tip().is_none();
         let outcome = if on_lineage {
             chain.apply_reconstructed(msg, entry_block.as_ref())
@@ -869,7 +870,7 @@ impl<S: StorageActorTrait, B: BedrockActorTrait> SequencerCore<S, B> {
         let (resubmit_txs, outcome, head_height) = {
             let mut chain = self.chain.lock().await;
 
-            let head_before: Vec<Block> = chain.head_blocks().to_vec();
+            let head_before: Vec<Block> = chain.head_blocks().cloned().collect();
             let head_tip_before = chain.head_tip().map(|tip| tip.block_id);
             let pin_before = chain.pin();
             log_update(view, finalized, head_tip_before);
@@ -935,7 +936,6 @@ impl<S: StorageActorTrait, B: BedrockActorTrait> SequencerCore<S, B> {
             // or that finalized, keeps its transactions.
             let kept: HashSet<HashType> = chain
                 .head_blocks()
-                .iter()
                 .chain(newly_final.iter())
                 .map(|block| block.header.hash)
                 .collect();
@@ -1115,6 +1115,12 @@ impl<S: StorageActorTrait, B: BedrockActorTrait> SequencerCore<S, B> {
             })
             .await;
 
+        if publish_res.is_err() {
+            // Nothing was inscribed, so the block's transactions go back in front.
+            for (origin, tx) in mempool_transactions.into_iter().rev() {
+                self.mempool.push_front((origin, tx));
+            }
+        }
         let outcome = match publish_res {
             Ok(outcome) => outcome,
             Err(kameo::error::SendError::HandlerError(
@@ -1122,12 +1128,7 @@ impl<S: StorageActorTrait, B: BedrockActorTrait> SequencerCore<S, B> {
                     provided: expected,
                     current,
                 },
-            )) => {
-                for (origin, tx) in mempool_transactions.into_iter().rev() {
-                    self.mempool.push_front((origin, tx));
-                }
-                return Err(ChannelMovedWhileBuilding { expected, current }.into());
-            }
+            )) => return Err(ChannelMovedWhileBuilding { expected, current }.into()),
             Err(err) => return Err(err).context("Failed to publish block to Bedrock"),
         };
 
@@ -1563,6 +1564,13 @@ impl<S: StorageActorTrait, B: BedrockActorTrait> SequencerCore<S, B> {
             parent,
         ) = {
             let chain = self.chain.lock().await;
+            if let Some(entry) = chain.check_for_gaps_in_lineage() {
+                error!(
+                    "Channel view entry {} chains on {}, which the view does not hold before it; skipping the turn",
+                    entry.msg, entry.parent
+                );
+                return Err(anyhow!("Channel view has a gap before entry {}", entry.msg));
+            }
             let tip = chain.head_tip();
             let parent = chain.pin();
             let height = tip.as_ref().map_or(GENESIS_BLOCK_ID, |head| {
@@ -2308,7 +2316,6 @@ fn set_keys(tx: &AccreditedKeysSender, keys: AccreditedKeys) {
 fn new_head_blocks(chain: &ChainState, held_before: &HashSet<HashType>) -> Vec<Block> {
     chain
         .head_blocks()
-        .iter()
         .filter(|block| !held_before.contains(&block.header.hash))
         .cloned()
         .collect()
