@@ -5,6 +5,7 @@ use std::{
 };
 
 use anyhow::anyhow;
+use chain_state::zone_indexer::ZoneIndexer;
 use common::{block::Block, transaction::LeeTransaction};
 use cross_zone::{build_dispatch_from_emission, extract_emission};
 use cross_zone_inbox_core::{
@@ -14,9 +15,7 @@ use futures::{Stream, StreamExt as _};
 use lee::{GENESIS_BLOCK_ID, PublicKey};
 use log::{debug, error, info, warn};
 use logos_blockchain_core::mantle::ops::channel::ChannelId;
-use logos_blockchain_zone_sdk::{
-    CommonHttpClient, Slot, ZoneMessage, adapter::NodeHttpClient, indexer::ZoneIndexer,
-};
+use logos_blockchain_zone_sdk::{CommonHttpClient, Slot, ZoneMessage, adapter::NodeHttpClient};
 use tokio::sync::RwLock;
 
 use crate::config::IndexerConfig;

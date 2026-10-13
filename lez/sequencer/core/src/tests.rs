@@ -86,7 +86,7 @@ fn setup_sequencer_config() -> SequencerConfig {
             node_url: "http://not-used-in-unit-tests".parse().unwrap(),
             auth: None,
             funding_key: ZkPublicKey::zero(),
-            priority_fee: config::default_priority_fee(),
+            priority_fee_percent: config::default_priority_fee_percent(),
         },
         retry_pending_blocks_timeout: Duration::from_mins(4),
         genesis: vec![],

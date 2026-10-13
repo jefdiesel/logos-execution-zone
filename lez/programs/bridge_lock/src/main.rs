@@ -122,8 +122,10 @@ fn decode_mint(payload: &[u8]) -> WrappedInstruction {
         "payload must be u32-aligned instruction words"
     );
     let words: Vec<u32> = payload
-        .chunks_exact(4)
-        .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap_or_else(|_| unreachable!())))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|chunk| u32::from_le_bytes(*chunk))
         .collect();
     risc0_zkvm::serde::from_slice(&words).expect("payload decodes to a wrapped-token instruction")
 }

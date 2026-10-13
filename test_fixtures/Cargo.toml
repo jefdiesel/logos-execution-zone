@@ -36,6 +36,9 @@ testcontainers = { version = "0.27.3", features = ["docker-compose"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 tokio-util.workspace = true
 url.workspace = true
+serde_yaml.workspace = true
 time.workspace = true
 
+logos-blockchain-binary-codec.workspace = true
+logos-blockchain-core.workspace = true
 logos-blockchain-key-management-system-service.workspace = true

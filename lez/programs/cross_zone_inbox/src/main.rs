@@ -121,8 +121,10 @@ fn dispatch(
         );
         let instruction_data = msg
             .payload
-            .chunks_exact(4)
-            .map(|c| u32::from_le_bytes(c.try_into().unwrap_or_else(|_| unreachable!())))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| u32::from_le_bytes(*c))
             .collect();
 
         let call = ChainedCall {

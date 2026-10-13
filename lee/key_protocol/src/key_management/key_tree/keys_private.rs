@@ -216,12 +216,18 @@ mod tests {
             180, 29, 153, 83, 39, 69, 232, 96, 238, 137, 104, 150, 2, 202, 239, 149, 248, 154, 115,
             115, 127, 3, 8, 32, 61, 96, 66, 25, 181, 14, 72, 73, 97, 186, 134, 140, 33, 69, 33, 74,
         ];
-        assert!(expected_ssk == keys.value.0.secret_spending_key);
-        assert!(expected_ccc == keys.ccc);
-        assert!(expected_nsk == keys.value.0.private_key_holder.nullifier_secret_key);
-        assert!(expected_npk == keys.value.0.nullifier_public_key);
-        assert!(expected_vsk == keys.value.0.private_key_holder.viewing_secret_key);
-        assert!(expected_vpk == keys.value.0.viewing_public_key.to_bytes());
+        assert_eq!(expected_ssk, keys.value.0.secret_spending_key);
+        assert_eq!(expected_ccc, keys.ccc);
+        assert_eq!(
+            expected_nsk,
+            keys.value.0.private_key_holder.nullifier_secret_key
+        );
+        assert_eq!(expected_npk, keys.value.0.nullifier_public_key);
+        assert_eq!(
+            expected_vsk,
+            keys.value.0.private_key_holder.viewing_secret_key
+        );
+        assert_eq!(expected_vpk, keys.value.0.viewing_public_key.to_bytes());
     }
 
     #[test]
@@ -326,11 +332,20 @@ mod tests {
             190, 166, 177, 157, 137, 60, 208, 155, 234, 158, 252, 30,
         ];
 
-        assert!(expected_ssk == child_node.value.0.secret_spending_key);
-        assert!(expected_ccc == child_node.ccc);
-        assert!(expected_nsk == child_node.value.0.private_key_holder.nullifier_secret_key);
-        assert!(expected_npk == child_node.value.0.nullifier_public_key);
-        assert!(expected_vsk == child_node.value.0.private_key_holder.viewing_secret_key);
-        assert!(expected_vpk == child_node.value.0.viewing_public_key.to_bytes());
+        assert_eq!(expected_ssk, child_node.value.0.secret_spending_key);
+        assert_eq!(expected_ccc, child_node.ccc);
+        assert_eq!(
+            expected_nsk,
+            child_node.value.0.private_key_holder.nullifier_secret_key
+        );
+        assert_eq!(expected_npk, child_node.value.0.nullifier_public_key);
+        assert_eq!(
+            expected_vsk,
+            child_node.value.0.private_key_holder.viewing_secret_key
+        );
+        assert_eq!(
+            expected_vpk,
+            child_node.value.0.viewing_public_key.to_bytes()
+        );
     }
 }

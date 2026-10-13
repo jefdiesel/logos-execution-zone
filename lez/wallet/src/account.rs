@@ -133,11 +133,8 @@ impl From<HumanReadableAccount> for lee::Account {
         program_owner_bytes.copy_from_slice(&decoded_program_owner);
 
         let mut program_owner = [0_u32; 8];
-        for (index, chunk) in program_owner_bytes.chunks_exact(4).enumerate() {
-            let chunk: [u8; 4] = chunk
-                .try_into()
-                .expect("chunk length is guaranteed to be 4");
-            program_owner[index] = u32::from_le_bytes(chunk);
+        for (index, chunk) in program_owner_bytes.as_chunks::<4>().0.iter().enumerate() {
+            program_owner[index] = u32::from_le_bytes(*chunk);
         }
 
         let data = hex::decode(&account.data).expect("Invalid hex in HumanReadableAccount.data");

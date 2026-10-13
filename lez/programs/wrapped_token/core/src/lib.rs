@@ -63,7 +63,7 @@ pub fn holding_seed(recipient: &[u8; 32]) -> PdaSeed {
 #[must_use]
 pub fn minter_bytes(minter: ProgramId) -> [u8; 32] {
     let mut bytes = [0_u8; 32];
-    for (word, chunk) in minter.iter().zip(bytes.chunks_exact_mut(4)) {
+    for (word, chunk) in minter.iter().zip(bytes.as_chunks_mut::<4>().0) {
         chunk.copy_from_slice(&word.to_le_bytes());
     }
     bytes
@@ -76,8 +76,8 @@ pub fn read_minter(data: &[u8]) -> Option<ProgramId> {
         return None;
     }
     let mut minter = [0_u32; 8];
-    for (word, chunk) in minter.iter_mut().zip(data[..32].chunks_exact(4)) {
-        *word = u32::from_le_bytes(chunk.try_into().unwrap_or_else(|_| unreachable!()));
+    for (word, chunk) in minter.iter_mut().zip(data[..32].as_chunks::<4>().0) {
+        *word = u32::from_le_bytes(*chunk);
     }
     Some(minter)
 }

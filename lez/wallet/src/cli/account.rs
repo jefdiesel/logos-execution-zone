@@ -226,8 +226,8 @@ impl NewSubcommand {
                 anyhow::bail!("Program ID must be exactly 32 bytes");
             }
             let mut pid: lee_core::program::ProgramId = [0; 8];
-            for (i, chunk) in pid_bytes.chunks_exact(4).enumerate() {
-                pid[i] = u32::from_le_bytes(chunk.try_into().unwrap());
+            for (i, chunk) in pid_bytes.as_chunks::<4>().0.iter().enumerate() {
+                pid[i] = u32::from_le_bytes(*chunk);
             }
 
             wallet_core

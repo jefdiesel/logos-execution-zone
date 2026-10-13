@@ -2,15 +2,14 @@ use std::{path::Path, sync::Arc};
 
 use anyhow::Result;
 use arc_swap::ArcSwap;
+// TODO: Remove after testnet
+use chain_state::zone_indexer::ZoneIndexer;
 pub use chain_state::{AcceptOutcome, BlockIngestError, StallReason};
 use chain_state::{Anchor, ChainConsistency};
 use common::block::Block;
-// TODO: Remove after testnet
 use futures::StreamExt as _;
 use log::{error, info, warn};
-use logos_blockchain_zone_sdk::{
-    CommonHttpClient, Slot, ZoneMessage, adapter::NodeHttpClient, indexer::ZoneIndexer,
-};
+use logos_blockchain_zone_sdk::{CommonHttpClient, Slot, ZoneMessage, adapter::NodeHttpClient};
 use retry::ApplyRetryGate;
 
 use crate::{

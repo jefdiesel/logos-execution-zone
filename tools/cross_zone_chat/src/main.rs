@@ -461,12 +461,13 @@ fn decode_send_ordinal(instruction_data: &[u32]) -> Option<u32> {
 
 /// Decodes a `ping_receiver::Record` payload (risc0 words in LE bytes) to text.
 fn decode_payload(payload: &[u8]) -> Option<String> {
-    let chunks = payload.chunks_exact(4);
-    if !chunks.remainder().is_empty() {
+    let (chunks, remainder) = payload.as_chunks::<4>();
+    if !remainder.is_empty() {
         return None;
     }
     let words: Vec<u32> = chunks
-        .map(|chunk| u32::from_le_bytes(chunk.try_into().expect("chunks_exact(4) yields 4 bytes")))
+        .iter()
+        .map(|chunk| u32::from_le_bytes(*chunk))
         .collect();
     let instruction: ReceiverInstruction =
         risc0_zkvm::serde::from_slice::<ReceiverInstruction, u32>(&words).ok()?;

@@ -72,7 +72,7 @@ async fn multi_sequencer_committee_converges() -> Result<()> {
             node_url: config::addr_to_url(config::UrlProtocol::Http, bedrock_addr)?,
             funding_key: config::bedrock_funding_key(),
             auth: None,
-            priority_fee: sequencer_core::config::default_priority_fee(),
+            priority_fee_percent: sequencer_core::config::default_priority_fee_percent(),
         },
         &Ed25519Key::from_bytes(&key_a),
         vec![pub_a, pub_b],

@@ -78,8 +78,8 @@ pub struct BedrockConfig {
     /// Bedrock auth.
     pub auth: Option<BasicAuth>,
     pub funding_key: ZkPublicKey,
-    #[serde(default = "default_priority_fee")]
-    pub priority_fee: u64,
+    #[serde(default = "default_priority_fee_percent")]
+    pub priority_fee_percent: u64,
 }
 
 impl SequencerConfig {
@@ -105,6 +105,6 @@ const fn default_metrics_address() -> Option<SocketAddr> {
 }
 
 #[must_use]
-pub const fn default_priority_fee() -> u64 {
-    logos_blockchain_zone_sdk::sequencer::FundingConfig::DEFAULT_PRIORITY_FEE
+pub const fn default_priority_fee_percent() -> u64 {
+    logos_blockchain_zone_sdk::sequencer::FundingConfig::DEFAULT_PRIORITY_FEE_PERCENT
 }

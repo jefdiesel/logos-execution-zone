@@ -182,14 +182,14 @@ schemars = "1.2"
 async-stream = "0.3.6"
 strum = { version = "0.28.0", features = ["derive"] }
 
-logos-blockchain-common-http-client = { git = "https://github.com/logos-blockchain/logos-blockchain.git", rev = "e2a1c3b7ef2191c224f998b94332c5926c789f9d" }
-logos-blockchain-key-management-system-service = { git = "https://github.com/logos-blockchain/logos-blockchain.git", rev = "e2a1c3b7ef2191c224f998b94332c5926c789f9d" }
-logos-blockchain-codec = { git = "https://github.com/logos-blockchain/logos-blockchain.git", rev = "e2a1c3b7ef2191c224f998b94332c5926c789f9d" }
-logos-blockchain-core = { git = "https://github.com/logos-blockchain/logos-blockchain.git", rev = "e2a1c3b7ef2191c224f998b94332c5926c789f9d" }
-logos-blockchain-chain-broadcast-service = { git = "https://github.com/logos-blockchain/logos-blockchain.git", rev = "e2a1c3b7ef2191c224f998b94332c5926c789f9d" }
-logos-blockchain-chain-service = { git = "https://github.com/logos-blockchain/logos-blockchain.git", rev = "e2a1c3b7ef2191c224f998b94332c5926c789f9d" }
-logos-blockchain-zone-sdk = { git = "https://github.com/logos-blockchain/logos-blockchain.git", rev = "e2a1c3b7ef2191c224f998b94332c5926c789f9d" }
-logos-blockchain-http-api-common = { git = "https://github.com/logos-blockchain/logos-blockchain.git", rev = "e2a1c3b7ef2191c224f998b94332c5926c789f9d" }
+logos-blockchain-common-http-client = { git = "https://github.com/logos-blockchain/logos-blockchain.git", tag = "0.3.1" }
+logos-blockchain-key-management-system-service = { git = "https://github.com/logos-blockchain/logos-blockchain.git", tag = "0.3.1" }
+logos-blockchain-binary-codec = { git = "https://github.com/logos-blockchain/logos-blockchain.git", tag = "0.3.1" }
+logos-blockchain-core = { git = "https://github.com/logos-blockchain/logos-blockchain.git", tag = "0.3.1" }
+logos-blockchain-chain-broadcast-service = { git = "https://github.com/logos-blockchain/logos-blockchain.git", tag = "0.3.1" }
+logos-blockchain-chain-service = { git = "https://github.com/logos-blockchain/logos-blockchain.git", tag = "0.3.1" }
+logos-blockchain-zone-sdk = { git = "https://github.com/logos-blockchain/logos-blockchain.git", tag = "0.3.1" }
+logos-blockchain-http-api-common = { git = "https://github.com/logos-blockchain/logos-blockchain.git", tag = "0.3.1" }
 
 keycard-rs = { git = "https://github.com/keycard-tech/keycard-rs", rev = "9535a657ba04b1e6916de51777e22b4837c1a84d" }
 
@@ -343,6 +343,14 @@ clippy.let-underscore-untyped = "allow"
 # Reason: this lint is actually bad as it forces to use wildcard `..` instead of
 # field-by-field `_` which may lead to subtle bugs when new fields are added to the struct.
 clippy.unneeded-field-pattern = "allow"
+# Reason: this lint makes no sense for us.
+clippy.error_impl_error = "allow"
+# Reason: inline `mod tests` is our convention.
+clippy.inline-modules = "allow"
+# Reason: we write short bounds inline.
+clippy.inline-trait-bounds = "allow"
+# Reason: trait impls are async by trait signature.
+clippy.unused-async-trait-impl = "allow"
 
 # Nursery
 clippy.nursery = { level = "deny", priority = -1 }

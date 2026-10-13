@@ -180,15 +180,78 @@ pub async fn indexer_client(addr: SocketAddr) -> Result<IndexerClient> {
         .context("Failed to build indexer client")
 }
 
+/// Writes a copy of the deployment settings at `template` whose chain starts
+/// now, and returns its path.
+///
+/// Bedrock numbers slots from the genesis time, and the indexer reads the
+/// channel slot range from genesis on, so a stale genesis time leaves it
+/// walking empty slots long after the test deadline.
+fn fresh_deployment_settings(template: &Path) -> Result<PathBuf> {
+    use logos_blockchain_binary_codec::canonical::{BinaryDecodeExt as _, BinaryEncode as _};
+    use logos_blockchain_core::{
+        block::genesis::GenesisBlock,
+        mantle::transactions::{CryptarchiaParameter, GenesisTime, GenesisTx},
+    };
+
+    let template = std::fs::read_to_string(template)
+        .with_context(|| format!("Failed to read {}", template.display()))?;
+    let mut settings: serde_yaml::Value =
+        serde_yaml::from_str(&template).context("Failed to parse deployment settings")?;
+
+    let mut tx = settings["genesis_block"]["transactions"][0].clone();
+    let inscription = tx["mantle_tx"]["ops"]
+        .as_sequence_mut()
+        .context("Genesis tx has no ops")?
+        .iter_mut()
+        .map(|op| &mut op["payload"]["inscription"])
+        .find(|inscription| inscription.is_string())
+        .context("Genesis tx has no inscription op")?;
+    let bytes = hex::decode(inscription.as_str().unwrap_or_default())
+        .context("Genesis inscription is not hex")?;
+    let mut parameter = CryptarchiaParameter::decode_all(&bytes)
+        .map_err(|err| anyhow::anyhow!("Invalid genesis cryptarchia parameter: {err:?}"))?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .context("System clock is before the Unix epoch")?
+        .as_secs();
+    parameter.genesis_time = GenesisTime::new(u32::try_from(now).context("Time overflows u32")?);
+    *inscription = serde_yaml::Value::String(hex::encode(parameter.encode_to_vec()));
+
+    // Rebuilding the block recomputes the body root the new inscription changes.
+    let tx: GenesisTx = serde_yaml::from_value(tx).context("Invalid genesis tx")?;
+    settings["genesis_block"] =
+        serde_yaml::to_value(GenesisBlock::genesis(tx)).context("Failed to encode genesis")?;
+
+    // Kept on disk: the node container bind-mounts it for its whole lifetime.
+    let (mut file, path) = tempfile::Builder::new()
+        .prefix("bedrock-deployment-settings-")
+        .suffix(".yaml")
+        .tempfile()
+        .context("Failed to create deployment settings file")?
+        .keep()
+        .context("Failed to persist deployment settings file")?;
+    serde_yaml::to_writer(&mut file, &settings).context("Failed to write deployment settings")?;
+    Ok(path)
+}
+
 pub async fn setup_bedrock_node() -> Result<(DockerCompose, SocketAddr)> {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let bedrock_compose_path = PathBuf::from(manifest_dir).join("../bedrock/docker-compose.yml");
+
+    let deployment_settings = fresh_deployment_settings(
+        &PathBuf::from(manifest_dir).join("../bedrock/deployment-settings.yaml"),
+    )
+    .context("Failed to prepare Bedrock deployment settings")?;
 
     let mut compose = DockerCompose::with_auto_client(&[bedrock_compose_path])
             .await
             .context("Failed to setup docker compose for Bedrock")?
             // Setting port to 0 to avoid conflicts between parallel tests, actual port will be retrieved after container is up
-            .with_env("PORT", "0");
+            .with_env("PORT", "0")
+            .with_env(
+                "BEDROCK_DEPLOYMENT_SETTINGS",
+                deployment_settings.to_string_lossy().into_owned(),
+            );
 
     #[expect(
         clippy::items_after_statements,

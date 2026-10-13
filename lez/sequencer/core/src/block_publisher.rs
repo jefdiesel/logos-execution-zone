@@ -1,44 +1,39 @@
 use std::time::Duration;
 
 use anyhow::{Context as _, Result, anyhow, ensure};
+use chain_state::zone_indexer::ZoneIndexer;
 use common::block::Block;
 use futures::Stream;
 use log::{info, warn};
-pub use logos_blockchain_core::mantle::{
-    ledger::NoteId,
-    ops::channel::{Ed25519PublicKey, MsgId},
-};
+pub use logos_blockchain_core::mantle::{ledger::NoteId, ops::channel::MsgId};
 use logos_blockchain_core::{
     mantle::{
-        SignedMantleTx,
+        SignedOps,
         channel::{SlotTimeframe, SlotTimeout},
         gas::GasCost,
         ops::{
             Op, OpProof,
             channel::{
-                ChannelId,
-                config::{ChannelConfigOp, Keys},
-                inscribe::Inscription,
+                ChannelId, VerifiedChannelKeys, config::ChannelConfigOp, inscribe::Inscription,
             },
         },
         traits::Hashable as _,
-        transactions::{MantleTxBuilder, OpsProofs},
+        transactions::{MantleTxBuilder, OpProofs},
     },
-    proofs::channel_multi_sig_proof::{ChannelMultiSigProof, IndexedSignature},
+    proofs::channel_multi_sig_proof::{ChannelMultiSigProof, IndexedSignatures},
 };
 use logos_blockchain_http_api_common::bodies::wallet::fund::WalletFundRequestBody;
 pub use logos_blockchain_key_management_system_service::keys::{
-    ED25519_SECRET_KEY_SIZE, Ed25519Key, ZkKey,
+    ED25519_SECRET_KEY_SIZE, Ed25519Key, Ed25519PublicKey, ZkKey,
 };
 pub use logos_blockchain_zone_sdk::sequencer::SequencerCheckpoint;
 use logos_blockchain_zone_sdk::{
     CommonHttpClient, Slot, ZoneMessage,
     adapter::{Node as _, NodeHttpClient},
-    indexer::ZoneIndexer,
     sequencer::{
         ChannelUpdateTx, DepositInfo, Event, FinalizedOp, FundingConfig, InscriptionInfo,
         PendingTx, SequencerConfig as ZoneSdkSequencerConfig, TurnNotification, WithdrawArg,
-        WithdrawInfo, ZoneSequencer,
+        WithdrawInfo, WithdrawInputs, ZoneSequencer,
     },
 };
 use tokio::sync::{mpsc, oneshot, watch};
@@ -188,12 +183,15 @@ impl BlockPublisherTrait for ZoneSdkPublisher {
 
         let zone_sdk_config = ZoneSdkSequencerConfig {
             resubmit_interval,
-            funding: Some(FundingConfig {
+            // Zero disables the pending-tx expiry, recovering the pre-expiry sdk behavior.
+            stale_refund_slots: 0,
+            ..ZoneSdkSequencerConfig::new(FundingConfig {
                 funding_pk: config.funding_key,
+                // Withdraw change goes back to the funding key.
+                change_pk: None,
                 max_tx_fee: GasCost::new(logos_blockchain_core::mantle::Value::MAX),
-                priority_fee: config.priority_fee,
-            }),
-            ..ZoneSdkSequencerConfig::default()
+                priority_fee_percent: config.priority_fee_percent,
+            })
         };
 
         let mut sequencer = ZoneSequencer::init_with_config(
@@ -239,7 +237,7 @@ impl BlockPublisherTrait for ZoneSdkPublisher {
                                         .context("Failed to publish block")
                                 } else {
                                     sequencer.handle()
-                                        .publish_atomic_withdraw(data_bounded, withdrawals)
+                                        .publish_atomic_withdraw(data_bounded, withdrawals, WithdrawInputs::Auto)
                                         .await
                                         .context("Failed to publish block with withdrawals")
                                 };
@@ -269,15 +267,18 @@ impl BlockPublisherTrait for ZoneSdkPublisher {
                                     checkpoint,
                                     channel_update,
                                     finalized,
+                                    // Non-finalized observations for deposit pinning; finalized
+                                    // deposits come through `finalized` instead.
+                                    deposits: _,
                                 } => {
                                     let adopted = channel_update
-                                        .adopted
+                                        .adopted()
                                         .iter()
                                         .filter_map(channel_update_inscription)
                                         .filter_map(block_from_inscription)
                                         .collect();
                                     let orphaned = channel_update
-                                        .orphaned
+                                        .orphaned()
                                         .iter()
                                         .filter_map(channel_update_inscription)
                                         .filter_map(block_from_inscription)
@@ -299,6 +300,9 @@ impl BlockPublisherTrait for ZoneSdkPublisher {
                                             FinalizedOp::Withdraw(withdraw) => {
                                                 withdrawals.push(withdraw);
                                             }
+                                            // Neither carries a block the LEZ chain models.
+                                            FinalizedOp::Config(_)
+                                            | FinalizedOp::ChannelTransfer(_) => {}
                                         }
                                     }
 
@@ -324,7 +328,6 @@ impl BlockPublisherTrait for ZoneSdkPublisher {
                                         notification.ends_at_slot
                                     );
                                 }
-                                Event::MempoolPending(_tx_hash) => {}
                             }
                         }
                     }
@@ -416,6 +419,10 @@ impl BlockPublisherTrait for ZoneSdkPublisher {
 /// Deserialize an inscription payload into `(this_msg, Block)`. Bad payloads are
 /// logged and skipped.
 fn block_from_inscription(inscription: &InscriptionInfo) -> Option<(MsgId, Block)> {
+    // An empty payload marks a missed turn, not a block.
+    if <Inscription as AsRef<[u8]>>::as_ref(&inscription.payload).is_empty() {
+        return None;
+    }
     borsh::from_slice::<Block>(&inscription.payload)
         .inspect_err(|err| {
             warn!("Failed to deserialize block from inscription: {err:?}");
@@ -428,7 +435,7 @@ fn block_from_inscription(inscription: &InscriptionInfo) -> Option<(MsgId, Block
 /// plain inscription. See [`PublishOutcome::released_notes`].
 fn released_notes(tx: &PendingTx) -> Vec<NoteId> {
     match tx {
-        PendingTx::Inscription(_) => Vec::new(),
+        PendingTx::Inscription(_) | PendingTx::PinDeposit(_) => Vec::new(),
         PendingTx::AtomicWithdraw(bundle) => bundle
             .withdraws
             .iter()
@@ -442,7 +449,8 @@ const fn channel_update_inscription(orphan: &ChannelUpdateTx) -> Option<&Inscrip
     match orphan {
         ChannelUpdateTx::Inscription(info) => Some(info),
         ChannelUpdateTx::AtomicWithdraw(bundle) => Some(&bundle.inscription),
-        ChannelUpdateTx::Custom(_signed_mantle_tx) => None,
+        ChannelUpdateTx::PinDeposit(bundle) => Some(&bundle.inscription),
+        ChannelUpdateTx::Config(_) | ChannelUpdateTx::Custom(_) => None,
     }
 }
 
@@ -451,7 +459,8 @@ const fn channel_update_inscription(orphan: &ChannelUpdateTx) -> Option<&Inscrip
 /// and posts it straight to the bedrock node.
 ///
 /// A standalone one-shot — no running sequencer involved, so authorization is
-/// holding the admin key: the L1 rejects non-admin signers. `Ok(())` means the
+/// holding an accredited key of the channel, signing alone: the current
+/// `configuration_threshold` must be 1. An unclaimed channel needs no signature. `Ok(())` means the
 /// node accepted the transaction; channel acceptance is asynchronous and a
 /// rejection only shows up in node logs and on-chain behavior.
 pub async fn post_channel_config(
@@ -480,20 +489,43 @@ pub async fn post_channel_config(
          got {posting_timeframe} and {posting_timeout}"
     );
 
-    let keys = Keys::try_from(keys).map_err(|err| anyhow!("Invalid channel key list: {err}"))?;
+    let node = NodeHttpClient::new(
+        CommonHttpClient::new(config.auth.clone().map(Into::into)),
+        config.node_url.clone(),
+    );
+
+    // The op extends the current config tip and is signed against the
+    // current accredited keys. An unclaimed channel starts a fresh config
+    // lineage and takes no signatures.
+    let (parent, signer_index) = match node
+        .channel_state(config.channel_id)
+        .await
+        .context("Failed to read channel state")?
+    {
+        Some(state) => {
+            let own_key = signing_key.public_key().into_unverified();
+            let index = state
+                .accredited_keys
+                .iter()
+                .position(|key| *key == own_key)
+                .context("Signing key is not an accredited key of the channel")?;
+            let index = u16::try_from(index).context("Channel key index out of range")?;
+            (state.config_tip_hash, Some(index))
+        }
+        None => (MsgId::root(), None),
+    };
+
+    let keys = VerifiedChannelKeys::try_from(keys)
+        .map_err(|err| anyhow!("Invalid channel key list: {err:?}"))?;
     let config_op = ChannelConfigOp {
         channel: config.channel_id,
+        parent,
         keys,
         posting_timeframe: SlotTimeframe::from(posting_timeframe),
         posting_timeout: SlotTimeout::from(posting_timeout),
         configuration_threshold,
         transfer_threshold,
     };
-
-    let node = NodeHttpClient::new(
-        CommonHttpClient::new(config.auth.clone().map(Into::into)),
-        config.node_url.clone(),
-    );
 
     // Fund the op from the node's wallet: the node appends a fee transfer
     // (paid from `funding_key`, change back to it) and returns its proof.
@@ -507,7 +539,7 @@ pub async fn post_channel_config(
             change_public_key: config.funding_key,
             funding_public_keys: vec![config.funding_key],
             max_tx_fee: GasCost::new(logos_blockchain_core::mantle::Value::MAX),
-            priority_fee: FundingConfig::DEFAULT_PRIORITY_FEE,
+            priority_fee_percent: config.priority_fee_percent,
         })
         .await
         .context("Failed to fund channel config transaction")?;
@@ -515,22 +547,24 @@ pub async fn post_channel_config(
 
     // Sign the funded tx: the appended fee transfer changes the hash.
     let tx_hash = mantle_tx.hash();
-    // The admin key is `keys[0]`, hence signature index 0.
-    let signature = IndexedSignature::new(
-        0,
-        signing_key.sign_payload(tx_hash.as_signing_bytes().as_ref()),
-    );
-    let proof = ChannelMultiSigProof::try_new(signature.into())
-        .map_err(|err| anyhow!("Failed to assemble channel multi-sig proof: {err:?}"))?;
+    let signatures = IndexedSignatures::try_from_iter(signer_index.map(|index| {
+        (
+            index,
+            signing_key.sign_payload(tx_hash.as_signing_bytes().as_ref()),
+        )
+    }))
+    .map_err(|err| anyhow!("Failed to assemble channel multi-sig proof: {err:?}"))?;
+    let proof = ChannelMultiSigProof::new(signatures);
 
     // Proofs follow op order; funding appends the transfer as the last op.
-    let mut ops_proofs: OpsProofs = OpProof::ChannelMultiSigProof(proof).into();
+    let mut ops_proofs = OpProofs::from([OpProof::ChannelMultiSigProof(proof)]);
     if let Some(transfer_proof) = funded.transfer_proof {
         ops_proofs
             .try_push(transfer_proof)
             .map_err(|err| anyhow!("Too many operation proofs: {err:?}"))?;
     }
-    let signed_tx = SignedMantleTx::new(mantle_tx, ops_proofs);
+    let signed_tx = SignedOps::from_parts(mantle_tx, ops_proofs)
+        .map_err(|err| anyhow!("Failed to assemble channel config transaction: {err:?}"))?;
 
     node.post_transaction(signed_tx)
         .await
