@@ -2,6 +2,11 @@ name: Publish Docker Images
 
 on:
   workflow_dispatch:
+    inputs:
+      tag:
+        description: Extra image tag to publish
+        required: false
+        default: ""
   push:
     tags:
       - "v*"
@@ -83,6 +88,7 @@ jobs:
             type=semver,pattern={{major}}.{{minor}}
             type=sha,prefix=sha-
             type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=${{ inputs.tag }},enable=${{ inputs.tag != '' }}
 
       - name: Build and push Docker image
         uses: docker/build-push-action@v5
