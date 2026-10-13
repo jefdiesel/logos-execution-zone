@@ -185,7 +185,7 @@ fn wallet_ffi_create_public_accounts() -> Result<()> {
         ownership_id: _,
         sequencer_ffi: sequencer_ffi_res,
         sequencer_home: _,
-    } = sequencer_ffi_helpers::joining_setup()?;
+    } = sequencer_ffi_helpers::joining_setup(false)?;
     let n_accounts = 10;
 
     // Create `n_accounts` public accounts with wallet FFI
@@ -241,7 +241,7 @@ fn wallet_ffi_create_private_accounts() -> Result<()> {
         ownership_id: _,
         sequencer_ffi: sequencer_ffi_res,
         sequencer_home: _,
-    } = sequencer_ffi_helpers::joining_setup()?;
+    } = sequencer_ffi_helpers::joining_setup(false)?;
     let n_accounts = 10;
     // Create `n_accounts` receiving keys with wallet FFI
     let new_npks_ffi = unsafe {
@@ -287,7 +287,7 @@ fn wallet_ffi_save_and_load_persistent_storage() -> Result<()> {
         ownership_id: _,
         sequencer_ffi: sequencer_ffi_res,
         sequencer_home: _,
-    } = sequencer_ffi_helpers::joining_setup()?;
+    } = sequencer_ffi_helpers::joining_setup(false)?;
     let home = tempfile::tempdir()?;
     // Create a receiving key and save
     let first_npk = unsafe {
@@ -338,7 +338,7 @@ fn test_wallet_ffi_list_accounts() -> Result<()> {
         ownership_id: _,
         sequencer_ffi: sequencer_ffi_res,
         sequencer_home: _,
-    } = sequencer_ffi_helpers::joining_setup()?;
+    } = sequencer_ffi_helpers::joining_setup(false)?;
     // Create the wallet FFI and track which account IDs were created as public/private
     let (wallet_ffi_handle, created_public_ids) = unsafe {
         let home = tempfile::tempdir()?;
@@ -418,7 +418,7 @@ fn test_wallet_ffi_get_balance_public() -> Result<()> {
         ownership_id: _,
         sequencer_ffi: sequencer_ffi_res,
         sequencer_home: _,
-    } = sequencer_ffi_helpers::joining_setup()?;
+    } = sequencer_ffi_helpers::joining_setup(false)?;
     let account_id: AccountId = ctx.ctx().existing_public_accounts()[0];
     let home = tempfile::tempdir()?;
     let FfiCreateWalletOutput {
@@ -462,7 +462,7 @@ fn test_wallet_ffi_get_account_public() -> Result<()> {
         ownership_id: _,
         sequencer_ffi: sequencer_ffi_res,
         sequencer_home: _,
-    } = sequencer_ffi_helpers::joining_setup()?;
+    } = sequencer_ffi_helpers::joining_setup(false)?;
     let account_id: AccountId = ctx.ctx().existing_public_accounts()[0];
     let home = tempfile::tempdir()?;
     let FfiCreateWalletOutput {
@@ -583,7 +583,7 @@ fn test_wallet_ffi_get_account_private() -> Result<()> {
         ownership_id: _,
         sequencer_ffi: sequencer_ffi_res,
         sequencer_home: _,
-    } = sequencer_ffi_helpers::joining_setup()?;
+    } = sequencer_ffi_helpers::joining_setup(false)?;
     let account_id: AccountId = ctx.ctx().existing_private_accounts()[0];
     let home = tempfile::tempdir()?;
     let FfiCreateWalletOutput {
@@ -633,7 +633,7 @@ fn test_wallet_ffi_get_public_account_keys() -> Result<()> {
         ownership_id: _,
         sequencer_ffi: sequencer_ffi_res,
         sequencer_home: _,
-    } = sequencer_ffi_helpers::joining_setup()?;
+    } = sequencer_ffi_helpers::joining_setup(false)?;
     let account_id: AccountId = ctx.ctx().existing_public_accounts()[0];
     let home = tempfile::tempdir()?;
     let FfiCreateWalletOutput {
@@ -686,7 +686,7 @@ fn test_wallet_ffi_get_private_account_keys() -> Result<()> {
         ownership_id: _,
         sequencer_ffi: sequencer_ffi_res,
         sequencer_home: _,
-    } = sequencer_ffi_helpers::joining_setup()?;
+    } = sequencer_ffi_helpers::joining_setup(false)?;
     let account_id: AccountId = ctx.ctx().existing_private_accounts()[0];
     let home = tempfile::tempdir()?;
     let FfiCreateWalletOutput {
@@ -783,7 +783,7 @@ fn wallet_ffi_public_credit_creates_only_the_native_shard() -> Result<()> {
         ownership_id: _,
         sequencer_ffi: sequencer_ffi_res,
         sequencer_home: _,
-    } = sequencer_ffi_helpers::joining_setup()?;
+    } = sequencer_ffi_helpers::joining_setup(false)?;
     let home = tempfile::tempdir()?;
     let FfiCreateWalletOutput {
         wallet: wallet_ffi_handle,
@@ -857,7 +857,7 @@ fn test_wallet_ffi_transfer_public() -> Result<()> {
         ownership_id: _,
         sequencer_ffi: sequencer_ffi_res,
         sequencer_home: _,
-    } = sequencer_ffi_helpers::joining_setup()?;
+    } = sequencer_ffi_helpers::joining_setup(false)?;
     let home = tempfile::tempdir()?;
     let FfiCreateWalletOutput {
         wallet: wallet_ffi_handle,
@@ -938,7 +938,7 @@ fn test_wallet_ffi_transfer_shielded() -> Result<()> {
         ownership_id: _,
         sequencer_ffi: sequencer_ffi_res,
         sequencer_home: _,
-    } = sequencer_ffi_helpers::joining_setup()?;
+    } = sequencer_ffi_helpers::joining_setup(false)?;
     let home = tempfile::tempdir()?;
     let FfiCreateWalletOutput {
         wallet: wallet_ffi_handle,
@@ -1023,7 +1023,7 @@ fn test_wallet_ffi_transfer_deshielded() -> Result<()> {
         ownership_id: _,
         sequencer_ffi: sequencer_ffi_res,
         sequencer_home: _,
-    } = sequencer_ffi_helpers::joining_setup()?;
+    } = sequencer_ffi_helpers::joining_setup(false)?;
     let home = tempfile::tempdir()?;
     let FfiCreateWalletOutput {
         wallet: wallet_ffi_handle,
@@ -1101,7 +1101,7 @@ fn test_wallet_ffi_transfer_private() -> Result<()> {
         ownership_id: _,
         sequencer_ffi: sequencer_ffi_res,
         sequencer_home: _,
-    } = sequencer_ffi_helpers::joining_setup()?;
+    } = sequencer_ffi_helpers::joining_setup(false)?;
     let home = tempfile::tempdir()?;
     let FfiCreateWalletOutput {
         wallet: wallet_ffi_handle,
@@ -1192,7 +1192,7 @@ fn restore_keys_from_seed_ffi() -> Result<()> {
         ownership_id: _,
         sequencer_ffi: sequencer_ffi_res,
         sequencer_home: _,
-    } = sequencer_ffi_helpers::joining_setup()?;
+    } = sequencer_ffi_helpers::joining_setup(false)?;
     let home = tempfile::tempdir()?;
     let FfiCreateWalletOutput {
         wallet: wallet_ffi_handle,
@@ -1566,7 +1566,7 @@ fn test_wallet_ffi_transfer_generic_public() -> Result<()> {
         ownership_id: _,
         sequencer_ffi: sequencer_ffi_res,
         sequencer_home: _,
-    } = sequencer_ffi_helpers::joining_setup()?;
+    } = sequencer_ffi_helpers::joining_setup(false)?;
     let home = tempfile::tempdir()?;
     let FfiCreateWalletOutput {
         wallet: wallet_ffi_handle,
@@ -1696,7 +1696,7 @@ fn test_wallet_ffi_transfer_generic_private() -> Result<()> {
         ownership_id: _,
         sequencer_ffi: sequencer_ffi_res,
         sequencer_home: _,
-    } = sequencer_ffi_helpers::joining_setup()?;
+    } = sequencer_ffi_helpers::joining_setup(false)?;
     let home = tempfile::tempdir()?;
     let FfiCreateWalletOutput {
         wallet: wallet_ffi_handle,
@@ -1829,7 +1829,7 @@ fn test_wallet_ffi_single_label() -> Result<()> {
         ownership_id: _,
         sequencer_ffi: sequencer_ffi_res,
         sequencer_home: _,
-    } = sequencer_ffi_helpers::joining_setup()?;
+    } = sequencer_ffi_helpers::joining_setup(false)?;
     let home = tempfile::tempdir()?;
     let FfiCreateWalletOutput {
         wallet: wallet_ffi_handle,
@@ -1889,7 +1889,7 @@ fn test_wallet_ffi_more_labels() -> Result<()> {
         ownership_id: _,
         sequencer_ffi: sequencer_ffi_res,
         sequencer_home: _,
-    } = sequencer_ffi_helpers::joining_setup()?;
+    } = sequencer_ffi_helpers::joining_setup(false)?;
     let home = tempfile::tempdir()?;
     let FfiCreateWalletOutput {
         wallet: wallet_ffi_handle,

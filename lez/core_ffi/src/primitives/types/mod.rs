@@ -116,6 +116,7 @@ pub type FfiAccountId = FfiBytes32;
 pub type FfiNonce = FfiU128;
 pub type FfiPublicKey = FfiBytes32;
 pub type FfiSelector = FfiBytes8;
+pub type FfiCommitment = FfiBytes32;
 
 impl From<Selector> for FfiSelector {
     fn from(value: Selector) -> Self {
@@ -166,6 +167,20 @@ impl From<PublicKey> for FfiPublicKey {
         Self {
             data: *value.value(),
         }
+    }
+}
+
+impl From<lee_core::Commitment> for FfiCommitment {
+    fn from(value: lee_core::Commitment) -> Self {
+        Self {
+            data: value.to_byte_array(),
+        }
+    }
+}
+
+impl From<FfiCommitment> for lee_core::Commitment {
+    fn from(value: FfiCommitment) -> Self {
+        Self::from_byte_array(value.data)
     }
 }
 
@@ -346,6 +361,16 @@ impl<T: Clone> FfiVec<T> {
 
         std_vec
     }
+
+    /// Reads data from pointer into ffi vector.
+    ///
+    /// # Safety
+    /// `ptr` must be valid.
+    #[must_use]
+    pub unsafe fn collect_from_ptr(ptr: *const T, len: usize) -> Self {
+        let std_vec = unsafe { slice::from_raw_parts(ptr, len).to_vec() };
+        std_vec.into()
+    }
 }
 
 #[repr(C)]
@@ -380,6 +405,106 @@ impl<T> From<Option<T>> for FfiOption<T> {
 impl<T> From<FfiOption<T>> for Option<T> {
     fn from(value: FfiOption<T>) -> Self {
         value.is_some.then(|| unsafe { value.value.read() })
+    }
+}
+
+// Exists because of conflicts with core.
+impl<T> FfiOption<T> {
+    pub fn deep_into<K: From<T>>(self) -> Option<K> {
+        if !self.is_some {
+            return None;
+        }
+
+        Some(unsafe { *Box::from_raw(self.value) }.into())
+    }
+
+    pub fn deep_try_into<K: TryFrom<T>>(self) -> Result<Option<K>, K::Error> {
+        if !self.is_some {
+            return Ok(None);
+        }
+
+        let claimed_orig = unsafe { *Box::from_raw(self.value) };
+
+        Ok(Some(claimed_orig.try_into()?))
+    }
+}
+
+#[repr(C)]
+pub struct FfiMembershipProof {
+    pub id: usize,
+    pub values: FfiVec<FfiBytes32>,
+}
+
+impl From<lee_core::MembershipProof> for FfiMembershipProof {
+    fn from(value: lee_core::MembershipProof) -> Self {
+        Self {
+            id: value.0,
+            values: value
+                .1
+                .into_iter()
+                .map(Into::into)
+                .collect::<Vec<_>>()
+                .into(),
+        }
+    }
+}
+
+impl From<FfiMembershipProof> for lee_core::MembershipProof {
+    fn from(value: FfiMembershipProof) -> Self {
+        let std_vec: Vec<_> = value.values.into();
+        (value.id, std_vec.into_iter().map(Into::into).collect())
+    }
+}
+
+#[repr(C)]
+pub struct FfiProofsAndRoot {
+    pub membership_proofs: FfiVec<FfiOption<FfiMembershipProof>>,
+    pub commitment_set_digest: FfiBytes32,
+}
+
+impl
+    From<(
+        Vec<Option<lee_core::MembershipProof>>,
+        lee_core::CommitmentSetDigest,
+    )> for FfiProofsAndRoot
+{
+    fn from(
+        value: (
+            Vec<Option<lee_core::MembershipProof>>,
+            lee_core::CommitmentSetDigest,
+        ),
+    ) -> Self {
+        Self {
+            membership_proofs: value
+                .0
+                .into_iter()
+                .map(|val_opt| val_opt.map(Into::into).into())
+                .collect::<Vec<_>>()
+                .into(),
+            commitment_set_digest: value.1.into(),
+        }
+    }
+}
+
+impl From<FfiProofsAndRoot>
+    for (
+        Vec<Option<lee_core::MembershipProof>>,
+        lee_core::CommitmentSetDigest,
+    )
+{
+    fn from(value: FfiProofsAndRoot) -> Self {
+        let std_vec: Vec<_> = value.membership_proofs.into();
+
+        (
+            std_vec
+                .into_iter()
+                .map(|ffi_opt| {
+                    let std_opt: Option<FfiMembershipProof> = ffi_opt.into();
+                    std_opt.map(Into::into)
+                })
+                .collect(),
+            value.commitment_set_digest.into(),
+        )
     }
 }
 
@@ -439,4 +564,27 @@ pub unsafe extern "C" fn primitives_ffi_free_private_account_keys(
     let owned = unsafe { keys.read() };
 
     unsafe { primitives_ffi_free_private_account_keys_owned(owned) }
+}
+
+/// Free proofs and root.
+///
+/// # Safety
+/// The proofs and root must be valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn primitives_ffi_free_proofs_and_root(
+    proofs_and_root: *mut FfiProofsAndRoot,
+) {
+    if proofs_and_root.is_null() {
+        log::error!("Trying to free a null pointer. Exiting");
+        return;
+    }
+
+    let boxed = unsafe { Box::from_raw(proofs_and_root) };
+
+    let std_prrofs_and_root: (
+        Vec<Option<lee_core::MembershipProof>>,
+        lee_core::CommitmentSetDigest,
+    ) = (*boxed).into();
+
+    drop(std_prrofs_and_root);
 }

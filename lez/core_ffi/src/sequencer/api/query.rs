@@ -2,8 +2,8 @@ use std::ffi::{CString, c_char};
 
 use sequencer_executor_actor::protocol::{
     BoundedRangeInclusive, GetAccount, GetAccountTransactions, GetBlock, GetBlockByHash,
-    GetBlockRange, GetLastBlockId, GetTransaction, MAX_BLOCK_RANGE_LEN, Transaction,
-    TransactionOrigin,
+    GetBlockRange, GetLastBlockId, GetProofsAndRoot, GetTransaction, MAX_BLOCK_RANGE_LEN,
+    Transaction, TransactionOrigin,
 };
 use sequencer_storage_actor::{
     actor::event_filter::{EventRecord, MAX_EVENT_QUERY_RESPONSE_BYTES, Selector, record_charge},
@@ -15,7 +15,8 @@ use crate::{
     primitives::{
         result::PointerResult,
         types::{
-            FfiAccountId, FfiBlockId, FfiHashType, FfiOption, FfiSelector, FfiVec,
+            FfiAccountId, FfiBlockId, FfiCommitment, FfiHashType, FfiOption, FfiProofsAndRoot,
+            FfiSelector, FfiVec,
             account::FfiAccount,
             block::{FfiBlock, FfiBlockOpt},
             event::FfiEventRecord,
@@ -307,6 +308,61 @@ pub unsafe extern "C" fn sequencer_ffi_query_account(
             PointerResult::from_error(FfiOperationError::QueryError)
         },
         |account| PointerResult::from_value(account.account.into()),
+    )
+}
+
+/// Query the prrofs and root for commitments.
+///
+/// # Arguments
+///
+/// - `sequencer`: A pointer to the [`SequencerServiceFFI`] instance to be queried.
+/// - `commitments`: valid pointer into array of `FfiCommitment`.
+/// - `commitments_len`: length of a commitments array.
+///
+/// # Returns
+///
+/// A `PointerResult<FfiProofsAndRoot, FfiOperationError>` indicating success or failure.
+///
+/// # Safety
+///
+/// The caller must ensure that:
+/// - `sequencer` is a valid pointer to a [`SequencerServiceFFI`] instance.
+/// - `commitments` must be valid pointer to a [`FfiCommitment`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sequencer_ffi_query_proofs_and_root(
+    sequencer: *const SequencerServiceFFI,
+    commitments: *const FfiCommitment,
+    commitments_len: usize,
+) -> PointerResult<FfiProofsAndRoot, FfiOperationError> {
+    if sequencer.is_null() {
+        log::error!("Attempted to query a null sequencer pointer. This is a bug. Aborting.");
+        return PointerResult::from_error(FfiOperationError::NullPointer);
+    }
+    if commitments.is_null() {
+        log::error!("Provided a null commitments pointer. This is a bug. Aborting.");
+        return PointerResult::from_error(FfiOperationError::NullPointer);
+    }
+
+    let sequencer = unsafe { &*sequencer };
+    let commitments =
+        unsafe { FfiVec::<FfiCommitment>::collect_from_ptr(commitments, commitments_len) };
+    let std_vec: Vec<_> = commitments.into();
+
+    let proofs_and_roots_resp = sequencer.runtime().block_on(
+        sequencer
+            .executor_ref()
+            .ask(GetProofsAndRoot {
+                commitments: std_vec.into_iter().map(Into::into).collect(),
+            })
+            .send(),
+    );
+
+    proofs_and_roots_resp.map_or_else(
+        |e| {
+            log::error!("Failed to query prrofs and root: {e:#}");
+            PointerResult::from_error(FfiOperationError::QueryError)
+        },
+        |proofs_and_roots| PointerResult::from_value(proofs_and_roots.into()),
     )
 }
 

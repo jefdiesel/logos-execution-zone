@@ -1,16 +1,17 @@
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc};
 
 use anyhow::Result;
 use wallet::WalletSequencerClient;
 
 use crate::{
-    primitives::types::FfiOption,
+    primitives::types::{FfiCommitment, FfiOption, FfiVec},
     sequencer::{
         SequencerServiceFFI,
         api::query::{
-            sequencer_ffi_query_account, sequencer_ffi_query_block, sequencer_ffi_query_block_vec,
-            sequencer_ffi_query_last_block, sequencer_ffi_query_transaction,
-            sequencer_ffi_send_transaction,
+            sequencer_ffi_query_account, sequencer_ffi_query_block,
+            sequencer_ffi_query_block_by_tx_hash, sequencer_ffi_query_block_vec,
+            sequencer_ffi_query_last_block, sequencer_ffi_query_proofs_and_root,
+            sequencer_ffi_query_transaction, sequencer_ffi_send_transaction,
         },
     },
 };
@@ -34,7 +35,7 @@ impl WalletSequencerClient for SequencerServiceFFIWrapper {
         if res.error.is_error() {
             anyhow::bail!("Sequencer FFI error: {:?}", res.error);
         }
-        let ffi_account = unsafe { res.value.read() };
+        let ffi_account = unsafe { *res.into_boxed().expect("Must be Success") };
         let std_account = ffi_account
             .try_into()
             .map_err(|_| anyhow::anyhow!("Failed cast"))?;
@@ -46,7 +47,7 @@ impl WalletSequencerClient for SequencerServiceFFIWrapper {
         if res.error.is_error() {
             anyhow::bail!("Sequencer FFI error: {:?}", res.error);
         }
-        let ffi_account = unsafe { res.value.read() };
+        let ffi_account = unsafe { *res.into_boxed().expect("Must be Success") };
         let std_account: lee::Account = ffi_account
             .try_into()
             .map_err(|_| anyhow::anyhow!("Failed cast"))?;
@@ -63,7 +64,7 @@ impl WalletSequencerClient for SequencerServiceFFIWrapper {
             if res.error.is_error() {
                 anyhow::bail!("Sequencer FFI error: {:?}", res.error);
             }
-            let ffi_account = unsafe { res.value.read() };
+            let ffi_account = unsafe { *res.into_boxed().expect("Must be Success") };
             let std_account: lee::Account = ffi_account
                 .try_into()
                 .map_err(|_| anyhow::anyhow!("Failed cast"))?;
@@ -77,15 +78,14 @@ impl WalletSequencerClient for SequencerServiceFFIWrapper {
         if res.error.is_error() {
             anyhow::bail!("Sequencer FFI error: {:?}", res.error);
         }
-        let ffi_opt_block = unsafe { res.value.read() };
+        let ffi_opt_block = unsafe { *res.into_boxed().expect("Must be Success") };
         if !ffi_opt_block.is_some {
             return Ok(None);
         }
-        let ffi_block = unsafe { ffi_opt_block.value.read() };
-        let std_block = ffi_block
-            .try_into()
+        let std_block_opt: Option<common::block::Block> = ffi_opt_block
+            .deep_try_into()
             .map_err(|_| anyhow::anyhow!("Failed cast"))?;
-        Ok(Some(std_block))
+        Ok(std_block_opt)
     }
 
     async fn get_block_range(
@@ -99,7 +99,7 @@ impl WalletSequencerClient for SequencerServiceFFIWrapper {
         if res.error.is_error() {
             anyhow::bail!("Sequencer FFI error: {:?}", res.error);
         }
-        let ffi_vec_block = unsafe { res.value.read() };
+        let ffi_vec_block = unsafe { *res.into_boxed().expect("Must be Success") };
         let std_vec_ffi_block: Vec<_> = ffi_vec_block.into();
         let mut std_vec_block = Vec::with_capacity(limit as usize);
 
@@ -132,51 +132,88 @@ impl WalletSequencerClient for SequencerServiceFFIWrapper {
         if res.error.is_error() {
             anyhow::bail!("Sequencer FFI error: {:?}", res.error);
         }
-        let ffi_opt_tx = unsafe { res.value.read() };
+        let ffi_opt_tx = unsafe { *res.into_boxed().expect("Must be Success") };
         if !ffi_opt_tx.is_some {
             return Ok(None);
         }
-        let ffi_tx = unsafe { ffi_opt_tx.value.read() };
-        let std_tx: common::transaction::LeeTransaction = ffi_tx
-            .try_into()
+        let std_tx_opt: Option<common::transaction::LeeTransaction> = ffi_opt_tx
+            .deep_try_into()
             .map_err(|_| anyhow::anyhow!("Failed cast"))?;
-        // !TODO!: fix zero resp.
-        Ok(Some((std_tx, 0)))
+
+        let ffi_block_id = unsafe { sequencer_ffi_query_block_by_tx_hash(*self.0, tx_hash.into()) };
+        if ffi_block_id.error.is_error() {
+            anyhow::bail!("Sequencer FFI error: {:?}", ffi_block_id.error);
+        }
+        let std_block_id = unsafe { *ffi_block_id.into_boxed().expect("Must be Success") };
+        Ok(std_tx_opt.map(|std_tx| (std_tx, std_block_id)))
     }
 
     async fn send_transaction(
         &self,
         tx: common::transaction::LeeTransaction,
     ) -> Result<common::HashType> {
+        let tx_hash = tx.hash();
         let res = unsafe { sequencer_ffi_send_transaction(*self.0, tx.into()) };
         if res.error.is_error() {
             anyhow::bail!("Sequencer FFI error: {:?}", res.error);
         }
-        // !TODO!: fix zero resp.
-        Ok([0u8; 32].into())
+        Ok(tx_hash)
     }
 
     async fn get_account_view(
         &self,
-        _shard_selector: lee::ProgramShardSelector,
+        shard_selector: lee::ProgramShardSelector,
     ) -> Result<lee::Account> {
-        // !TODO!: Add.
-        todo!()
+        let res = unsafe { sequencer_ffi_query_account(*self.0, shard_selector.account_id.into()) };
+        if res.error.is_error() {
+            anyhow::bail!("Sequencer FFI error: {:?}", res.error);
+        }
+        let ffi_account = unsafe { *res.into_boxed().expect("Must be Success") };
+        let std_account: lee::Account = ffi_account
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("Failed cast"))?;
+        let view_account = std_account.project([shard_selector.program_account_id]);
+        Ok(view_account)
     }
 
     async fn get_program_ids(&self) -> Result<std::collections::BTreeMap<String, lee::ProgramId>> {
-        // !TODO!: Add.
-        todo!()
+        // TODO: Sequencer RPC don't read programs from state. Need to update both.
+        let mut program_ids = BTreeMap::new();
+        program_ids.insert(
+            "privacy_preserving_circuit".to_owned(),
+            lee::PRIVACY_PRESERVING_CIRCUIT_ID,
+        );
+        Ok(program_ids)
     }
 
     async fn get_proofs_and_root(
         &self,
-        _commitments: Vec<lee_core::Commitment>,
+        commitments: Vec<lee_core::Commitment>,
     ) -> Result<(
         Vec<Option<lee_core::MembershipProof>>,
         lee_core::CommitmentSetDigest,
     )> {
-        // !TODO!: Add.
-        todo!()
+        let commitments_ffi_vec: FfiVec<FfiCommitment> = commitments
+            .into_iter()
+            .map(Into::into)
+            .collect::<Vec<_>>()
+            .into();
+
+        let res = unsafe {
+            sequencer_ffi_query_proofs_and_root(
+                *self.0,
+                commitments_ffi_vec.entries.cast_const(),
+                commitments_ffi_vec.len,
+            )
+        };
+        if res.error.is_error() {
+            anyhow::bail!("Sequencer FFI error: {:?}", res.error);
+        }
+        let ffi_proofs_and_root = unsafe { *res.into_boxed().expect("Must be Success") };
+        let std_proofs_and_root: (
+            Vec<Option<lee_core::MembershipProof>>,
+            lee_core::CommitmentSetDigest,
+        ) = ffi_proofs_and_root.into();
+        Ok(std_proofs_and_root)
     }
 }

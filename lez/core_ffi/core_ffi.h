@@ -180,6 +180,33 @@ typedef struct FfiPrivateAccountKeys {
   FfiVecU8 viewing_public_key;
 } FfiPrivateAccountKeys;
 
+typedef struct FfiVec_FfiBytes32 {
+  struct FfiBytes32 *entries;
+  uintptr_t len;
+  uintptr_t capacity;
+} FfiVec_FfiBytes32;
+
+typedef struct FfiMembershipProof {
+  uintptr_t id;
+  struct FfiVec_FfiBytes32 values;
+} FfiMembershipProof;
+
+typedef struct FfiOption_FfiMembershipProof {
+  struct FfiMembershipProof *value;
+  bool is_some;
+} FfiOption_FfiMembershipProof;
+
+typedef struct FfiVec_FfiOption_FfiMembershipProof {
+  struct FfiOption_FfiMembershipProof *entries;
+  uintptr_t len;
+  uintptr_t capacity;
+} FfiVec_FfiOption_FfiMembershipProof;
+
+typedef struct FfiProofsAndRoot {
+  struct FfiVec_FfiOption_FfiMembershipProof membership_proofs;
+  struct FfiBytes32 commitment_set_digest;
+} FfiProofsAndRoot;
+
 typedef struct FfiBytes32 FfiAccountId;
 
 typedef struct FfiVec_FfiAccountId {
@@ -559,6 +586,19 @@ typedef struct PointerResult_FfiAccount__FfiOperationError {
  * Pointer is not guaranteed. You should check the error field before
  * dereferencing the pointer.
  */
+typedef struct PointerResult_FfiProofsAndRoot__FfiOperationError {
+  struct FfiProofsAndRoot *value;
+  enum FfiOperationError error;
+} PointerResult_FfiProofsAndRoot__FfiOperationError;
+
+typedef struct FfiBytes32 FfiCommitment;
+
+/**
+ * Simple wrapper around a pointer to a value or an error.
+ *
+ * Pointer is not guaranteed. You should check the error field before
+ * dereferencing the pointer.
+ */
 typedef struct PointerResult_u8__FfiOperationError {
   uint8_t *value;
   enum FfiOperationError error;
@@ -738,15 +778,6 @@ typedef struct FfiProgramHeader {
 /**
  * Intended to be created manually.
  */
-typedef struct FfiMembershipProof {
-  uintptr_t index;
-  const struct FfiBytes32 *path;
-  uintptr_t path_len;
-} FfiMembershipProof;
-
-/**
- * Intended to be created manually.
- */
 typedef struct FfiDependency {
   struct FfiProgram program;
   /**
@@ -847,6 +878,14 @@ void primitives_ffi_free_private_account_keys_boxed(struct FfiPrivateAccountKeys
  * The keys must be valid. Pointer must not be used again.
  */
 void primitives_ffi_free_private_account_keys(struct FfiPrivateAccountKeys *keys);
+
+/**
+ * Free proofs and root.
+ *
+ * # Safety
+ * The proofs and root must be valid.
+ */
+void primitives_ffi_free_proofs_and_root(struct FfiProofsAndRoot *proofs_and_root);
 
 /**
  * Frees the resources associated with the given ffi account.
@@ -1191,6 +1230,29 @@ struct PointerResult_FfiBlockOpt__FfiOperationError sequencer_ffi_query_block_by
  */
 struct PointerResult_FfiAccount__FfiOperationError sequencer_ffi_query_account(const struct SequencerServiceFFI *sequencer,
                                                                                FfiAccountId account_id);
+
+/**
+ * Query the prrofs and root for commitments.
+ *
+ * # Arguments
+ *
+ * - `sequencer`: A pointer to the [`SequencerServiceFFI`] instance to be queried.
+ * - `commitments`: valid pointer into array of `FfiCommitment`.
+ * - `commitments_len`: length of a commitments array.
+ *
+ * # Returns
+ *
+ * A `PointerResult<FfiProofsAndRoot, FfiOperationError>` indicating success or failure.
+ *
+ * # Safety
+ *
+ * The caller must ensure that:
+ * - `sequencer` is a valid pointer to a [`SequencerServiceFFI`] instance.
+ * - `commitments` must be valid pointer to a [`FfiCommitment`].
+ */
+struct PointerResult_FfiProofsAndRoot__FfiOperationError sequencer_ffi_query_proofs_and_root(const struct SequencerServiceFFI *sequencer,
+                                                                                             const FfiCommitment *commitments,
+                                                                                             uintptr_t commitments_len);
 
 /**
  * Send transaction into sequencer.
