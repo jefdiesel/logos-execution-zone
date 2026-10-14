@@ -107,10 +107,11 @@ pub const JOINER_SIGNING_KEY: [u8; 32] = [0x42; 32];
 
 /// A leader node with an FFI node staked into its channel.
 pub struct JoiningSetup {
-    pub ctx: BlockingTestContext,
-    pub node: NodeHttpClient,
     pub ownership_id: Option<AccountId>,
     pub sequencer_ffi: PointerResult<SequencerServiceFFI, FfiOperationError>,
+    pub node: NodeHttpClient,
+    // Runtime must have stable address.
+    pub ctx: Box<BlockingTestContext>,
     /// The joining node's home. Its `RocksDB` lives in here, so it has to
     /// outlive the sequencer; dropping it pulls the database out from under a
     /// node that is still running.
@@ -161,7 +162,7 @@ pub fn joining_setup_with_stake() -> Result<JoiningSetup> {
     let funding_private_key = PrivateKey::new_os_random();
     let funding_id = AccountId::from(&PublicKey::new_from_private_key(&funding_private_key));
 
-    let mut ctx = MultiZoneTestContextBuilder::default()
+    let mut ctx = Box::new(MultiZoneTestContextBuilder::default()
         .with_zone(
             ZoneTestContextBuilder::new(MultiNodeTestContextConfig::default())
                 .with_sequencer_partial_config(fast_blocks())
@@ -171,7 +172,7 @@ pub fn joining_setup_with_stake() -> Result<JoiningSetup> {
                 }]),
         )
         .build_blocking()
-        .context("Failed to build test context")?;
+        .context("Failed to build test context")?);
 
     // Import the funding key directly; it's not one of the wallet's default accounts.
     ctx.ctx_mut()
@@ -334,24 +335,25 @@ pub fn joining_setup_with_stake() -> Result<JoiningSetup> {
     }
 
     Ok(JoiningSetup {
-        ctx,
         node,
         ownership_id: Some(ownership_id),
         sequencer_ffi: sequencer_ffi_res,
         sequencer_home: temp_sequencer_dir,
+        ctx,
     })
 }
 
 /// Sets up blocking context with one leader node
 /// and joins FFI node without staking flow.
 pub fn joining_setup_no_stake() -> Result<JoiningSetup> {
-    let ctx = MultiZoneTestContextBuilder::default()
+    let ctx = Box::new(MultiZoneTestContextBuilder::default()
         .with_zone(
             ZoneTestContextBuilder::new(MultiNodeTestContextConfig::default())
-                .with_sequencer_partial_config(fast_blocks()),
+                .with_sequencer_partial_config(fast_blocks())
+                .with_genesis(vec![]),
         )
         .build_blocking()
-        .context("Failed to build test context")?;
+        .context("Failed to build test context")?);
 
     let bedrock_url = addr_to_url(UrlProtocol::Http, ctx.ctx().bedrock_addr())
         .context("Failed to build the Bedrock node URL")?;
@@ -379,10 +381,11 @@ pub fn joining_setup_no_stake() -> Result<JoiningSetup> {
 
     let raw_config_path = config_c_string.into_raw();
 
+    let borrowed_runtime = unsafe{ core_ffi::primitives::runtime::Runtime::from_borrowed(ctx.runtime()) };
+
     let sequencer_ffi_res =
-    // SAFETY: null runtime → the FFI creates and owns its own tokio runtime,
-    // so there is no external runtime whose address we must keep stable.
-    unsafe { sequencer_ffi_start_sequencer(std::ptr::null(), raw_config_path) };
+    unsafe { sequencer_ffi_start_sequencer(
+        &raw const borrowed_runtime, raw_config_path) };
 
     // SAFETY: cstring was constructed from valid string.
     unsafe {
@@ -394,11 +397,11 @@ pub fn joining_setup_no_stake() -> Result<JoiningSetup> {
     }
 
     Ok(JoiningSetup {
-        ctx,
         node,
         ownership_id: None,
         sequencer_ffi: sequencer_ffi_res,
         sequencer_home: temp_sequencer_dir,
+        ctx,
     })
 }
 

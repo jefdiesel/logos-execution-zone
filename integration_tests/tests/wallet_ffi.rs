@@ -186,6 +186,7 @@ fn wallet_ffi_create_public_accounts() -> Result<()> {
         sequencer_ffi: sequencer_ffi_res,
         sequencer_home: _,
     } = sequencer_ffi_helpers::joining_setup(false)?;
+
     let n_accounts = 10;
 
     // Create `n_accounts` public accounts with wallet FFI
@@ -417,8 +418,11 @@ fn test_wallet_ffi_get_balance_public() -> Result<()> {
         node: _,
         ownership_id: _,
         sequencer_ffi: sequencer_ffi_res,
-        sequencer_home: _,
+        sequencer_home,
     } = sequencer_ffi_helpers::joining_setup(false)?;
+
+    log::info!("Joining sequencer home: {sequencer_home:?}");
+
     let account_id: AccountId = ctx.ctx().existing_public_accounts()[0];
     let home = tempfile::tempdir()?;
     let FfiCreateWalletOutput {
@@ -445,6 +449,8 @@ fn test_wallet_ffi_get_balance_public() -> Result<()> {
     unsafe {
         wallet_ffi_destroy(wallet_ffi_handle);
     }
+
+    log::info!("##################################### Wallet dropped");
 
     // SAFETY: sequencer_ffi created by FFI, it is valid.
     unsafe {

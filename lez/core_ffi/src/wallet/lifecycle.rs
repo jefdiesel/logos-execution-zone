@@ -116,6 +116,12 @@ pub unsafe extern "C" fn wallet_ffi_create_new(
         return FfiCreateWalletOutput::default();
     };
 
+    if sequencer.is_null() {
+        return FfiCreateWalletOutput::default();
+    }
+
+    let sequencer = unsafe{*sequencer};
+
     match WalletCore::new_init_storage_with_client(
         config_path,
         storage_path,
@@ -176,6 +182,12 @@ pub unsafe extern "C" fn wallet_ffi_open(
     let Ok(storage_path) = c_str_to_path(storage_path, "storage_path") else {
         return ptr::null_mut();
     };
+
+    if sequencer.is_null() {
+        return ptr::null_mut();
+    }
+
+    let sequencer = unsafe{*sequencer};
 
     match WalletCore::new_update_chain_with_client(
         config_path,

@@ -1,6 +1,7 @@
 use std::{collections::BTreeMap, sync::Arc};
 
 use anyhow::Result;
+use sequencer_executor_actor::protocol::GetAccount;
 use wallet::WalletSequencerClient;
 
 use crate::{
@@ -17,10 +18,10 @@ use crate::{
 };
 
 #[derive(Clone)]
-pub struct SequencerServiceFFIWrapper(Arc<*const SequencerServiceFFI>);
+pub struct SequencerServiceFFIWrapper(pub Arc<SequencerServiceFFI>);
 
 impl SequencerServiceFFIWrapper {
-    pub fn wrap(sequencer: *const SequencerServiceFFI) -> Self {
+    pub fn wrap(sequencer: SequencerServiceFFI) -> Self {
         Self(Arc::new(sequencer))
     }
 }
@@ -31,15 +32,13 @@ impl WalletSequencerClient for SequencerServiceFFIWrapper {
     }
 
     async fn get_account(&self, account_id: lee::AccountId) -> Result<lee::Account> {
-        let res = unsafe { sequencer_ffi_query_account(*self.0, account_id.into()) };
-        if res.error.is_error() {
-            anyhow::bail!("Sequencer FFI error: {:?}", res.error);
-        }
-        let ffi_account = unsafe { *res.into_boxed().expect("Must be Success") };
-        let std_account = ffi_account
-            .try_into()
-            .map_err(|_| anyhow::anyhow!("Failed cast"))?;
-        Ok(std_account)
+        Ok(self.0
+            .executor_ref()
+            .ask(GetAccount {
+                account_id: account_id.into(),
+            })
+            .send()
+            .await?.account)
     }
 
     async fn get_account_balance(&self, account_id: lee::AccountId) -> Result<u128> {

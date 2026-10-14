@@ -293,6 +293,8 @@ pub unsafe extern "C" fn sequencer_ffi_query_account(
 
     let sequencer = unsafe { &*sequencer };
 
+    log::info!("################################# INSIDE SEQUENCER FFI: before block on");
+
     let acc_resp = sequencer.runtime().block_on(
         sequencer
             .executor_ref()
