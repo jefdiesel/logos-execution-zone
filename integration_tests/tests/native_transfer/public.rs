@@ -139,7 +139,12 @@ async fn a_foreign_recipient_named_by_its_public_key_receives_its_first_credit()
     let sender = ctx.existing_public_accounts()[0];
     let recipient_key = PublicKey::new_from_private_key(&lee::PrivateKey::try_new([77; 32])?);
     let recipient = AccountId::from(&recipient_key);
-    assert_eq!(get_account(&ctx, recipient).await?, lee::Account::default());
+    assert!(
+        ctx.sequencer_client()
+            .get_account(recipient)
+            .await?
+            .is_none()
+    );
 
     let command = Command::AuthTransfer(AuthTransferSubcommand::Send {
         from: public_mention(sender),
@@ -302,8 +307,12 @@ async fn fresh_account_cannot_pay_for_its_own_transaction() -> Result<()> {
     );
 
     log::info!("Checking the account was never touched");
-    let account = get_account(&ctx, account_id).await?;
-    assert_eq!(account, lee::Account::default());
+    assert!(
+        ctx.sequencer_client()
+            .get_account(account_id)
+            .await?
+            .is_none()
+    );
 
     Ok(())
 }

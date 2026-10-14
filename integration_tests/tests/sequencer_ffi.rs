@@ -14,13 +14,13 @@ use std::time::Duration;
 
 use anyhow::{Context as _, Result};
 use integration_tests::get_account;
-use lee::AccountId;
+use lee::{AccountId, Actor};
 use log::info;
 use logos_blockchain_key_management_system_service::keys::Ed25519Key;
 use logos_blockchain_zone_sdk::adapter::Node as _;
 use sequencer_ffi::api::types::{
     FfiOption,
-    transaction::{FfiTransaction, FfiTransactionKind},
+    transaction::{FfiActor, FfiTransaction, FfiTransactionKind},
 };
 use sequencer_service_rpc::RpcClient as _;
 use test_fixtures::config::bedrock_channel_id;
@@ -329,11 +329,17 @@ fn sequencer_ffi_acc_id_to_tx_map() -> Result<()> {
     );
 
     let owner_id_transactions =
-    // SAFETY: FFI ensures validity of value.
-    unsafe{ owner_id_transactions_res.value.read() };
+    // SAFETY: the vector stays allocated until it is freed below.
+    unsafe { owner_id_transactions_res.value.as_ref() }
+        .context("Transaction vec must be present")?;
 
-    // Which selector names the account is what the transaction is: the Stake
-    // that opened the record, or one of the block rewards that followed it.
+    // The root call is what the transaction is: the Stake that opened the
+    // record, or one of the block rewards that followed it.
+    let staking = Actor::new(owner_id, programs::sequencer_stake_account_id());
+    let fee_state = Actor::new(
+        system_accounts::fee_state_account_id(),
+        programs::fee_account_id(),
+    );
     let mut stake_txs = 0_usize;
     let mut reward_txs = 0_usize;
     for i in 0..owner_id_transactions.len {
@@ -341,15 +347,44 @@ fn sequencer_ffi_acc_id_to_tx_map() -> Result<()> {
         // SAFETY: `i` is below the vector's length.
         unsafe { owner_id_transactions.get(i) };
 
-        match owner_id_selector_position(owner_id_tx, *owner_id.value())? {
-            // Stake: ownership (the root), funds, funding, config.
-            Some(0) => stake_txs += 1,
-            // Fee distribution: fee state, escrow, inbox, producer payout.
-            Some(3) => reward_txs += 1,
-            position => anyhow::bail!(
-                "Transaction {i} names {owner_id} at selector {position:?}, which is neither the \
-                 Stake transaction nor a block reward"
-            ),
+        let (root, actors, message) = public_call(owner_id_tx)
+            .with_context(|| format!("Transaction {i} against {owner_id} is not public"))?;
+        anyhow::ensure!(
+            actors
+                .iter()
+                .any(|actor| AccountId::from(actor.account_id) == owner_id),
+            "Transaction {i} does not declare {owner_id}"
+        );
+
+        if root == staking {
+            let sequencer_stake_core::Message::Stake {
+                sequencer_key,
+                amount,
+                ..
+            } = borsh::from_slice(message)?
+            else {
+                anyhow::bail!("Transaction {i} sends {root:?} a message other than Stake");
+            };
+            anyhow::ensure!(
+                sequencer_key.to_bytes() == joining_sequencer_key.to_bytes()
+                    && amount == sequencer_ffi_helpers::FUNDING_BALANCE,
+                "Transaction {i} stakes {amount} for {sequencer_key:?}"
+            );
+            stake_txs += 1;
+        } else if root == fee_state {
+            let fee_core::Message::Distribute { producer, .. } = borsh::from_slice(message)? else {
+                anyhow::bail!("Transaction {i} sends {root:?} a message other than Distribute");
+            };
+            anyhow::ensure!(
+                producer == owner_id,
+                "Transaction {i} rewards {producer}, not {owner_id}"
+            );
+            reward_txs += 1;
+        } else {
+            anyhow::bail!(
+                "Transaction {i} against {owner_id} calls {root:?}, which is neither the Stake \
+                 transaction nor a block reward"
+            );
         }
     }
 
@@ -507,18 +542,22 @@ fn sequencer_ffi_starting_events_produced_correctly() -> Result<()> {
     Ok(())
 }
 
-/// Which declared public actor of `tx` names `account`, if any.
-fn owner_id_selector_position(tx: &FfiTransaction, account: [u8; 32]) -> Result<Option<usize>> {
+/// The root actor, declared actors and root message of a public `tx`, borrowed from the FFI.
+fn public_call(tx: &FfiTransaction) -> Option<(Actor, &[FfiActor], &[u8])> {
     let FfiTransactionKind::Public = tx.kind else {
-        return Err(anyhow::anyhow!("All owner_id transactions must be public"));
+        return None;
     };
 
-    let public_actors =
-        // SAFETY: the kind says the public body is the live union member.
-        unsafe { tx.body.public_body.read().message.public_context.actors };
+    let message =
+        // SAFETY: the kind says the public body is the live one, allocated as long as `tx`.
+        &unsafe { tx.body.public_body.as_ref() }?.message;
+    let (actors, root) = (&message.public_context.actors, &message.root);
 
-    Ok((0..public_actors.len).find(|&i| {
-        // SAFETY: `i` is below the vector's length.
-        unsafe { public_actors.get(i).account_id.data == account }
-    }))
+    Some((
+        root.to.into(),
+        // SAFETY: the FFI builds its vectors from `Vec`s, so `entries` holds `len` values.
+        unsafe { std::slice::from_raw_parts(actors.entries, actors.len) },
+        // SAFETY: as above.
+        unsafe { std::slice::from_raw_parts(root.message.entries, root.message.len) },
+    ))
 }

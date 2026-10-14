@@ -4,7 +4,7 @@
 )]
 
 use cucumber::{gherkin::Step, given};
-use lee::Account;
+use sequencer_service_rpc::RpcClient as _;
 
 use super::{
     super::log_step,
@@ -69,8 +69,12 @@ async fn ownership_account_is_unclaimed(world: &mut CucumberWorld, step: &Step) 
     log_step(step);
     let context = world.lez()?;
     let ownership_id = context.new_public_account().await?;
-    let account = get_account(context, ownership_id).await?;
-    if account != Account::default() {
+    let account = context
+        .sequencer_client()
+        .get_account(ownership_id)
+        .await
+        .map_err(StepError::query_failed)?;
+    if account.is_some() {
         return Err(StepError::AssertionFailed {
             message: "the ownership account does not start out fresh and unclaimed".to_owned(),
         });
