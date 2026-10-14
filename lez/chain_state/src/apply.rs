@@ -204,19 +204,18 @@ pub fn apply_block_to_state(
     }
 
     // The forced fee transaction must carry exactly the summary this block's
-    // settlement produced. Its reward target rides inside the tx (the account
-    // after the fixed fee accounts); the byte-compare pins the summary and tx
-    // shape. The producer chooses that account freely, like a coinbase output,
-    // but it must not be a restricted system account: the fee tx settles via the
-    // direct transition, bypassing the user-tx restricted-account guards, so
-    // without this floor a producer could credit the bridge and decouple its
-    // balance from L1 deposits.
-    let producer_account = common::transaction::fee_invocation_producer(fee_tx)
+    // settlement produced. Its reward target rides inside the tx; the
+    // byte-compare pins the summary and tx shape. The producer chooses that
+    // account freely, like a coinbase output, but it must not be a restricted
+    // system account: the fee tx settles via the direct transition, bypassing
+    // the user-tx restricted-account guards, so without this floor a producer
+    // could credit the bridge and decouple its balance from L1 deposits.
+    let payee = common::transaction::fee_invocation_payee(fee_tx)
         .ok_or(BlockIngestError::InvalidFeeTransaction)?;
-    if *fee_tx != fee_invocation(summary, block_payout(&opening, &summary), producer_account) {
+    if *fee_tx != fee_invocation(summary, block_payout(&opening, &summary), payee) {
         return Err(BlockIngestError::InvalidFeeTransaction);
     }
-    common::transaction::validate_reward_target(producer_account)
+    common::transaction::validate_reward_target(payee.producer())
         .map_err(|reason| BlockIngestError::InvalidRewardTarget { reason })?;
 
     let fee_events = state
@@ -276,7 +275,7 @@ pub fn opening_fee_state(state: &V03State) -> FeeState {
         state
             .get_account_by_id(system_accounts::fee_state_account_id())
             .data
-            .shard(system_accounts::fee_program_id()),
+            .actor_state(system_accounts::fee_program_id()),
     )
 }
 
@@ -356,7 +355,12 @@ pub fn settle_transaction(
                 }
             })?;
 
-            state.apply_state_diff(diff)
+            state
+                .apply_state_diff(diff)
+                .map_err(|err| BlockIngestError::StateTransition {
+                    tx_index,
+                    reason: format!("{:#}", anyhow::Error::from(err)),
+                })?
         }
         FeeClass::Charged(view) => settle_charged_transaction(
             transaction,
@@ -419,9 +423,9 @@ fn settle_charged_transaction(
     let reserve_msg = fee_reserve_invocation(payer, reserved);
     let payer_authorized = HashSet::from([payer]);
     let reserve_diff = lee::ValidatedStateDiff::from_fee_settlement_invocation(
-        reserve_msg.program_account_id,
-        &reserve_msg.shard_selectors,
-        &reserve_msg.instruction_data,
+        reserve_msg.execution.root.to,
+        &reserve_msg.execution.root.message,
+        &reserve_msg.public_context.actors,
         &payer_authorized,
         state,
         block_id,
@@ -429,7 +433,9 @@ fn settle_charged_transaction(
     )
     .map_err(|err| fee_validity(format!("fee reserve failed: {err}")))?;
     // Reserve is a fee-internal move; its events are not the user's.
-    drop(state.apply_state_diff(reserve_diff));
+    state
+        .apply_state_diff(reserve_diff)
+        .map_err(|err| fee_validity(format!("fee reserve failed: {err}")))?;
 
     // Phase 2: Action
     //
@@ -468,7 +474,9 @@ fn settle_charged_transaction(
         }
     })?;
     // The action's events are the transaction's user-facing events.
-    let action_events = state.apply_state_diff(action_diff);
+    let action_events = state
+        .apply_state_diff(action_diff)
+        .map_err(|err| fee_validity(format!("fee action failed: {err}")))?;
 
     // Phase 3: Refund
     //
@@ -484,9 +492,9 @@ fn settle_charged_transaction(
     if refund > 0 {
         let refund_msg = fee_refund_invocation(payer, refund);
         let refund_diff = lee::ValidatedStateDiff::from_fee_settlement_invocation(
-            refund_msg.program_account_id,
-            &refund_msg.shard_selectors,
-            &refund_msg.instruction_data,
+            refund_msg.execution.root.to,
+            &refund_msg.execution.root.message,
+            &refund_msg.public_context.actors,
             &HashSet::new(),
             state,
             block_id,
@@ -494,7 +502,9 @@ fn settle_charged_transaction(
         )
         .map_err(|err| fee_validity(format!("fee refund failed: {err}")))?;
         // Refund is a fee-internal move; its events are not the user's.
-        drop(state.apply_state_diff(refund_diff));
+        state
+            .apply_state_diff(refund_diff)
+            .map_err(|err| fee_validity(format!("fee refund failed: {err}")))?;
     }
 
     summary.revenue_base = summary
