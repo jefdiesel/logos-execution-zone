@@ -307,14 +307,10 @@ impl V03State {
     ) {
         let binary = risc0_binfmt::ProgramBinary::decode(program.elf())
             .expect("builtin program must be a valid ProgramBinary");
-        assert!(
-            binary.kernel_elf == risc0_zkos_v1compat::V1COMPAT_ELF,
-            "builtin program must be built with the protocol's default kernel"
-        );
-        let image_id: ProgramId = binary
-            .compute_image_id()
-            .expect("builtin program must have a computable image id")
-            .into();
+        let image_id: ProgramId =
+            risc0_binfmt::compute_image_id(&crate::program::attach_kernel(binary.user_elf))
+                .expect("builtin program must have a computable image id")
+                .into();
         assert_eq!(
             image_id,
             program.id(),
