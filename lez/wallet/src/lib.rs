@@ -2369,7 +2369,7 @@ mod tests {
             };
             served
                 .accounts
-                .insert(*segment, loader(segment_state.to_bytes()));
+                .insert(*segment, loader(segment_state.to_loader_actor_state()));
         }
         let header_state = ProgramHeader {
             image_id: program.id(),
@@ -2378,7 +2378,7 @@ mod tests {
         };
         served
             .accounts
-            .insert(header, loader(header_state.to_bytes()));
+            .insert(header, loader(header_state.to_loader_actor_state()));
         header
     }
 

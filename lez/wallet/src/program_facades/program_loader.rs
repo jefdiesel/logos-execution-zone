@@ -55,7 +55,7 @@ impl ProgramLoader<'_> {
                 .await
                 .map_err(ExecutionFailureKind::SequencerError)?
                 .unwrap_or_default();
-            if program_loader_core::ProgramSegment::from_bytes(
+            if program_loader_core::ProgramSegment::from_loader_actor_state(
                 next_segment_acc.data.actor_state(PROGRAM_LOADER_ACCOUNT_ID),
             )
             .is_none()
@@ -239,7 +239,7 @@ impl ProgramLoader<'_> {
         let Some(ProgramHeader {
             program_first_segment,
             ..
-        }) = ProgramHeader::from_bytes(header_state)
+        }) = ProgramHeader::from_loader_actor_state(header_state)
         else {
             return Ok(None);
         };
@@ -274,7 +274,7 @@ impl ProgramLoader<'_> {
                 .with_context(|| format!("failed to fetch segment account {id}"))?
                 .unwrap_or_default();
             let state = account.data.actor_state(PROGRAM_LOADER_ACCOUNT_ID).clone();
-            let segment = program_loader_core::ProgramSegment::from_bytes(&state)
+            let segment = program_loader_core::ProgramSegment::from_loader_actor_state(&state)
                 .with_context(|| format!("account {id} does not hold a valid program segment"))?;
             chain.push((id, state));
             next = segment.next_segment;

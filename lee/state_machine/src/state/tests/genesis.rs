@@ -65,7 +65,7 @@ fn genesis_immutable_program_lands_immutable_mirror_commitment() {
     let state = V03State::new().with_programs([crate::test_methods::scripted()]);
     let header_account_id =
         lee_core::account::AccountId::from_builtin_program(crate::test_methods::scripted().id());
-    let program_header = lee_core::program::ProgramHeader::from_bytes(
+    let program_header = lee_core::program::ProgramHeader::from_loader_actor_state(
         state.public_state[&header_account_id]
             .data
             .actor_state(PROGRAM_LOADER_ACCOUNT_ID),
@@ -84,7 +84,7 @@ fn genesis_mutable_program_lands_no_immutable_mirror_commitment() {
         V03State::new().with_genesis_programs([(crate::test_methods::forges_echo(), false)]);
     let header_account_id =
         lee_core::account::AccountId::from_builtin_program(crate::test_methods::forges_echo().id());
-    let program_header = lee_core::program::ProgramHeader::from_bytes(
+    let program_header = lee_core::program::ProgramHeader::from_loader_actor_state(
         state.public_state[&header_account_id]
             .data
             .actor_state(PROGRAM_LOADER_ACCOUNT_ID),

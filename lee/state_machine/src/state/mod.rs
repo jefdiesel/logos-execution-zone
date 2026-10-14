@@ -325,7 +325,7 @@ impl V03State {
                         bytecode: chunk.to_vec(),
                         next_segment: segment_account_ids.get(i.saturating_add(1)).copied(),
                     }
-                    .to_bytes(),
+                    .to_loader_actor_state(),
                 ),
             );
             self.public_state
@@ -339,7 +339,7 @@ impl V03State {
         };
         let header = Account::default().with_actor_state(
             PROGRAM_LOADER_ACCOUNT_ID,
-            ActorState::from(program_header.to_bytes()),
+            ActorState::from(program_header.to_loader_actor_state()),
         );
         self.public_state.insert_mut(header_account_id, header);
 
