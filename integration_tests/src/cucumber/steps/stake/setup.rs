@@ -10,7 +10,7 @@ use super::{
     super::log_step,
     helpers::{
         config_entry, first_configured_public_account, get_account, native_balance, stake_config,
-        stake_shard, submit_accepted_stake,
+        stake_state, submit_accepted_stake,
     },
 };
 use crate::cucumber::{
@@ -123,7 +123,7 @@ async fn stake_second_sequencer_key(world: &mut CucumberWorld, step: &Step) -> S
         timeout,
     )
     .await?;
-    if stake_shard(&get_account(context, second_ownership_id).await?).is_empty() {
+    if stake_state(&get_account(context, second_ownership_id).await?).is_empty() {
         return Err(StepError::AssertionFailed {
             message: "staking the second sequencer key did not claim its ownership account"
                 .to_owned(),

@@ -175,6 +175,7 @@ pub struct V03State {
 }
 
 #[derive(Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+#[cfg_attr(test, derive(Debug))]
 enum StoredPublication {
     Clear(MessageBody),
     Sealed(SealedMessage),
@@ -234,6 +235,7 @@ impl V03State {
     }
 
     /// Initializes state with given private accounts.
+    #[cfg(any(test, feature = "test-utils"))]
     #[must_use]
     pub fn with_private_accounts(
         mut self,
@@ -644,6 +646,18 @@ impl V03State {
         self.public_state.insert_mut(account_id, account);
     }
 
+    #[must_use]
+    pub fn with_empty_public_accounts(
+        mut self,
+        account_ids: impl IntoIterator<Item = AccountId>,
+    ) -> Self {
+        for account_id in account_ids {
+            if !self.public_state.contains_key(&account_id) {
+                self.public_state.insert_mut(account_id, Account::default());
+            }
+        }
+        self
+    }
 }
 
 /// The deterministic `AccountId` a genesis-seeded builtin's `index`-th segment lives at.

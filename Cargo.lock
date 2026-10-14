@@ -1517,6 +1517,7 @@ dependencies = [
  "serde",
  "serde_json",
  "system_accounts",
+ "test_guest_core",
  "test_methods",
  "testnet_initial_state",
  "thiserror 2.0.18",
@@ -4631,13 +4632,13 @@ dependencies = [
  "ping_core",
  "program_loader_core",
  "programs",
- "risc0-binfmt",
  "serde",
  "serde_json",
  "serde_with",
  "storage",
  "tempfile",
- "test_methods",
+ "test_guest_core",
+ "test_programs",
  "testnet_initial_state",
  "thiserror 2.0.18",
  "tokio",
@@ -4803,7 +4804,6 @@ dependencies = [
  "bytesize",
  "common",
  "cross_zone_inbox_core",
- "cross_zone_marker_core",
  "cross_zone_outbox_core",
  "cucumber",
  "fee_core",
@@ -4836,7 +4836,7 @@ dependencies = [
  "system_accounts",
  "tempfile",
  "test_fixtures",
- "test_methods",
+ "test_guest_core",
  "test_programs",
  "testing-framework",
  "testing-framework-app",
@@ -11177,6 +11177,7 @@ dependencies = [
  "serde_json",
  "system_accounts",
  "tempfile",
+ "test_guest_core",
  "test_programs",
  "testnet_initial_state",
  "thiserror 2.0.18",
@@ -12473,6 +12474,7 @@ version = "0.1.0"
 dependencies = [
  "borsh",
  "lee_core",
+ "risc0-zkvm",
 ]
 
 [[package]]
@@ -12496,7 +12498,6 @@ dependencies = [
 name = "test_program_guests"
 version = "0.1.0"
 dependencies = [
- "borsh",
  "clock_core",
  "lee_core",
  "risc0-zkvm",
@@ -13792,6 +13793,7 @@ dependencies = [
  "humantime-serde",
  "indicatif",
  "itertools 0.14.0",
+ "jsonrpsee",
  "key_protocol",
  "keycard_wallet",
  "lee",
@@ -13810,6 +13812,8 @@ dependencies = [
  "serde_json",
  "system_accounts",
  "tempfile",
+ "test_guest_core",
+ "test_programs",
  "testnet_initial_state",
  "thiserror 2.0.18",
  "tokio",

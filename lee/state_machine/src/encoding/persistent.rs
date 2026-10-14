@@ -112,6 +112,34 @@ mod tests {
     }
 
     #[test]
+    fn an_ordered_map_encodes_and_decodes_as_a_btree_map() {
+        let std: BTreeMap<u32, u64> = (0..100).map(|key| (key, u64::from(key))).collect();
+        let map: RedBlackTreeMapSync<u32, u64> = std.clone().into_iter().collect();
+
+        let bytes = encoded(|writer| serialize_ordered_map(&map, writer));
+        assert_eq!(bytes, borsh::to_vec(&std).unwrap());
+        assert_eq!(
+            deserialize_ordered_map::<u32, u64, _>(&mut bytes.as_slice()).unwrap(),
+            map
+        );
+    }
+
+    #[test]
+    fn an_ordered_map_refuses_repeated_or_unordered_keys() {
+        // A map's encoding with entries in exactly this order, which a `BTreeMap` would normalize.
+        let entries = |keys: [u32; 2]| {
+            borsh::to_vec(&Vec::from(keys.map(|key| (key, u64::from(key))))).unwrap()
+        };
+
+        for keys in [[1, 1], [2, 1]] {
+            assert!(
+                deserialize_ordered_map::<u32, u64, _>(&mut entries(keys).as_slice()).is_err(),
+                "{keys:?}"
+            );
+        }
+    }
+
+    #[test]
     fn a_set_encodes_and_decodes_as_a_hash_set() {
         let std: HashSet<u32> = (0..100).collect();
         let set: HashTrieSetSync<u32> = std.clone().into_iter().collect();

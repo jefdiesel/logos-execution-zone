@@ -651,37 +651,399 @@ fn signatures(
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        alloc::{GlobalAlloc, Layout, System},
+        cell::Cell,
+        collections::{BTreeMap, BTreeSet},
+    };
+
+    use ffi_types::FfiNonceEntry;
+    use lee::{
+        AccountId, Actor, BoundaryStep, Delivery, EphemeralPublicKey, FeeDeclaration,
+        MessageEnvelope, PublicExecutionContext, RootCall,
+    };
+    use lee_core::{
+        Commitment, EncryptedNote, SealedMessage, account::Nonce, encryption::Ciphertext,
+        program::PdaSeed,
+    };
+
     use super::*;
 
-    #[test]
-    fn public_transaction_fee_roundtrips_over_the_ffi() {
-        let tx = |fee| PublicTransaction {
+    thread_local! {
+        static LIVE_ALLOCATIONS: Cell<isize> = const { Cell::new(0) };
+    }
+
+    #[global_allocator]
+    static ALLOCATOR: CountingAllocator = CountingAllocator;
+
+    struct CountingAllocator;
+
+    unsafe impl GlobalAlloc for CountingAllocator {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            let ptr = unsafe { System.alloc(layout) };
+            if !ptr.is_null() {
+                count_allocations(1);
+            }
+            ptr
+        }
+
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            unsafe {
+                System.dealloc(ptr, layout);
+            }
+            count_allocations(-1);
+        }
+    }
+
+    fn count_allocations(delta: isize) {
+        LIVE_ALLOCATIONS.with(|live| live.set(live.get().saturating_add(delta)));
+    }
+
+    fn net_allocations(scenario: impl Fn()) -> isize {
+        scenario();
+        let before = LIVE_ALLOCATIONS.with(Cell::get);
+        scenario();
+        LIVE_ALLOCATIONS.with(Cell::get).saturating_sub(before)
+    }
+
+    fn account_id(tag: u8) -> AccountId {
+        AccountId::new([tag; 32])
+    }
+
+    fn actor(account_tag: u8, program_tag: u8) -> Actor {
+        Actor {
+            account_id: account_id(account_tag),
+            program_account_id: account_id(program_tag),
+        }
+    }
+
+    fn signer() -> PublicKey {
+        PublicKey::new_from_private_key(&lee::PrivateKey::try_new([1; 32]).expect("valid key"))
+    }
+
+    fn admission_evidence() -> Vec<PublicAccountEvidence> {
+        vec![
+            PublicAccountEvidence::Key(signer()),
+            PublicAccountEvidence::Pda {
+                program: account_id(2),
+                seed: PdaSeed::new([3; 32]),
+            },
+        ]
+    }
+
+    fn delivery(from: Actor, to: Actor, message: u8) -> Delivery<Actor> {
+        Delivery {
+            envelope: MessageEnvelope {
+                from,
+                to,
+                message: vec![message],
+            },
+            inherited_authorizations: BTreeSet::new(),
+            inherits_entry_authorizations: true,
+            pda_seeds: BTreeSet::new(),
+        }
+    }
+
+    fn public_transaction(fee: Option<FeeDeclaration>) -> PublicTransaction {
+        PublicTransaction {
             message: lee::public_transaction::Message {
-                program_account_id: AccountId::new([42; 32]),
-                shard_selectors: vec![ProgramShardSelector {
-                    account_id: AccountId::new([3; 32]),
-                    program_account_id: AccountId::new([42; 32]),
-                }],
-                nonces: vec![],
-                instruction_data: vec![9, 9],
-                fee,
+                admission_evidence: admission_evidence(),
+                ..lee::public_transaction::Message::new_preserialized(
+                    actor(4, 7),
+                    vec![8],
+                    [actor(5, 6)],
+                    BTreeMap::from([(account_id(9), Nonce(10))]),
+                    fee,
+                )
             },
             witness_set: lee::public_transaction::WitnessSet::from_raw_parts(vec![]),
-        };
+        }
+    }
 
+    fn private_transaction() -> PrivacyPreservingTransaction {
+        // A repeated send to one actor, and not a palindrome: a set would collapse the
+        // sequence and a reversal would show, and execution replays them in emission order.
+        let repeated = delivery(actor(3, 53), actor(4, 5), 6);
+        PrivacyPreservingTransaction {
+            message: lee::privacy_preserving_transaction::Message {
+                public_context: PublicExecutionContext {
+                    promotions: BTreeSet::from([21, 27]),
+                    ..PublicExecutionContext::default()
+                },
+                execution: ProvenExecution {
+                    boundary: vec![
+                        BoundaryStep::PrivateToPublic(repeated.clone()),
+                        BoundaryStep::PrivateToPublic(Delivery {
+                            inherited_authorizations: BTreeSet::from([account_id(14)]),
+                            pda_seeds: BTreeSet::from([PdaSeed::new([15; 32])]),
+                            ..delivery(actor(11, 61), actor(8, 9), 10)
+                        }),
+                        BoundaryStep::PrivateToPublic(delivery(actor(40, 90), actor(41, 42), 43)),
+                        BoundaryStep::PrivateToPublic(repeated),
+                        BoundaryStep::PublicToPrivate(Delivery {
+                            inherits_entry_authorizations: false,
+                            ..delivery(actor(16, 17), actor(18, 19), 20)
+                        }),
+                        BoundaryStep::EndPrivateSubtree,
+                        BoundaryStep::EndPublicSubtree,
+                    ],
+                    async_messages: vec![
+                        SealedMessage {
+                            commitment: Commitment::from_byte_array([22; 32]),
+                            note: EncryptedNote {
+                                epk: EphemeralPublicKey(vec![23; 2]),
+                                ciphertext: Ciphertext::from_inner(vec![24; 3]),
+                            },
+                        };
+                        2
+                    ],
+                    recovery_bindings: Vec::new(),
+                    public_root: Some(RootCall {
+                        to: actor(25, 26),
+                        message: vec![27; 2],
+                    }),
+                    private_actions: vec![],
+                    validity: ValidityWindows::new_unbounded(),
+                    program_image_claims: vec![],
+                },
+                nonces: BTreeMap::from([(account_id(28), Nonce(29))]),
+                admission_evidence: admission_evidence(),
+            },
+            witness_set: lee::privacy_preserving_transaction::WitnessSet::from_raw_parts(
+                vec![],
+                Proof::from_inner(vec![]),
+            ),
+        }
+    }
+
+    fn signed_public_body(corrupt: fn(&mut FfiPublicTransactionBody)) -> FfiPublicTransactionBody {
+        let mut body = FfiPublicTransactionBody::from(PublicTransaction {
+            witness_set: lee::public_transaction::WitnessSet::from_raw_parts(vec![(
+                Signature { value: [5; 64] },
+                signer(),
+            )]),
+            ..public_transaction(None)
+        });
+        corrupt(&mut body);
+        body
+    }
+
+    fn signed_private_body(
+        corrupt: fn(&mut FfiPrivateTransactionBody),
+    ) -> FfiPrivateTransactionBody {
+        let mut body = FfiPrivateTransactionBody::from(PrivacyPreservingTransaction {
+            witness_set: lee::privacy_preserving_transaction::WitnessSet::from_raw_parts(
+                vec![(Signature { value: [5; 64] }, signer())],
+                Proof::from_inner(vec![6; 8]),
+            ),
+            ..private_transaction()
+        });
+        corrupt(&mut body);
+        body
+    }
+
+    fn edit<T>(list: &mut FfiVec<T>, edit: impl FnOnce(&mut Vec<T>)) {
+        let mut entries = Vec::from(std::mem::replace(list, Vec::new().into()));
+        edit(&mut entries);
+        *list = entries.into();
+    }
+
+    fn duplicate_first_nonce(nonces: &mut Vec<FfiNonceEntry>) {
+        let duplicate = FfiNonceEntry {
+            account_id: nonces[0].account_id,
+            nonce: nonces[0].nonce,
+        };
+        nonces.push(duplicate);
+    }
+
+    fn invalidate_first_key(evidence: &mut [FfiPublicAccountEvidence]) {
+        evidence[0].key.data = [0xFF; 32];
+    }
+
+    fn invalidate_first_signer(witness_set: &mut [FfiSignaturePubKeyEntry]) {
+        witness_set[0].public_key.data = [0xFF; 32];
+    }
+
+    fn end_of_subtree_deliveries(
+        steps: &mut [FfiBoundaryStep],
+    ) -> impl Iterator<Item = &mut FfiDelivery> {
+        steps
+            .iter_mut()
+            .filter(|step| {
+                matches!(
+                    step.kind,
+                    FfiBoundaryStepKind::EndPrivateSubtree | FfiBoundaryStepKind::EndPublicSubtree
+                )
+            })
+            .map(|step| &mut step.delivery)
+    }
+
+    fn zero_inactive_payloads(body: &mut FfiPrivateTransactionBody) {
+        body.message.has_public_root = false;
+        drop(RootCall::from(std::mem::replace(
+            &mut body.message.public_root,
+            unsafe { std::mem::zeroed() },
+        )));
+        edit(&mut body.message.boundary, |steps| {
+            for slot in end_of_subtree_deliveries(steps) {
+                drop(Delivery::<Actor>::from(std::mem::replace(slot, unsafe {
+                    std::mem::zeroed()
+                })));
+            }
+        });
+    }
+
+    fn fill_inactive_payloads(body: &mut FfiPrivateTransactionBody) {
+        body.message.has_public_root = false;
+        edit(&mut body.message.boundary, |steps| {
+            for slot in end_of_subtree_deliveries(steps) {
+                let filled = Delivery {
+                    inherited_authorizations: BTreeSet::from([account_id(30)]),
+                    pda_seeds: BTreeSet::from([PdaSeed::new([31; 32])]),
+                    ..delivery(actor(32, 33), actor(34, 35), 36)
+                };
+                drop(Delivery::<Actor>::from(std::mem::replace(
+                    slot,
+                    filled.into(),
+                )));
+            }
+        });
+    }
+
+    fn free_public(body: FfiPublicTransactionBody) {
+        unsafe {
+            sequencer_ffi_free_ffi_transaction(FfiTransaction {
+                body: FfiTransactionBody {
+                    public_body: Box::into_raw(Box::new(body)),
+                    private_body: std::ptr::null_mut(),
+                },
+                kind: FfiTransactionKind::Public,
+            });
+        }
+    }
+
+    fn free_private(body: FfiPrivateTransactionBody) {
+        unsafe {
+            sequencer_ffi_free_ffi_transaction(FfiTransaction {
+                body: FfiTransactionBody {
+                    public_body: std::ptr::null_mut(),
+                    private_body: Box::into_raw(Box::new(body)),
+                },
+                kind: FfiTransactionKind::Private,
+            });
+        }
+    }
+
+    #[test]
+    fn both_program_image_claim_kinds_roundtrip_over_the_ffi() {
+        for claim in [
+            ProgramImageClaim::Disclosed {
+                account_id: account_id(1),
+                image_id: [2; 8],
+            },
+            ProgramImageClaim::Undisclosed { root: [3; 32] },
+        ] {
+            let ffi: FfiProgramImageClaim = claim.into();
+            assert_eq!(ProgramImageClaim::from(ffi), claim);
+        }
+    }
+
+    #[test]
+    fn public_transaction_message_fee_and_admission_evidence_roundtrip_over_the_ffi() {
         for fee in [
             None,
             Some(FeeDeclaration {
-                payer: AccountId::new([3; 32]),
+                payer: account_id(3),
                 gas_limit: 5,
                 tip: 1,
                 max_fee: 42,
             }),
         ] {
-            let original = tx(fee);
+            let original = public_transaction(fee);
+
             let ffi: FfiPublicTransactionBody = original.clone().into();
             let back: PublicTransaction = Box::new(ffi).try_into().unwrap();
-            assert_eq!(back.message.fee, original.message.fee);
+
+            assert_eq!(back.message, original.message);
+        }
+    }
+
+    #[test]
+    fn private_transaction_boundary_entry_and_admission_evidence_roundtrip_over_the_ffi() {
+        let original = private_transaction();
+
+        let ffi: FfiPrivateTransactionBody = original.clone().into();
+        let back: PrivacyPreservingTransaction = Box::new(ffi).try_into().unwrap();
+
+        assert_eq!(back.message, original.message);
+    }
+
+    #[test]
+    fn a_rejected_public_body_releases_every_buffer_whether_converted_or_freed() {
+        assert!(PublicTransaction::try_from(Box::new(signed_public_body(|_| {}))).is_ok());
+        let corruptions: [fn(&mut FfiPublicTransactionBody); 3] = [
+            |body| edit(&mut body.message.nonces, duplicate_first_nonce),
+            |body| {
+                edit(&mut body.message.admission_evidence, |e| {
+                    invalidate_first_key(e);
+                });
+            },
+            |body| edit(&mut body.witness_set, |w| invalidate_first_signer(w)),
+        ];
+        for corrupt in corruptions {
+            let converted = || {
+                assert!(
+                    PublicTransaction::try_from(Box::new(signed_public_body(corrupt))).is_err()
+                );
+            };
+            let freed = || free_public(signed_public_body(corrupt));
+            assert_eq!(net_allocations(converted), 0);
+            assert_eq!(net_allocations(freed), 0);
+        }
+    }
+
+    #[test]
+    fn a_rejected_private_body_releases_every_buffer_whether_converted_or_freed() {
+        assert!(
+            PrivacyPreservingTransaction::try_from(Box::new(signed_private_body(|_| {}))).is_ok()
+        );
+        let corruptions: [fn(&mut FfiPrivateTransactionBody); 4] = [
+            |body| body.message.block_validity_window = [5, 3],
+            |body| edit(&mut body.message.nonces, duplicate_first_nonce),
+            |body| {
+                edit(&mut body.message.admission_evidence, |e| {
+                    invalidate_first_key(e);
+                });
+            },
+            |body| edit(&mut body.witness_set, |w| invalidate_first_signer(w)),
+        ];
+        for corrupt in corruptions {
+            let converted = || {
+                assert!(
+                    PrivacyPreservingTransaction::try_from(Box::new(signed_private_body(corrupt)))
+                        .is_err()
+                );
+            };
+            let freed = || free_private(signed_private_body(corrupt));
+            assert_eq!(net_allocations(converted), 0);
+            assert_eq!(net_allocations(freed), 0);
+        }
+    }
+
+    #[test]
+    fn inactive_payloads_are_reclaimed_whether_zero_initialized_or_allocated() {
+        let shapes: [fn(&mut FfiPrivateTransactionBody); 2] =
+            [zero_inactive_payloads, fill_inactive_payloads];
+        for shape in shapes {
+            let converted = || {
+                let transaction =
+                    PrivacyPreservingTransaction::try_from(Box::new(signed_private_body(shape)))
+                        .unwrap();
+                assert_eq!(transaction.message.execution.public_root, None);
+            };
+            let freed = || free_private(signed_private_body(shape));
+            assert_eq!(net_allocations(converted), 0);
+            assert_eq!(net_allocations(freed), 0);
         }
     }
 }
