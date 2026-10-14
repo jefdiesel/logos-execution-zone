@@ -7,7 +7,7 @@ use lee::{
     program::{Program, load_program},
 };
 use lee_core::program::{PROGRAM_LOADER_ACCOUNT_ID, ProgramHeader};
-use program_loader_core::{MAX_PROGRAM_SEGMENTS, MAX_SEGMENT_DATA_LEN, Message};
+use program_loader_core::{MAX_PROGRAM_SEGMENTS, Message, build_segments};
 
 use crate::{AccountIdentity, ExecutionFailureKind, WalletCore};
 
@@ -117,7 +117,8 @@ impl ProgramLoader<'_> {
     }
 
     /// Chunks `bytecode` into `segments.len()` pieces (must match exactly — this never
-    /// auto-generates or drops segment accounts) and uploads them tail-to-head, one signed
+    /// auto-generates or drops segment accounts), checks the chain against the loader's segment
+    /// cap, and only then uploads them tail-to-head, one signed
     /// `WriteSegment` transaction per chunk, waiting for each to land before submitting the next
     /// (a `WriteSegment`'s optional `next_segment` `pre_state` must already exist on-chain). Then
     /// uploads `header` pointing at the resulting chain. Returns the header's `AccountId`. See
@@ -172,20 +173,14 @@ impl ProgramLoader<'_> {
         if binary.kernel_elf != risc0_zkos_v1compat::V1COMPAT_ELF {
             return Err(ExecutionFailureKind::UnsupportedKernelElf.into());
         }
-        let chunks: Vec<&[u8]> = binary.user_elf.chunks(MAX_SEGMENT_DATA_LEN).collect();
-        if chunks.len() != segments.len() {
-            return Err(ExecutionFailureKind::SegmentCountMismatch {
-                expected: chunks.len(),
-                actual: segments.len(),
-            }
-            .into());
-        }
+        // Refuse before uploading, so no paid segment is stranded.
+        let chain =
+            build_segments(binary.user_elf, segments).map_err(ExecutionFailureKind::from)?;
 
         // FIXME: Resume after a partial upload; retrying the same segments currently fails.
-        for i in (0..chunks.len()).rev() {
-            let next_segment = segments.get(i.saturating_add(1)).copied();
+        for (i, segment) in chain.into_iter().enumerate().rev() {
             let tx_hash = self
-                .write_segment(segments[i], chunks[i].to_vec(), next_segment, payer)
+                .write_segment(segments[i], segment.bytecode, segment.next_segment, payer)
                 .await
                 .with_context(|| format!("failed to upload segment {i}"))?;
             self.0

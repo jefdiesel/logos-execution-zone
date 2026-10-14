@@ -331,6 +331,58 @@ fn a_header_cannot_be_created_at_the_loader_address() {
     );
 }
 
+#[test]
+fn build_segments_links_each_chunk_to_the_next_id() {
+    let user_elf: Vec<u8> = (0..=u8::MAX)
+        .cycle()
+        .take(MAX_SEGMENT_DATA_LEN * 2 + 5)
+        .collect();
+    let ids = [
+        AccountId::new([1; 32]),
+        AccountId::new([2; 32]),
+        AccountId::new([3; 32]),
+    ];
+
+    let segments = build_segments(&user_elf, &ids).expect("valid chain");
+
+    let next: Vec<_> = segments
+        .iter()
+        .map(|segment| segment.next_segment)
+        .collect();
+    assert_eq!(next, vec![Some(ids[1]), Some(ids[2]), None]);
+    let rejoined: Vec<u8> = segments
+        .into_iter()
+        .flat_map(|segment| segment.bytecode)
+        .collect();
+    assert_eq!(rejoined, user_elf);
+}
+
+#[test]
+fn build_segments_rejects_a_segment_count_mismatch() {
+    let user_elf = vec![0; MAX_SEGMENT_DATA_LEN + 1];
+    assert_eq!(
+        build_segments(&user_elf, &[AccountId::new([1; 32])]),
+        Err(SegmentChainError::CountMismatch {
+            expected: 2,
+            actual: 1
+        })
+    );
+}
+
+/// Refused before upload, not at `CreateHeader` after every segment is paid for.
+#[test]
+fn build_segments_rejects_a_chain_over_the_segment_cap() {
+    let count = MAX_PROGRAM_SEGMENTS + 1;
+    let user_elf = vec![0; MAX_SEGMENT_DATA_LEN * count];
+    let ids: Vec<_> = (0..count)
+        .map(|i| AccountId::new([u8::try_from(i).unwrap(); 32]))
+        .collect();
+    assert_eq!(
+        build_segments(&user_elf, &ids),
+        Err(SegmentChainError::TooManySegments { count })
+    );
+}
+
 fn linked_header() -> ProgramHeader {
     ProgramHeader {
         image_id: [60, 0, 0, 0, 0, 0, 0, 0],

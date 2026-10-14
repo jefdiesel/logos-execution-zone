@@ -6,8 +6,8 @@ use lee_core::{
     MembershipProof, Nullifier, RecoveryBinding, SealedMessage, Timestamp,
     account::{Account, AccountId, ActorState},
     program::{
-        MessageBody, PROGRAM_LOADER_ACCOUNT_ID, ProgramHeader, ProgramId, ProgramSegment,
-        Publication, TransactionEvent, get_program_via, immutable_mirror_commitment,
+        MessageBody, PROGRAM_LOADER_ACCOUNT_ID, ProgramHeader, ProgramId, Publication,
+        TransactionEvent, get_program_via, immutable_mirror_commitment,
     },
 };
 use rpds::{HashTrieMapSync, HashTrieSetSync, RedBlackTreeMapSync, RedBlackTreeSetSync};
@@ -310,26 +310,19 @@ impl V03State {
             .user_elf
             .to_vec();
 
-        let chunks: Vec<&[u8]> = user_elf
-            .chunks(program_loader_core::MAX_SEGMENT_DATA_LEN)
-            .collect();
-        let segment_account_ids: Vec<AccountId> = (0..chunks.len())
-            .map(|i| genesis_segment_account_id(header_account_id, i))
-            .collect();
+        let segment_account_ids: Vec<AccountId> =
+            (0..program_loader_core::segment_count(&user_elf))
+                .map(|i| genesis_segment_account_id(header_account_id, i))
+                .collect();
+        let segments = program_loader_core::build_segments(&user_elf, &segment_account_ids)
+            .expect("builtin program must split into a valid segment chain");
 
-        for (i, chunk) in chunks.iter().enumerate() {
+        for (segment_account_id, segment) in segment_account_ids.iter().zip(segments) {
             let segment = Account::default().with_actor_state(
                 PROGRAM_LOADER_ACCOUNT_ID,
-                ActorState::from(
-                    ProgramSegment {
-                        bytecode: chunk.to_vec(),
-                        next_segment: segment_account_ids.get(i.saturating_add(1)).copied(),
-                    }
-                    .to_loader_actor_state(),
-                ),
+                ActorState::from(segment.to_loader_actor_state()),
             );
-            self.public_state
-                .insert_mut(segment_account_ids[i], segment);
+            self.public_state.insert_mut(*segment_account_id, segment);
         }
 
         let program_header = ProgramHeader {

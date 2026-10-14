@@ -45,6 +45,47 @@ pub enum Message {
     },
 }
 
+/// Why [`build_segments`] refused a program before any segment was uploaded.
+#[derive(Debug, thiserror::Error, Clone, Copy, PartialEq, Eq)]
+pub enum SegmentChainError {
+    #[error("Program bytecode splits into {expected} segment(s) but {actual} were supplied")]
+    CountMismatch { expected: usize, actual: usize },
+    #[error("Program needs {count} segments, over the {MAX_PROGRAM_SEGMENTS}-segment cap")]
+    TooManySegments { count: usize },
+}
+
+/// How many segments [`build_segments`] splits `user_elf` into.
+#[must_use]
+pub const fn segment_count(user_elf: &[u8]) -> usize {
+    user_elf.len().div_ceil(MAX_SEGMENT_DATA_LEN)
+}
+
+/// Splits `user_elf` into a segment chain written to `segment_ids`, each linking to the next.
+/// A deployer's pre-check.
+pub fn build_segments(
+    user_elf: &[u8],
+    segment_ids: &[AccountId],
+) -> Result<Vec<ProgramSegment>, SegmentChainError> {
+    let count = segment_count(user_elf);
+    if count != segment_ids.len() {
+        return Err(SegmentChainError::CountMismatch {
+            expected: count,
+            actual: segment_ids.len(),
+        });
+    }
+    if count > MAX_PROGRAM_SEGMENTS {
+        return Err(SegmentChainError::TooManySegments { count });
+    }
+    Ok(user_elf
+        .chunks(MAX_SEGMENT_DATA_LEN)
+        .enumerate()
+        .map(|(index, chunk)| ProgramSegment {
+            bytecode: chunk.to_vec(),
+            next_segment: segment_ids.get(index.saturating_add(1)).copied(),
+        })
+        .collect())
+}
+
 pub fn handle_message<'state>(
     input: &ReceiveInput,
     actor_state: impl Fn(AccountId) -> &'state ActorState,
