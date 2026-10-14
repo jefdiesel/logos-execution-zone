@@ -1205,8 +1205,10 @@ name = "bridge_core"
 version = "0.1.0"
 dependencies = [
  "borsh",
+ "lee",
  "lee_core",
  "risc0-zkvm",
+ "serde",
  "sha2 0.10.9",
 ]
 
@@ -2069,7 +2071,7 @@ dependencies = [
  "bridge_lock_core",
  "common",
  "cross_zone_inbox_core",
- "cross_zone_marker_core",
+ "cross_zone_outbox_core",
  "hex",
  "lee",
  "lee_core",
@@ -2105,6 +2107,7 @@ name = "cross_zone_inbox_core"
 version = "0.1.0"
 dependencies = [
  "borsh",
+ "cross_zone_marker_core",
  "lee_core",
  "risc0-zkvm",
  "serde",
@@ -2116,7 +2119,6 @@ version = "0.1.0"
 dependencies = [
  "borsh",
  "cross_zone_inbox_core",
- "cross_zone_marker_core",
  "lee_core",
 ]
 
@@ -2124,6 +2126,7 @@ dependencies = [
 name = "cross_zone_marker_core"
 version = "0.1.0"
 dependencies = [
+ "borsh",
  "lee_core",
  "risc0-zkvm",
 ]
@@ -3326,6 +3329,17 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 1.0.109",
+]
+
+[[package]]
+name = "ffi_types"
+version = "0.1.0"
+dependencies = [
+ "cbindgen",
+ "common",
+ "indexer_service_protocol",
+ "lee",
+ "lee_core",
 ]
 
 [[package]]
@@ -4636,10 +4650,12 @@ version = "0.1.0"
 dependencies = [
  "cbindgen",
  "env_logger",
+ "ffi_types",
  "futures",
  "indexer_core",
  "indexer_service_protocol",
  "lee",
+ "lee_core",
  "log",
  "serde_json",
  "tokio",
@@ -4766,7 +4782,6 @@ dependencies = [
  "indexer_service_rpc",
  "jsonrpsee",
  "lee",
- "lee_core",
  "programs",
  "sequencer_service_rpc",
  "serde",
@@ -5621,6 +5636,7 @@ dependencies = [
  "risc0-zkvm",
  "rpds",
  "semver",
+ "serde",
  "serde_with",
  "sha2 0.10.9",
  "test-case",
@@ -5635,7 +5651,6 @@ version = "0.1.0"
 dependencies = [
  "base58",
  "borsh",
- "bytesize",
  "chacha20",
  "derive_more",
  "ml-kem",
@@ -11124,6 +11139,7 @@ dependencies = [
  "anyhow",
  "borsh",
  "bridge_core",
+ "bridge_lock_core",
  "bytesize",
  "chain_state",
  "chrono",
@@ -11234,6 +11250,7 @@ dependencies = [
  "cbindgen",
  "common",
  "env_logger",
+ "ffi_types",
  "kameo",
  "lee",
  "lee_core",
@@ -11315,7 +11332,6 @@ dependencies = [
  "lee",
  "log",
  "metrics-exporter-prometheus",
- "programs",
  "sequencer_bedrock_actor",
  "sequencer_channel_config_actor",
  "sequencer_core",
@@ -11325,7 +11341,6 @@ dependencies = [
  "sequencer_slasher_actor",
  "sequencer_stake_core",
  "sequencer_storage_actor",
- "system_accounts",
  "tokio",
  "tokio-util",
  "wallet",
@@ -12699,11 +12714,13 @@ source = "git+https://github.com/logos-blockchain/logos-blockchain-testing.git?r
 name = "testnet_initial_state"
 version = "0.1.0"
 dependencies = [
+ "borsh",
  "fee_core",
  "key_protocol",
  "lee",
  "lee_core",
  "programs",
+ "rand 0.8.6",
  "serde",
  "system_accounts",
 ]
@@ -13763,6 +13780,7 @@ dependencies = [
  "async-stream",
  "bincode",
  "bip39",
+ "borsh",
  "bridge_core",
  "clap",
  "common",
@@ -13787,6 +13805,7 @@ dependencies = [
  "risc0-zkos-v1compat",
  "rpassword",
  "sequencer_service_rpc",
+ "sequencer_stake_core",
  "serde",
  "serde_json",
  "system_accounts",
