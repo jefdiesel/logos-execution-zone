@@ -925,6 +925,28 @@ impl WalletCore {
         Ok(latest_block_id)
     }
 
+    /// Rediscovers the private accounts this wallet's keys hold from genesis through the current
+    /// tip, keeping every other record, the sync cursor and the spent-nullifier cache. A failed
+    /// scan changes nothing.
+    pub async fn rescan_private_accounts(&mut self) -> Result<()> {
+        let tip = self
+            .get_last_block_id()
+            .await?
+            .max(self.storage.last_synced_block());
+        log::info!("Rescanning private accounts from genesis to block {tip}");
+        let poller = self.poller();
+        let rescanned = self
+            .storage
+            .key_chain()
+            .clone()
+            .rescan(tip, poller.poll_block_range(1..=tip))
+            .await?;
+        let unscanned = std::mem::replace(self.storage.key_chain_mut(), rescanned);
+        self.store_persistent_data().inspect_err(|_| {
+            *self.storage.key_chain_mut() = unscanned;
+        })
+    }
+
     pub async fn sync_to_block(&mut self, block_id: u64) -> Result<()> {
         use futures::TryStreamExt as _;
 
