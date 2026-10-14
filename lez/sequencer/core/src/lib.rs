@@ -2,6 +2,8 @@
 
 use std::{
     collections::{HashSet, VecDeque},
+    io::Write as _,
+    os::unix::fs::OpenOptionsExt as _,
     path::Path,
     sync::Arc,
     time::{Duration, Instant},
@@ -3103,7 +3105,17 @@ fn load_or_create_key_bytes(path: &Path) -> Result<[u8; ED25519_SECRET_KEY_SIZE]
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(path, key_bytes)?;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)?
+            .write_all(&key_bytes)?;
+        // A misplaced volume lands here too, silently becoming a new identity.
+        warn!(
+            "No key at {}, generated a new one. Expected only on first start",
+            path.display()
+        );
         Ok(key_bytes)
     }
 }
