@@ -41,11 +41,11 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{config::BedrockConfig, task_group::TaskGroup};
 
-/// LIB slots an unmined own tx waits before zone-sdk re-funds it (about an
-/// hour at 1s slots). The sdk default of 30 re-funds every pending entry each
+/// LIB slots an unmined own tx waits before zone-sdk re-funds it (5 minutes
+/// at 1s slots). The sdk default of 30 re-funds every pending entry each
 /// window, including the ones queued behind `max_pending_publish_depth` that
 /// were never posted, so a backlog churns its whole queue every few minutes.
-const STALE_REFUND_SLOTS: u64 = 3600;
+const STALE_REFUND_SLOTS: u64 = 300;
 
 /// Channel capacity for the publish inbox. One publish per produced block, drained
 /// in microseconds by the drive task — 32 is huge headroom and just provides
