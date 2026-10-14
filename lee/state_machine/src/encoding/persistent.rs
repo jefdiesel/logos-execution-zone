@@ -1,14 +1,14 @@
 //! Borsh encodings of the persistent collections the state is built on, byte-identical to the
-//! `HashMap`, `HashSet` and `Vec` each one replaced, so stored states keep decoding.
+//! `HashMap`, `HashSet`, `BTreeMap` and `Vec` each one replaced, so stored states keep decoding.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     hash::Hash,
     io::{Read, Result, Write},
 };
 
 use borsh::{BorshDeserialize, BorshSerialize};
-use rpds::{HashTrieMapSync, HashTrieSetSync, VectorSync};
+use rpds::{HashTrieMapSync, HashTrieSetSync, RedBlackTreeMapSync, VectorSync};
 
 pub fn serialize_map<K, V, W>(map: &HashTrieMapSync<K, V>, writer: &mut W) -> Result<()>
 where
@@ -28,6 +28,26 @@ where
     R: Read,
 {
     Ok(HashMap::<K, V>::deserialize_reader(reader)?
+        .into_iter()
+        .collect())
+}
+
+pub fn serialize_ordered_map<K, V, W>(map: &RedBlackTreeMapSync<K, V>, writer: &mut W) -> Result<()>
+where
+    K: BorshSerialize + Ord,
+    V: BorshSerialize,
+    W: Write,
+{
+    map.iter().collect::<Vec<(&K, &V)>>().serialize(writer)
+}
+
+pub fn deserialize_ordered_map<K, V, R>(reader: &mut R) -> Result<RedBlackTreeMapSync<K, V>>
+where
+    K: BorshDeserialize + Ord,
+    V: BorshDeserialize,
+    R: Read,
+{
+    Ok(BTreeMap::<K, V>::deserialize_reader(reader)?
         .into_iter()
         .collect())
 }
