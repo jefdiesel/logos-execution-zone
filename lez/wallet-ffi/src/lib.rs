@@ -48,6 +48,7 @@ pub mod generic_transaction;
 pub mod keys;
 pub mod label;
 pub mod pda;
+pub mod pending;
 pub mod program_deployment;
 pub mod sync;
 pub mod transfer;
@@ -91,6 +92,7 @@ pub(crate) fn map_execution_error(e: ExecutionFailureKind) -> FfiError {
         )) if error.message().contains("Incorrect fee") => FfiError::PayerCannotFund,
         ExecutionFailureKind::InsufficientFundsError => FfiError::InsufficientFunds,
         ExecutionFailureKind::KeyNotFoundError => FfiError::KeyNotFound,
+        ExecutionFailureKind::StorageError(_) => FfiError::StorageError,
         ExecutionFailureKind::SequencerError(_) | ExecutionFailureKind::SequencerClientError(_) => {
             FfiError::NetworkError
         }
@@ -101,6 +103,21 @@ pub(crate) fn map_execution_error(e: ExecutionFailureKind) -> FfiError {
 /// Reads a nullable `FfiBytes32` pointer as an optional `AccountId`.
 pub(crate) unsafe fn read_optional_account_id(ptr: *const FfiBytes32) -> Option<lee::AccountId> {
     (!ptr.is_null()).then(|| lee::AccountId::from(unsafe { *ptr }))
+}
+
+// The `size` entries at `data`, which may be null when there are none.
+pub(crate) unsafe fn list<'entries, T>(
+    data: *const T,
+    size: usize,
+) -> Result<&'entries [T], WalletFfiError> {
+    if size == 0 {
+        return Ok(&[]);
+    }
+    if data.is_null() {
+        print_error("Null pointer for a non-empty list");
+        return Err(WalletFfiError::NullPointer);
+    }
+    Ok(unsafe { std::slice::from_raw_parts(data, size) })
 }
 
 /// Helper to convert a C string to a Rust String.

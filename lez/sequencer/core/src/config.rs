@@ -7,6 +7,8 @@ use std::{
 };
 
 use anyhow::{Result, ensure};
+use bridge_core::BridgeAmount;
+pub use bridge_core::DepositRecipient;
 use bytesize::ByteSize;
 use common::config::BasicAuth;
 pub use cross_zone_inbox_core::{CrossZoneConfig, CrossZonePeer, CrossZoneRoute};
@@ -34,20 +36,26 @@ pub const MAX_PUBLISHABLE_BLOCK_SIZE: u64 =
 
 /// A transaction to be applied at genesis to supply initial balances.
 ///
-/// Amounts are `u64`, not [`lee::Balance`], because every one is funded through
-/// the bridge's `Deposit`, whose amount is `u64`.
+/// Amounts are [`BridgeAmount`], not [`lee::Balance`]: every one is funded through the bridge's
+/// `Deposit`, so it has the bridge's range, while the balance it credits stays a `Balance`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GenesisAction {
     SupplyAccount {
-        account_id: AccountId,
-        balance: u64,
+        recipient: DepositRecipient,
+        balance: BridgeAmount,
+    },
+    /// Credits a private address with a pending native credit, published under the recovery
+    /// binding the initial state pins for it; its owner receives it.
+    SupplyPrivateAccount {
+        address: AccountId,
+        balance: BridgeAmount,
     },
     /// Funds a holder's holding PDA at genesis with one replayable genesis
     /// credit; the balance-only PDA needs no claim.
     SupplyBridgeLockHolding {
         holder: AccountId,
-        amount: u64,
+        amount: BridgeAmount,
     },
     /// Stakes `sequencer_key` at genesis.
     StakeSequencer {

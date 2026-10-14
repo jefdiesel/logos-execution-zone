@@ -20,8 +20,6 @@ sequencer_bedrock_actor = { workspace = true, features = ["actor"] }
 lee = { workspace = true, optional = true }
 common = { workspace = true, optional = true }
 borsh = { workspace = true, optional = true }
-programs = { workspace = true, optional = true }
-system_accounts = { workspace = true, optional = true }
 wallet = { workspace = true, optional = true }
 sequencer_stake_core = { workspace = true, optional = true }
 
@@ -74,10 +72,4 @@ inscribe_garbage = [
   "dep:lee",
 ]
 # Needed only by the submit_stake bin.
-submit_stake = [
-  "dep:lee",
-  "programs",
-  "dep:system_accounts",
-  "dep:wallet",
-  "dep:sequencer_stake_core",
-]
+submit_stake = ["dep:lee", "dep:wallet", "dep:sequencer_stake_core"]
