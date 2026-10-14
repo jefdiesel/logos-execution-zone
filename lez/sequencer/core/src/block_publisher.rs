@@ -41,6 +41,12 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{config::BedrockConfig, task_group::TaskGroup};
 
+/// LIB slots an unmined own tx waits before zone-sdk re-funds it (about an
+/// hour at 1s slots). The sdk default of 30 re-funds every pending entry each
+/// window, including the ones queued behind `max_pending_publish_depth` that
+/// were never posted, so a backlog churns its whole queue every few minutes.
+const STALE_REFUND_SLOTS: u64 = 3600;
+
 /// Channel capacity for the publish inbox. One publish per produced block, drained
 /// in microseconds by the drive task — 32 is huge headroom and just provides
 /// backpressure if the drive task stalls (reconnect, long backfill).
@@ -183,6 +189,7 @@ impl BlockPublisherTrait for ZoneSdkPublisher {
 
         let zone_sdk_config = ZoneSdkSequencerConfig {
             resubmit_interval,
+            stale_refund_slots: STALE_REFUND_SLOTS,
             ..ZoneSdkSequencerConfig::new(FundingConfig {
                 funding_pk: config.funding_key,
                 // Withdraw change goes back to the funding key.
