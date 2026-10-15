@@ -142,11 +142,21 @@ fn state_serialization_roundtrip() {
     assert_eq!(state, state_from_bytes);
 }
 
+/// Only the user ELF is deployed, and it runs under the default kernel, so a builtin declared under
+/// another kernel's image id is refused.
 #[test]
-#[should_panic(expected = "builtin program must be built with the protocol's default kernel")]
+#[should_panic(expected = "builtin program's image id does not match its bytecode")]
 fn genesis_rejects_a_builtin_with_a_non_default_kernel() {
-    let elf = risc0_binfmt::ProgramBinary::new(b"user elf", b"some other kernel").encode();
-    let program = Program::new_unchecked([1; 8], elf.into());
+    let scripted = crate::test_methods::scripted();
+    let user_elf = risc0_binfmt::ProgramBinary::decode(scripted.elf())
+        .unwrap()
+        .user_elf;
+    let binary = risc0_binfmt::ProgramBinary::new(user_elf, user_elf);
+    let image_id = binary
+        .compute_image_id()
+        .expect("any ELF can stand in as a kernel")
+        .into();
+    let program = Program::new_unchecked(image_id, binary.encode().into());
     let _state = V03State::new().with_programs([program]);
 }
 
