@@ -247,7 +247,7 @@ fn system_registry(cross_zone: bool) -> (AccountId, Account) {
 /// name-derived, `image_id`-independent address. Not defaulted: every caller states the choice.
 #[must_use]
 pub fn initial_state(cross_zone: bool) -> V03State {
-    lee::V03State::new()
+    lee::GenesisBuilder::new()
         .with_public_accounts(initial_public_accounts())
         .with_public_accounts([system_registry(cross_zone)])
         .with_recovery_bindings(initial_recovery_bindings())
@@ -259,6 +259,7 @@ pub fn initial_state(cross_zone: bool) -> V03State {
                     |(name, program)| (AccountId::from_system_program_name(&name), program, false),
                 )),
         )
+        .build()
 }
 
 #[cfg(test)]
