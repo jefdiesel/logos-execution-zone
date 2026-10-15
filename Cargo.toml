@@ -182,16 +182,17 @@ schemars = "1.2"
 async-stream = "0.3.6"
 strum = { version = "0.28.0", features = ["derive"] }
 
-# 0.3.1 + zone-sdk fix for the re-mirror order panic (logos-blockchain#3824).
+# 0.3.1 + zone-sdk fixes for the re-mirror order panic (logos-blockchain#3824)
+# and re-funding mined txs at an unseen tip (logos-blockchain#3825).
 # Back to a tag once a release carries it.
-logos-blockchain-common-http-client = { git = "https://github.com/logos-blockchain/logos-blockchain.git", rev = "604cb561363c74a9ad791f6b4eb02efde22f79f4" }
-logos-blockchain-key-management-system-service = { git = "https://github.com/logos-blockchain/logos-blockchain.git", rev = "604cb561363c74a9ad791f6b4eb02efde22f79f4" }
-logos-blockchain-binary-codec = { git = "https://github.com/logos-blockchain/logos-blockchain.git", rev = "604cb561363c74a9ad791f6b4eb02efde22f79f4" }
-logos-blockchain-core = { git = "https://github.com/logos-blockchain/logos-blockchain.git", rev = "604cb561363c74a9ad791f6b4eb02efde22f79f4" }
-logos-blockchain-chain-broadcast-service = { git = "https://github.com/logos-blockchain/logos-blockchain.git", rev = "604cb561363c74a9ad791f6b4eb02efde22f79f4" }
-logos-blockchain-chain-service = { git = "https://github.com/logos-blockchain/logos-blockchain.git", rev = "604cb561363c74a9ad791f6b4eb02efde22f79f4" }
-logos-blockchain-zone-sdk = { git = "https://github.com/logos-blockchain/logos-blockchain.git", rev = "604cb561363c74a9ad791f6b4eb02efde22f79f4" }
-logos-blockchain-http-api-common = { git = "https://github.com/logos-blockchain/logos-blockchain.git", rev = "604cb561363c74a9ad791f6b4eb02efde22f79f4" }
+logos-blockchain-common-http-client = { git = "https://github.com/logos-blockchain/logos-blockchain.git", rev = "4a55133f74563de12f9ec3480e3a95a7bd2089c5" }
+logos-blockchain-key-management-system-service = { git = "https://github.com/logos-blockchain/logos-blockchain.git", rev = "4a55133f74563de12f9ec3480e3a95a7bd2089c5" }
+logos-blockchain-binary-codec = { git = "https://github.com/logos-blockchain/logos-blockchain.git", rev = "4a55133f74563de12f9ec3480e3a95a7bd2089c5" }
+logos-blockchain-core = { git = "https://github.com/logos-blockchain/logos-blockchain.git", rev = "4a55133f74563de12f9ec3480e3a95a7bd2089c5" }
+logos-blockchain-chain-broadcast-service = { git = "https://github.com/logos-blockchain/logos-blockchain.git", rev = "4a55133f74563de12f9ec3480e3a95a7bd2089c5" }
+logos-blockchain-chain-service = { git = "https://github.com/logos-blockchain/logos-blockchain.git", rev = "4a55133f74563de12f9ec3480e3a95a7bd2089c5" }
+logos-blockchain-zone-sdk = { git = "https://github.com/logos-blockchain/logos-blockchain.git", rev = "4a55133f74563de12f9ec3480e3a95a7bd2089c5" }
+logos-blockchain-http-api-common = { git = "https://github.com/logos-blockchain/logos-blockchain.git", rev = "4a55133f74563de12f9ec3480e3a95a7bd2089c5" }
 
 keycard-rs = { git = "https://github.com/keycard-tech/keycard-rs", rev = "9535a657ba04b1e6916de51777e22b4837c1a84d" }
 
