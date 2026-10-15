@@ -314,11 +314,14 @@ fn setup_sequencer_config() -> SequencerConfig {
 }
 
 #[test]
-fn only_the_cross_zone_inbox_and_fee_are_sequencer_only() {
+fn only_the_cross_zone_inbox_fee_and_system_upgrader_are_sequencer_only() {
     assert!(is_sequencer_only_program(
         programs::cross_zone_inbox_account_id()
     ));
     assert!(is_sequencer_only_program(programs::fee_account_id()));
+    assert!(is_sequencer_only_program(
+        programs::system_upgrader_account_id()
+    ));
     assert!(!is_sequencer_only_program(
         programs::cross_zone_outbox_account_id()
     ));
@@ -2647,6 +2650,41 @@ fn resubmittable_txs_drops_clock_and_bridge_deposits() {
     // The trailing clock tx and the sequencer-generated deposit are dropped;
     // user txs (withdrawals included) are returned.
     assert_eq!(resubmittable_txs(&block), vec![user_tx, withdraw_tx]);
+}
+
+/// An approved change can't be rebuilt, so a rewind returns it; the producer rebuilds `Apply`.
+#[test]
+fn resubmittable_txs_keeps_an_approved_system_change_and_drops_apply() {
+    let system_upgrader_tx = |message: &system_upgrader_core::Message| {
+        let registry = system_upgrader_core::registry_actor();
+        LeeTransaction::Public(PublicTransaction::new(
+            lee::public_transaction::Message::try_new(
+                registry,
+                [registry],
+                BTreeMap::new(),
+                message,
+            )
+            .unwrap(),
+            lee::public_transaction::WitnessSet::from_raw_parts(vec![]),
+        ))
+    };
+    let schedule = system_upgrader_tx(&system_upgrader_core::Message::Schedule {
+        name: programs::CLOCK_NAME,
+        first_segment: AccountId::new([1; 32]),
+        from_height: 5,
+    });
+    let apply = system_upgrader_tx(&system_upgrader_core::Message::Apply {
+        name: programs::CLOCK_NAME,
+        from_height: 5,
+    });
+
+    let block = common::test_utils::produce_dummy_block(
+        2,
+        Some(HashType([1; 32])),
+        vec![schedule.clone(), apply],
+    );
+
+    assert_eq!(resubmittable_txs(&block), vec![schedule]);
 }
 
 #[test]
@@ -6482,4 +6520,52 @@ async fn a_turn_on_a_view_with_a_hole_is_skipped() {
     assert_eq!(sequencer.chain_height().await, 1);
     assert_eq!(sequencer.chain().lock().await.pin(), pin);
     assert_eq!(sequencer.mempool.len(), 1, "the user transaction is kept");
+}
+
+#[test]
+fn a_due_system_upgrade_gets_an_apply() {
+    use lee_core::program::SYSTEM_UPGRADER_ACCOUNT_ID;
+    use system_upgrader_core::{
+        Registry, ScheduledUpgrade, loader_actor, registry_account_id, registry_actor,
+    };
+
+    let upgrade = ScheduledUpgrade {
+        first_segment: AccountId::new([0x51; 32]),
+        from_height: 5,
+    };
+    let genesis = testnet_initial_state::initial_state(false);
+    let mut registry = Registry::from_bytes(
+        genesis
+            .get_account_by_id(registry_account_id())
+            .data
+            .actor_state(SYSTEM_UPGRADER_ACCOUNT_ID),
+    )
+    .unwrap();
+    registry
+        .programs
+        .insert(programs::CLOCK_NAME, Some(upgrade));
+    let state = genesis.with_public_accounts([(
+        registry_account_id(),
+        lee::Account::default()
+            .with_actor_state(SYSTEM_UPGRADER_ACCOUNT_ID, registry.to_bytes().into()),
+    )]);
+
+    assert!(
+        super::build_upgrade_apply_txs(&state, 4).is_empty(),
+        "nothing is due before the upgrade's height"
+    );
+    let expected = LeeTransaction::Public(lee::PublicTransaction::new(
+        lee::public_transaction::Message::try_new(
+            registry_actor(),
+            [registry_actor(), loader_actor(&programs::CLOCK_NAME)],
+            BTreeMap::new(),
+            system_upgrader_core::Message::Apply {
+                name: programs::CLOCK_NAME,
+                from_height: 5,
+            },
+        )
+        .unwrap(),
+        lee::public_transaction::WitnessSet::from_raw_parts(vec![]),
+    ));
+    assert_eq!(super::build_upgrade_apply_txs(&state, 5), vec![expected]);
 }

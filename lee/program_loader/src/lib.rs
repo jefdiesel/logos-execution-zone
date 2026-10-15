@@ -6,9 +6,9 @@
 //!
 //! The loader is protocol code that runs only at public settlement: [`handle_message`] handles each
 //! message against the target's live loader actor state.
-use borsh::{BorshDeserialize, BorshSerialize};
 pub use lee_core::program::{
-    LoaderEntry, MAX_PROGRAM_SEGMENTS, ProgramHeader, ProgramSegment, immutable_mirror_commitment,
+    LoaderEntry, LoaderMessage as Message, MAX_PROGRAM_SEGMENTS, ProgramHeader, ProgramSegment,
+    immutable_mirror_commitment,
 };
 use lee_core::{
     Commitment,
@@ -21,29 +21,6 @@ use lee_core::{
 ///
 /// This is a client-side batching choice, not a limit enforced by the program.
 pub const MAX_SEGMENT_DATA_LEN: usize = 96 * 1024;
-
-/// Variants are append-only. Borsh encodes the variant as a leading tag byte, so inserting one
-/// ahead of `WriteSegment` shifts every existing encoding.
-#[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
-pub enum Message {
-    /// Writes a new segment to the target's empty loader actor state; the target must be
-    /// authorized.
-    ///
-    /// If `next_segment` is `Some`, that account must already hold a valid [`ProgramSegment`].
-    /// Segments are immutable and linked from tail to head.
-    WriteSegment {
-        bytecode: Vec<u8>,
-        next_segment: Option<AccountId>,
-    },
-    CreateHeader {
-        first_segment: AccountId,
-        immutable: bool,
-    },
-    UpdateHeader {
-        first_segment: AccountId,
-        immutable: bool,
-    },
-}
 
 /// Why [`build_segments`] refused a program before any segment was uploaded.
 #[derive(Debug, thiserror::Error, Clone, Copy, PartialEq, Eq)]

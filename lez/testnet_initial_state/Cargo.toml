@@ -17,6 +17,7 @@ lee.workspace = true
 lee_core.workspace = true
 system_accounts.workspace = true
 programs.workspace = true
+system_upgrader_core.workspace = true
 
 serde.workspace = true
 borsh.workspace = true

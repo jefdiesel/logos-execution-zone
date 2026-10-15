@@ -1727,6 +1727,8 @@ impl<S: StorageActorTrait, B: BedrockActorTrait> SequencerCore<S, B> {
         // record behind it and so needs no requeue, where the origin only says
         // it was not submitted by a user.
         let mut mempool_transactions = Vec::new();
+        // `system_upgrader` transactions handed to the node wait for the one slot before the fee.
+        let mut upgrade_candidates = Vec::new();
         let mut pending_from_store = pending_deposits;
         pending_from_store.extend(pending_dispatches);
         pending_from_store.extend(slash_txs);
@@ -1737,6 +1739,11 @@ impl<S: StorageActorTrait, B: BedrockActorTrait> SequencerCore<S, B> {
             .or_else(|| self.mempool.pop().map(|(origin, tx)| (origin, tx, false)))
         {
             let tx_hash = tx.hash();
+
+            if common::system_upgrades::is_system_upgrader_tx(&tx) {
+                upgrade_candidates.push((origin, tx));
+                continue;
+            }
 
             let temp_valid_transactions = [
                 valid_transactions.as_slice(),
@@ -1881,6 +1888,66 @@ impl<S: StorageActorTrait, B: BedrockActorTrait> SequencerCore<S, B> {
 
             if valid_transactions.len() >= self.sequencer_config.max_num_tx_in_block {
                 break;
+            }
+        }
+
+        // At most one `system_upgrader` transaction, directly before the fee: a due `Apply` first,
+        // then approved changes handed to the node, the first that fits and applies. Untried
+        // changes go back to the mempool.
+        let mut candidates = build_upgrade_apply_txs(&working_state, new_block_height)
+            .into_iter()
+            .map(|tx| (TransactionOrigin::Sequencer, tx))
+            .chain(upgrade_candidates)
+            .collect::<VecDeque<_>>();
+        while let Some((origin, tx)) = candidates.pop_front() {
+            let block_size = borsh::to_vec(&HashableBlockData {
+                block_id: new_block_height,
+                transactions: [
+                    valid_transactions.as_slice(),
+                    &[
+                        tx.clone(),
+                        placeholder_fee_lee_tx.clone(),
+                        clock_lee_tx.clone(),
+                    ],
+                ]
+                .concat(),
+                prev_block_hash,
+                timestamp: new_block_timestamp,
+            })
+            .context("Failed to serialize block for size check")?
+            .len();
+            if block_size > max_block_size {
+                warn!(
+                    "system_upgrader transaction {} deferred: block is full",
+                    tx.hash()
+                );
+                if !matches!(origin, TransactionOrigin::Sequencer) {
+                    self.mempool.push_front((origin, tx));
+                }
+                continue;
+            }
+            if Self::apply_mempool_transaction(
+                &mut working_state,
+                origin,
+                &tx,
+                new_block_height,
+                new_block_timestamp,
+                &mut withdrawals,
+                &opening,
+                valid_transactions.len().try_into().expect("fits u64"),
+                &mut summary,
+            ) {
+                if !matches!(origin, TransactionOrigin::Sequencer) {
+                    mempool_transactions.push((origin, tx.clone()));
+                }
+                valid_transactions.push(tx);
+                break;
+            }
+            warn!("system_upgrader transaction {} failed to apply", tx.hash());
+        }
+        for (origin, tx) in candidates {
+            if !matches!(origin, TransactionOrigin::Sequencer) {
+                self.mempool.push_front((origin, tx));
             }
         }
 
@@ -2802,11 +2869,13 @@ fn bridge_lock_holdings(
 /// The cross-zone inbox is injected solely by the watcher; a user-submitted call
 /// must be rejected at ingress, since `TransactionOrigin` is not carried in the
 /// block. The fee program is invoked solely by the forced per-block fee
-/// transaction.
+/// transaction. Every `system_upgrader` transaction is built or admitted by the
+/// producer.
 #[must_use]
 pub fn is_sequencer_only_program(program_account_id: AccountId) -> bool {
     cross_zone::is_sequencer_only_program(program_account_id)
         || program_account_id == programs::fee_account_id()
+        || program_account_id == system_upgrader_core::SYSTEM_UPGRADER_ACCOUNT_ID
 }
 
 /// Op id of the `index`-th genesis allocation.
@@ -2911,6 +2980,56 @@ fn build_bridge_deposit_tx_from_event(event: &PendingDepositEventRecord) -> Resu
     ))
 }
 
+/// An `Apply` for every registered system program whose scheduled upgrade is due by block
+/// `block_id`.
+fn build_upgrade_apply_txs(
+    state: &lee::V03State,
+    block_id: lee_core::BlockId,
+) -> Vec<LeeTransaction> {
+    common::system_upgrades::registry(state)
+        .programs
+        .into_iter()
+        .filter_map(|(name, upgrade)| {
+            let upgrade = upgrade.filter(|upgrade| upgrade.from_height <= block_id)?;
+            system_upgrader_tx(
+                [system_upgrader_core::loader_actor(&name)],
+                system_upgrader_core::Message::Apply {
+                    name,
+                    from_height: upgrade.from_height,
+                },
+            )
+            .map_err(|err| {
+                warn!(
+                    "Skipping the upgrade of system program {}: {err:#}",
+                    String::from_utf8_lossy(name.as_bytes()).trim_end_matches('\0')
+                );
+            })
+            .ok()
+        })
+        .collect()
+}
+
+/// An unsigned, fee-exempt `system_upgrader` transaction to its registry, also declaring
+/// `actors`.
+fn system_upgrader_tx(
+    actors: impl IntoIterator<Item = Actor>,
+    message: system_upgrader_core::Message,
+) -> Result<LeeTransaction> {
+    let registry = system_upgrader_core::registry_actor();
+    let message = Message::try_new(
+        registry,
+        std::iter::once(registry).chain(actors),
+        BTreeMap::new(),
+        message,
+    )
+    .context("Failed to build system_upgrader message")?;
+    let witness_set = lee::public_transaction::WitnessSet::from_raw_parts(vec![]);
+    Ok(LeeTransaction::Public(PublicTransaction::new(
+        message,
+        witness_set,
+    )))
+}
+
 /// A `FinalizeUnstake` for every release whose exit delay has passed in `state`.
 fn build_finalize_unstake_txs(state: &lee::V03State) -> VecDeque<LeeTransaction> {
     committee_discovery::finalize_unstake_candidates(state)
@@ -2959,16 +3078,32 @@ fn build_finalize_unstake_tx(
 /// User transactions of an orphaned block to return to the mempool: everything
 /// except the trailing clock tx, sequencer-generated bridge deposits (replayed
 /// from their own bedrock events) and sequencer-only txs — cross-zone dispatches
-/// (replayed by the watcher) and the fee tx (regenerated every block; the
-/// ingress guard rejects them as `User`).
+/// (replayed by the watcher), the fee tx (regenerated every block; the ingress
+/// guard rejects them as `User`) and `system_upgrader`'s `Apply` (rebuilt from
+/// the registry). An approved `system_upgrader` change can't be rebuilt, so it
+/// is returned.
 fn resubmittable_txs(block: &Block) -> Vec<LeeTransaction> {
     let Some((_clock, rest)) = block.body.transactions.split_last() else {
         return Vec::new();
     };
     rest.iter()
-        .filter(|tx| extract_bridge_deposit_id(tx).is_none() && !is_sequencer_only_tx(tx))
+        .filter(|tx| {
+            extract_bridge_deposit_id(tx).is_none()
+                && (!is_sequencer_only_tx(tx) || is_approved_system_change(tx))
+        })
         .cloned()
         .collect()
+}
+
+/// Whether `tx` is a `system_upgrader` change other than `Apply`.
+fn is_approved_system_change(tx: &LeeTransaction) -> bool {
+    common::system_upgrades::is_system_upgrader_tx(tx)
+        && tx.public_call().is_some_and(|(_, message)| {
+            !matches!(
+                borsh::from_slice(message),
+                Ok(system_upgrader_core::Message::Apply { .. }) | Err(_)
+            )
+        })
 }
 
 #[must_use]

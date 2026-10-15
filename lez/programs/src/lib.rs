@@ -12,7 +12,8 @@ mod inner {
         BRIDGE_ELF, BRIDGE_ID, BRIDGE_LOCK_ELF, BRIDGE_LOCK_ID, CLOCK_ELF, CLOCK_ID,
         CROSS_ZONE_INBOX_ELF, CROSS_ZONE_INBOX_ID, CROSS_ZONE_OUTBOX_ELF, CROSS_ZONE_OUTBOX_ID,
         FEE_ELF, FEE_ID, PING_RECEIVER_ELF, PING_RECEIVER_ID, PING_SENDER_ELF, PING_SENDER_ID,
-        SEQUENCER_STAKE_ELF, SEQUENCER_STAKE_ID, WRAPPED_TOKEN_ELF, WRAPPED_TOKEN_ID,
+        SEQUENCER_STAKE_ELF, SEQUENCER_STAKE_ID, SYSTEM_UPGRADER_ELF, SYSTEM_UPGRADER_ID,
+        WRAPPED_TOKEN_ELF, WRAPPED_TOKEN_ID,
     };
     use lee::program::Program;
 
@@ -29,6 +30,14 @@ mod inner {
     pub use ping_core::{PING_RECEIVER_NAME, PING_SENDER_NAME};
     pub use sequencer_stake_core::SEQUENCER_STAKE_NAME;
     pub use wrapped_token_core::WRAPPED_TOKEN_NAME;
+
+    #[must_use]
+    #[inline]
+    pub const fn system_upgrader() -> Program {
+        Program::new_unchecked(SYSTEM_UPGRADER_ID, Cow::Borrowed(SYSTEM_UPGRADER_ELF))
+    }
+
+    pub use system_upgrader_core::system_upgrader_account_id;
 
     #[must_use]
     #[inline]
@@ -115,6 +124,352 @@ mod inner {
         use lee::{Account, AccountId, Actor, PublicTransaction, V03State, public_transaction};
 
         use super::*;
+
+        mod system_upgrade {
+            use std::collections::BTreeMap;
+
+            use lee::{Account, AccountId, Actor, PublicTransaction, V03State, public_transaction};
+            use lee_core::program::{
+                LoaderMessage, PROGRAM_LOADER_ACCOUNT_ID, SYSTEM_UPGRADER_ACCOUNT_ID,
+                SystemProgramName,
+            };
+            use system_upgrader_core::{
+                Message, Registry, ScheduledUpgrade, loader_actor, registry_account_id,
+                registry_actor,
+            };
+
+            use super::super::*;
+
+            const FROM_HEIGHT: u64 = 5;
+
+            /// An unsigned transaction to the registry, as the producer builds it.
+            fn system_upgrader_tx(actors: &[Actor], message: &Message) -> PublicTransaction {
+                let message = public_transaction::Message::try_new(
+                    registry_actor(),
+                    std::iter::once(registry_actor()).chain(actors.iter().copied()),
+                    BTreeMap::new(),
+                    message,
+                )
+                .unwrap();
+                PublicTransaction::new(
+                    message,
+                    public_transaction::WitnessSet::from_raw_parts(vec![]),
+                )
+            }
+
+            /// `clock` deployed upgradable and registered, and `ping_receiver`'s code uploaded
+            /// as the new version's segment chain. Returns the chain's account ids.
+            fn staged() -> (V03State, Vec<AccountId>) {
+                staged_with([(clock_account_id(), clock(), false)])
+            }
+
+            /// `programs` deployed, `clock` registered, and the new chain uploaded.
+            fn staged_with(
+                programs: impl IntoIterator<Item = (AccountId, Program, bool)>,
+            ) -> (V03State, Vec<AccountId>) {
+                let new_code = ping_receiver();
+                let user_elf = risc0_binfmt::ProgramBinary::decode(new_code.elf())
+                    .unwrap()
+                    .user_elf
+                    .to_vec();
+                let ids: Vec<AccountId> = (0..program_loader_core::segment_count(&user_elf))
+                    .map(|i| AccountId::new([0x40_u8.wrapping_add(u8::try_from(i).unwrap()); 32]))
+                    .collect();
+                let segments = program_loader_core::build_segments(&user_elf, &ids).unwrap();
+                let registry = Registry {
+                    programs: BTreeMap::from([(CLOCK_NAME, None)]),
+                };
+                let state = V03State::new()
+                    .with_named_programs(
+                        std::iter::once((system_upgrader_account_id(), system_upgrader(), false))
+                            .chain(programs),
+                    )
+                    .with_public_accounts([(
+                        registry_account_id(),
+                        Account::default().with_actor_state(
+                            SYSTEM_UPGRADER_ACCOUNT_ID,
+                            registry.to_bytes().into(),
+                        ),
+                    )])
+                    .with_public_accounts(ids.iter().zip(segments).map(|(id, segment)| {
+                        (
+                            *id,
+                            Account::default().with_actor_state(
+                                PROGRAM_LOADER_ACCOUNT_ID,
+                                segment.to_loader_actor_state().into(),
+                            ),
+                        )
+                    }));
+                (state, ids)
+            }
+
+            fn schedule_tx(first_segment: AccountId) -> PublicTransaction {
+                schedule_tx_with(CLOCK_NAME, first_segment)
+            }
+
+            fn schedule_tx_with(
+                name: SystemProgramName,
+                first_segment: AccountId,
+            ) -> PublicTransaction {
+                system_upgrader_tx(
+                    &[],
+                    &Message::Schedule {
+                        name,
+                        first_segment,
+                        from_height: FROM_HEIGHT,
+                    },
+                )
+            }
+
+            fn apply_tx(from_height: u64) -> PublicTransaction {
+                system_upgrader_tx(
+                    &[loader_actor(&CLOCK_NAME)],
+                    &Message::Apply {
+                        name: CLOCK_NAME,
+                        from_height,
+                    },
+                )
+            }
+
+            fn registry(state: &V03State) -> Registry {
+                Registry::from_bytes(
+                    state
+                        .get_account_by_id(registry_account_id())
+                        .data
+                        .actor_state(SYSTEM_UPGRADER_ACCOUNT_ID),
+                )
+                .unwrap()
+            }
+
+            fn schedule(state: &V03State) -> Option<ScheduledUpgrade> {
+                registry(state).scheduled(&CLOCK_NAME)
+            }
+
+            fn scheduled_at(ids: &[AccountId]) -> Option<ScheduledUpgrade> {
+                Some(ScheduledUpgrade {
+                    first_segment: ids[0],
+                    from_height: FROM_HEIGHT,
+                })
+            }
+
+            #[test]
+            fn a_scheduled_upgrade_applies_from_its_height() {
+                let (mut state, ids) = staged();
+                assert_eq!(
+                    state.get_program_image_id(clock_account_id()),
+                    Some(clock().id())
+                );
+
+                state
+                    .transition_from_public_transaction(&schedule_tx(ids[0]), 1, 0)
+                    .expect("scheduling succeeds");
+                assert_eq!(schedule(&state), scheduled_at(&ids));
+
+                state
+                    .transition_from_public_transaction(&apply_tx(FROM_HEIGHT), FROM_HEIGHT - 1, 0)
+                    .expect_err("an upgrade can't apply before its height");
+
+                state
+                    .transition_from_public_transaction(&apply_tx(FROM_HEIGHT), FROM_HEIGHT, 0)
+                    .expect("the upgrade applies at its height");
+                assert_eq!(
+                    state.get_program_image_id(clock_account_id()),
+                    Some(ping_receiver().id())
+                );
+                assert_eq!(schedule(&state), None, "applying clears the schedule");
+            }
+
+            #[test]
+            fn scheduling_an_unregistered_system_program_is_refused() {
+                // Deployed at its name-derived address, but not in the registry.
+                let name = SystemProgramName::new(b"unregistered");
+                let (mut state, ids) = staged_with([
+                    (clock_account_id(), clock(), false),
+                    (AccountId::from_system_program_name(&name), fee(), false),
+                ]);
+                let err = state
+                    .transition_from_public_transaction(&schedule_tx_with(name, ids[0]), 1, 0)
+                    .expect_err("only registered system programs can be scheduled");
+                assert!(
+                    err.to_string().contains("system program is not registered"),
+                    "got: {err}"
+                );
+            }
+
+            #[test]
+            fn applying_to_a_system_program_without_a_header_is_refused() {
+                let (mut state, ids) = staged_with([]);
+                state
+                    .transition_from_public_transaction(&schedule_tx(ids[0]), 1, 0)
+                    .unwrap();
+
+                let err = state
+                    .transition_from_public_transaction(&apply_tx(FROM_HEIGHT), FROM_HEIGHT, 0)
+                    .expect_err("there is no clock header to upgrade");
+                assert!(
+                    err.to_string().contains("must already hold a valid header"),
+                    "got: {err}"
+                );
+                assert_eq!(schedule(&state), scheduled_at(&ids), "the schedule is kept");
+            }
+
+            #[test]
+            fn applying_to_an_immutable_system_program_is_refused() {
+                let (mut state, ids) = staged_with([(clock_account_id(), clock(), true)]);
+                state
+                    .transition_from_public_transaction(&schedule_tx(ids[0]), 1, 0)
+                    .unwrap();
+
+                let err = state
+                    .transition_from_public_transaction(&apply_tx(FROM_HEIGHT), FROM_HEIGHT, 0)
+                    .expect_err("an immutable system program can't be upgraded");
+                assert!(
+                    err.to_string().contains("immutable and cannot be updated"),
+                    "got: {err}"
+                );
+                assert_eq!(
+                    state.get_program_image_id(clock_account_id()),
+                    Some(clock().id())
+                );
+            }
+
+            /// `system_upgrader`'s header is mutable, but no signer or PDA can authorize its
+            /// address, so only a protocol upgrade can repoint it.
+            #[test]
+            fn system_upgrader_header_cannot_be_updated() {
+                let (mut state, ids) = staged();
+                let header_before = state.get_account_by_id(system_upgrader_account_id());
+                let signer = lee::PrivateKey::try_new([0x44; 32]).unwrap();
+                let signer_id = AccountId::from(&lee::PublicKey::new_from_private_key(&signer));
+                let header = Actor::new(system_upgrader_account_id(), PROGRAM_LOADER_ACCOUNT_ID);
+
+                let message = public_transaction::Message::try_new(
+                    header,
+                    [header],
+                    BTreeMap::from([(signer_id, lee_core::account::Nonce(0))]),
+                    LoaderMessage::UpdateHeader {
+                        first_segment: ids[0],
+                        immutable: false,
+                    },
+                )
+                .unwrap();
+                let witness_set = public_transaction::WitnessSet::for_message(&message, &[&signer]);
+                let err = state
+                    .transition_from_public_transaction(
+                        &PublicTransaction::new(message, witness_set),
+                        1,
+                        0,
+                    )
+                    .expect_err("nobody can authorize system_upgrader's header");
+                assert!(err.to_string().contains("must be authorized"), "got: {err}");
+                assert_eq!(
+                    state.get_account_by_id(system_upgrader_account_id()),
+                    header_before
+                );
+            }
+
+            #[test]
+            fn a_second_schedule_while_one_is_pending_is_refused() {
+                let (mut state, ids) = staged();
+                state
+                    .transition_from_public_transaction(&schedule_tx(ids[0]), 1, 0)
+                    .unwrap();
+
+                let err = state
+                    .transition_from_public_transaction(
+                        &schedule_tx(AccountId::new([0x77; 32])),
+                        2,
+                        0,
+                    )
+                    .expect_err("one upgrade may be pending at a time");
+                assert!(
+                    err.to_string()
+                        .contains("system program already has a scheduled upgrade"),
+                    "got: {err}"
+                );
+                assert_eq!(
+                    schedule(&state),
+                    scheduled_at(&ids),
+                    "the pending upgrade is kept"
+                );
+            }
+
+            #[test]
+            fn system_upgrader_refuses_a_message_from_another_actor() {
+                let (state, ids) = staged();
+                let sender = test_programs::scripted();
+                let sender_actor = Actor::new(
+                    AccountId::new([0x55; 32]),
+                    AccountId::from_builtin_program(sender.id()),
+                );
+                let mut state = state.with_programs([sender]);
+                state.force_insert_account(sender_actor.account_id, Account::default());
+
+                let script = test_guest_core::Script::default().send_sync(
+                    registry_actor(),
+                    &Message::Schedule {
+                        name: CLOCK_NAME,
+                        first_segment: ids[0],
+                        from_height: FROM_HEIGHT,
+                    },
+                );
+                let message = public_transaction::Message::try_new(
+                    sender_actor,
+                    [sender_actor, registry_actor()],
+                    BTreeMap::new(),
+                    script,
+                )
+                .unwrap();
+                let tx = PublicTransaction::new(
+                    message,
+                    public_transaction::WitnessSet::from_raw_parts(vec![]),
+                );
+
+                let err = state
+                    .transition_from_public_transaction(&tx, 1, 0)
+                    .expect_err("system_upgrader runs only at the top level");
+                assert!(
+                    err.to_string()
+                        .contains("system_upgrader may only be invoked at the top level"),
+                    "got: {err}"
+                );
+                assert_eq!(schedule(&state), None);
+            }
+
+            #[test]
+            fn an_unscheduled_upgrade_is_refused() {
+                let (mut state, _) = staged();
+
+                state
+                    .transition_from_public_transaction(&apply_tx(FROM_HEIGHT), FROM_HEIGHT, 0)
+                    .expect_err("nothing was scheduled");
+                assert_eq!(
+                    state.get_program_image_id(clock_account_id()),
+                    Some(clock().id())
+                );
+            }
+
+            #[test]
+            fn an_apply_for_another_height_is_refused() {
+                let (mut state, ids) = staged();
+                state
+                    .transition_from_public_transaction(&schedule_tx(ids[0]), 1, 0)
+                    .unwrap();
+
+                state
+                    .transition_from_public_transaction(
+                        &apply_tx(FROM_HEIGHT + 1),
+                        FROM_HEIGHT + 1,
+                        0,
+                    )
+                    .expect_err("the height differs from the scheduled one");
+                assert_eq!(
+                    state.get_program_image_id(clock_account_id()),
+                    Some(clock().id())
+                );
+                assert_eq!(schedule(&state), scheduled_at(&ids));
+            }
+        }
 
         fn deposit_tx(
             op_id: [u8; 32],
@@ -211,6 +566,7 @@ mod inner {
         #[test]
         fn builtin_program_ids_match_elfs() {
             let cases: &[(&[u8], [u32; 8])] = &[
+                (SYSTEM_UPGRADER_ELF, SYSTEM_UPGRADER_ID),
                 (CLOCK_ELF, CLOCK_ID),
                 (FEE_ELF, FEE_ID),
                 (BRIDGE_ELF, BRIDGE_ID),
