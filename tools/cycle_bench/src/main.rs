@@ -36,7 +36,7 @@ use clock_core::{
     CLOCK_01_PROGRAM_ACCOUNT_ID, CLOCK_10_PROGRAM_ACCOUNT_ID, CLOCK_50_PROGRAM_ACCOUNT_ID,
     ClockAccountData,
 };
-use cycle_bench::{ppe, stats::Stats};
+use cycle_bench::{ppe, stats::Stats, system_upgrader};
 use fee_core::{BlockFeeSummary, state::FeeState};
 use lee::program::Program;
 use lee_core::{
@@ -343,6 +343,16 @@ fn guest(program_account_id: AccountId) -> Option<(&'static str, Program)> {
         ("clock", programs::clock_account_id(), programs::clock()),
         ("fee", programs::fee_account_id(), programs::fee()),
         ("scripted", scripted_account_id(), test_programs::scripted()),
+        (
+            "system_upgrader",
+            programs::system_upgrader_account_id(),
+            programs::system_upgrader(),
+        ),
+        (
+            "sequencer_stake",
+            programs::sequencer_stake_account_id(),
+            programs::sequencer_stake(),
+        ),
     ]
     .into_iter()
     .find(|(_, account_id, _)| *account_id == program_account_id)
@@ -535,7 +545,25 @@ fn tick_case(label: &'static str, block_id: BlockId) -> Result<Case> {
     )
 }
 
-fn cases() -> Result<[Case; 7]> {
+/// `Schedule`'s guest work: `system_upgrader`'s and `sequencer_stake`'s approval checks.
+/// `Apply`'s chain walk runs natively in `program_loader`; the `system_upgrader` criterion bench
+/// times it.
+fn schedule_case(label: &'static str, committee_size: usize) -> Result<Case> {
+    let (actor_states, message) = system_upgrader::schedule_guest_input(committee_size);
+    Case::new(
+        label,
+        system_upgrader_core::registry_actor(),
+        actor_states
+            .into_iter()
+            .map(|(actor, data)| {
+                Fixture::new(actor.account_id, false, actor.program_account_id, data)
+            })
+            .collect(),
+        &message,
+    )
+}
+
+fn cases() -> Result<[Case; 12]> {
     Ok([
         tick_case("Tick (block_id+1, no multiples)", 1)?,
         tick_case("Tick (10-block rollup)", 10)?,
@@ -561,6 +589,11 @@ fn cases() -> Result<[Case; 7]> {
         )?,
         state_write_case("Write 4 KiB", 4 * 1024)?,
         state_write_case("Write 64 KiB", 64 * 1024)?,
+        schedule_case("Schedule (committee 2)", 2)?,
+        schedule_case("Schedule (committee 4)", 4)?,
+        schedule_case("Schedule (committee 7)", 7)?,
+        schedule_case("Schedule (committee 10)", 10)?,
+        schedule_case("Schedule (committee 20)", 20)?,
     ])
 }
 
