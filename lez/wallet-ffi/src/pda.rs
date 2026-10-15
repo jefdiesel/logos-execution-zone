@@ -1,8 +1,7 @@
 use lee::AccountId;
 
 use crate::{
-    error::WalletFfiError, FfiBytes32, FfiIdentifier, FfiNullifierPublicKey, FfiPdaSeed,
-    FfiPrivateAccountKeys,
+    error::WalletFfiError, FfiBytes32, FfiNullifierPublicKey, FfiPdaSeed, FfiPrivateAccountKeys,
 };
 
 /// Produce account id for public PDA.
@@ -32,7 +31,6 @@ pub extern "C" fn wallet_ffi_account_id_for_public_pda(
 ///   `wallet_ffi_get_private_account_keys`)
 /// - `viewing_public_key_len`: length of a `viewing_public_key` (can be obtained from
 ///   `wallet_ffi_get_private_account_keys`), must be `1184`
-/// - `identifier`: 32-byte opaque identifier
 /// - `account_id`: valid pointer to `FfiBytes32`
 ///
 /// # Returns
@@ -49,7 +47,6 @@ pub unsafe extern "C" fn wallet_ffi_account_id_for_private_pda(
     npk: FfiNullifierPublicKey,
     viewing_public_key: *const u8,
     viewing_public_key_len: usize,
-    identifier: FfiIdentifier,
     account_id: *mut FfiBytes32,
 ) -> WalletFfiError {
     if viewing_public_key.is_null() {
@@ -74,7 +71,6 @@ pub unsafe extern "C" fn wallet_ffi_account_id_for_private_pda(
             &pda_seed.into(),
             &ffi_private_keys.npk(),
             &vpk.unwrap(),
-            identifier.into(),
         )
         .into();
     }
@@ -111,10 +107,8 @@ mod tests {
         let pda_seed = PdaSeed::new([42; 32]);
         let vpk = ViewingPublicKey::from_bytes(vec![43; 1184]).unwrap();
         let npk = NullifierPublicKey([44; 32]);
-        let identifier = lee_core::Identifier::new([100; 32]);
 
-        let pda_id =
-            AccountId::for_private_pda(&program_account_id, &pda_seed, &npk, &vpk, identifier);
+        let pda_id = AccountId::for_private_pda(&program_account_id, &pda_seed, &npk, &vpk);
 
         let vpk_ptr = Box::into_raw(vpk.to_bytes().to_vec().into_boxed_slice()) as *const u8;
 
@@ -128,7 +122,6 @@ mod tests {
                 npk.into(),
                 vpk_ptr,
                 1184,
-                identifier.into(),
                 ffi_pda_id,
             )
         };

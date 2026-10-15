@@ -96,7 +96,7 @@ impl BedrockActor {
             channel_id,
             node_url,
             basic_auth,
-            bedrock_signing_key,
+            channel_signing_key,
             funding_pk,
             priority_fee_percent,
             resubmit_interval,
@@ -131,7 +131,7 @@ impl BedrockActor {
 
         let sequencer = ZoneSequencer::init_with_config(
             *channel_id,
-            bedrock_signing_key.clone(),
+            channel_signing_key.clone(),
             node.clone(),
             zone_sdk_config,
             initial_checkpoint,
@@ -374,7 +374,7 @@ impl Message<CreateChannel> for BedrockActor {
         }: CreateChannel,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        let own_key = self.config.bedrock_signing_key.public_key();
+        let own_key = self.config.channel_signing_key.public_key();
         if keys.first() != Some(&own_key) {
             return Err(Error::ChannelCreationRequiresOurKey);
         }
@@ -414,7 +414,7 @@ impl Message<CreateChannel> for BedrockActor {
 
         let signature = self
             .config
-            .bedrock_signing_key
+            .channel_signing_key
             .sign_payload(mantle_tx.hash().as_signing_bytes().as_ref());
 
         let mut op_proofs = OpProofs::from([OpProof::ChannelMultiSigProof(genesis_config_proof())]);
@@ -470,7 +470,7 @@ impl Message<PublishBlock> for BedrockActor {
                 parent,
                 signer: self
                     .config
-                    .bedrock_signing_key
+                    .channel_signing_key
                     .public_key()
                     .into_unverified(),
             };
@@ -483,7 +483,7 @@ impl Message<PublishBlock> for BedrockActor {
 
             let signature = self
                 .config
-                .bedrock_signing_key
+                .channel_signing_key
                 .sign_payload(mantle_tx.hash().as_signing_bytes().as_ref());
             let mut op_proofs = OpProofs::from([OpProof::Ed25519Sig(signature)]);
             if let Some(transfer_proof) = funded.transfer_proof {

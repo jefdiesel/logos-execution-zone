@@ -1,6 +1,5 @@
 use std::collections::BTreeMap;
 
-use bytesize::ByteSize;
 use common::transaction::LeeTransaction;
 use jsonrpsee::{
     core::async_trait,
@@ -11,31 +10,33 @@ use kameo::{
     error::{Infallible, SendError},
 };
 use log::{error, warn};
+use sequencer_core::gossip::MaxBlockSizeReceiver;
 use sequencer_executor_actor::ExecutorActorTrait;
 use sequencer_gossip_actor::protocol::PublishTransaction;
 use sequencer_service_protocol::{
-    Account, AccountId, Block, BlockId, ChannelId, Commitment, CommitmentSetDigest,
-    CrossZoneDeadLetter, CrossZoneDeadLetterReport, CrossZoneDeadLetterRequeue, FeeStateQuote,
-    HashType, MembershipProof, Nonce, ProgramId, ProgramShardSelector,
+    Account, AccountId, Actor, Block, BlockId, ChannelId, Commitment, CommitmentPosition,
+    CommitmentSetDigest, CrossZoneDeadLetter, CrossZoneDeadLetterReport,
+    CrossZoneDeadLetterRequeue, EncryptedNote, FeeStateQuote, HashType, MembershipProof, Nonce,
+    PageLimit, ProgramId, Publication,
 };
 
 pub struct Service<E: ExecutorActorTrait> {
     executor_ref: ActorRef<E>,
-    max_block_size: ByteSize,
+    max_block_size_rx: MaxBlockSizeReceiver,
     gossip: Option<Recipient<PublishTransaction>>,
 }
 
 impl<E: ExecutorActorTrait> Service<E> {
     pub fn new(
         executor_ref: ActorRef<E>,
-        max_block_size: ByteSize,
+        max_block_size_rx: MaxBlockSizeReceiver,
         gossip: Option<Recipient<PublishTransaction>>,
     ) -> Self {
         sequencer_rpc_server_actor_metrics::init();
 
         Self {
             executor_ref,
-            max_block_size,
+            max_block_size_rx,
             gossip,
         }
     }
@@ -55,8 +56,8 @@ impl<E: ExecutorActorTrait> sequencer_service_rpc::RpcServer for Service<E> {
                 u64::try_from(encoded_tx.len()).expect("Transaction size should fit in u64");
 
             let max_tx_size = self
-                .max_block_size
-                .as_u64()
+                .max_block_size_rx
+                .borrow()
                 .saturating_sub(sequencer_core::config::BLOCK_OVERHEAD);
 
             if tx_size > max_tx_size {
@@ -82,8 +83,8 @@ impl<E: ExecutorActorTrait> sequencer_service_rpc::RpcServer for Service<E> {
             // watcher; a user must not invoke them top-level, or anyone could forge
             // an inbound cross-zone delivery. Chained user calls are already rejected
             // by the inbox guest's caller-is-none assertion.
-            if let LeeTransaction::Public(public_tx) = &authenticated_tx
-                && sequencer_core::is_sequencer_only_program(public_tx.message().program_account_id)
+            if let Some((to, _)) = authenticated_tx.public_call()
+                && sequencer_core::is_sequencer_only_program(to.program_account_id)
             {
                 return Err(ErrorObjectOwned::owned(
                     ErrorCode::InvalidParams.code(),
@@ -202,26 +203,76 @@ impl<E: ExecutorActorTrait> sequencer_service_rpc::RpcServer for Service<E> {
 
     async fn get_account_view(
         &self,
-        shard_selector: ProgramShardSelector,
-    ) -> Result<Account, ErrorObjectOwned> {
+        actor_state_selector: Actor,
+    ) -> Result<Option<Account>, ErrorObjectOwned> {
         self.executor_ref
-            .ask(sequencer_executor_actor::protocol::GetAccountView { shard_selector })
+            .ask(sequencer_executor_actor::protocol::GetAccountView {
+                actor_state_selector,
+            })
             .await
             .map(|reply| reply.account)
+            .map_err(map_infallible_error)
+    }
+
+    async fn get_publications(
+        &self,
+        from_position: CommitmentPosition,
+        limit: PageLimit,
+    ) -> Result<Vec<(CommitmentPosition, Publication)>, ErrorObjectOwned> {
+        self.executor_ref
+            .ask(sequencer_executor_actor::protocol::GetPublications {
+                from_position,
+                limit,
+            })
+            .await
+            .map_err(map_infallible_error)
+    }
+
+    async fn get_message_path(
+        &self,
+        position: CommitmentPosition,
+    ) -> Result<Option<MembershipProof>, ErrorObjectOwned> {
+        self.executor_ref
+            .ask(sequencer_executor_actor::protocol::GetMessagePath { position })
+            .await
+            .map_err(map_infallible_error)
+    }
+
+    async fn get_recovery_binding(
+        &self,
+        address: AccountId,
+    ) -> Result<Option<EncryptedNote>, ErrorObjectOwned> {
+        self.executor_ref
+            .ask(sequencer_executor_actor::protocol::GetRecoveryBinding { address })
+            .await
             .map_err(map_infallible_error)
     }
 
     async fn get_proofs_and_root(
         &self,
         commitments: Vec<Commitment>,
-    ) -> Result<(Vec<Option<MembershipProof>>, CommitmentSetDigest), ErrorObjectOwned> {
+        message_position: Option<CommitmentPosition>,
+    ) -> Result<
+        (
+            Vec<Option<MembershipProof>>,
+            Option<MembershipProof>,
+            CommitmentSetDigest,
+        ),
+        ErrorObjectOwned,
+    > {
         self.executor_ref
-            .ask(sequencer_executor_actor::protocol::GetProofsAndRoot { commitments })
+            .ask(sequencer_executor_actor::protocol::GetProofsAndRoot {
+                commitments,
+                message_position,
+            })
             .await
             .map_err(map_infallible_error)
     }
 
-    async fn get_account(&self, account_id: AccountId) -> Result<Account, ErrorObjectOwned> {
+    async fn get_account(
+        &self,
+        account_id: AccountId,
+    ) -> Result<Option<Account>, ErrorObjectOwned> {
         self.executor_ref
             .ask(sequencer_executor_actor::protocol::GetAccount { account_id })
             .await

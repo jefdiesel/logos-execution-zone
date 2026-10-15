@@ -258,31 +258,30 @@ impl LezScenarioContext {
             .map_err(StepError::query_failed_boxed)
     }
 
-    /// Signs and submits a public transaction against an arbitrary program
-    /// through the scenario wallet, with the wallet picking the fee payer, if
-    /// any, from the signing accounts.
+    /// Signs and submits a public transaction delivering `message` to the actor of
+    /// `accounts[root]` through the scenario wallet, with the wallet picking the
+    /// fee payer, if any, from the signing accounts.
     pub async fn send_program_transaction(
         &self,
         accounts: Vec<wallet::AccountMention>,
-        instruction_data: lee_core::program::InstructionData,
-        program_id: lee::AccountId,
+        root: usize,
+        message: lee_core::program::MessageData,
     ) -> Result<HashType, StepError> {
-        self.send_program_transaction_paid_by(accounts, instruction_data, program_id, None)
+        self.send_program_transaction_paid_by(accounts, root, message, None)
             .await
     }
 
-    /// Signs and submits a public transaction against the program at
-    /// `program_account_id` through the scenario wallet, paid by `payer` if
-    /// given.
+    /// Signs and submits a public transaction delivering `message` to the actor of
+    /// `accounts[root]` through the scenario wallet, paid by `payer` if given.
     pub async fn send_program_transaction_paid_by(
         &self,
         accounts: Vec<wallet::AccountMention>,
-        instruction_data: lee_core::program::InstructionData,
-        program_account_id: AccountId,
+        root: usize,
+        message: lee_core::program::MessageData,
         payer: Option<AccountId>,
     ) -> Result<HashType, StepError> {
         self.wallet()
-            .send_program_transaction_paid_by(accounts, instruction_data, program_account_id, payer)
+            .send_program_transaction_paid_by(accounts, root, message, payer)
             .await
             .map_err(StepError::query_failed_boxed)
     }

@@ -1,8 +1,8 @@
 Feature: Stake instruction validation
 
-  # Node-level (L3) coverage of the instruction itself rather than the amount
-  # or the accounts: the bytes a Stake carries and the call path an
-  # instruction may arrive on. Every scenario runs against a deployed LEZ
+  # Node-level (L3) coverage of the message itself rather than the amount
+  # or the accounts: the bytes a Stake carries and the call path a
+  # message may arrive on. Every scenario runs against a deployed LEZ
   # stack through the scenario wallet and the sequencer's RPC API. The @P-NN
   # tags are stable case ids.
   #
@@ -14,7 +14,7 @@ Feature: Stake instruction validation
   # guests are not in the node's compiled-in program set. A deployed program is
   # addressed by the header account its deployment claims, not by its image id.
   #
-  # P-19 (a ConfirmStake chained from another program) has no target any more:
+  # P-19 (a ConfirmStake sent from another program) has no target any more:
   # Stake moves the funds natively and ConfirmStake is gone from the program.
 
   Background:
@@ -27,11 +27,12 @@ Feature: Stake instruction validation
 
   @stake_instruction_ci @P-17 @P1 @L3
   # In-program reason: "Stake is only invoked as a top-level user
-  # transaction". The stake_chain_caller test program forwards an otherwise
-  # well-formed Stake into sequencer_stake as a chained call, so the
-  # caller-is-none guard is the only assert that can reject it.
+  # transaction". The scripted test program relays an otherwise well-formed
+  # Stake to the ownership account's sequencer_stake actor, which sees the
+  # relay, not the transaction, as its sender, so the root-origin guard is the
+  # only assert that can reject it.
   #
-  # Unlike the other rejection scenarios, the top-level transaction targets the
+  # Unlike the other rejection scenarios, the transaction is delivered to the
   # test program, not sequencer_stake, so it is fee-charged rather than exempt.
   # A charged transaction whose execution fails is not dropped: it is included
   # with its fee kept and its effects reverted, advancing only the signers'
@@ -39,9 +40,9 @@ Feature: Stake instruction validation
   # apart from those nonces. A genesis supply account pays the fee, so the
   # funding account's balance stays put; the funds and config accounts do not
   # sign, so they are unchanged outright.
-  Scenario: Stake invoked as a chained call is rejected
-    Given the stake_chain_caller test program is deployed
-    When a Stake of "twice the minimum stake" is submitted as a chained call through the stake_chain_caller program
+  Scenario: Stake sent from another actor is rejected
+    Given the scripted test program is deployed
+    When a Stake of "twice the minimum stake" is sent from the scripted test program
     Then the stake transaction is included in a block
     And the ownership account is not claimed
     And the config has no entry for the sequencer key
@@ -51,15 +52,15 @@ Feature: Stake instruction validation
 
   @stake_instruction_ci @P-24 @P1 @L3
   # The borsh half mirrors sequencer_stake core's
-  # a_non_curve_point_is_not_a_sequencer_key; the instruction half is
+  # a_non_curve_point_is_not_a_sequencer_key; the message half is
   # the 🆕 path of the plan: an off-curve Stake never reaches the handler
-  # (the instruction decode panics inside the zkVM guest and surfaces as a
+  # (the message decode panics inside the zkVM guest and surfaces as a
   # program-execution failure).
   Scenario: SequencerKey accepts only Ed25519 curve points
     Given 32 bytes that are not an Ed25519 curve point
     Then the bytes are not decodable as a SequencerKey
     And a StakeRecord carrying the bytes fails to decode
-    And an Instruction carrying the bytes fails to deserialize
+    And a Stake message carrying the bytes fails to deserialize
     When a Stake carrying the off-curve key bytes is submitted
     Then the stake transaction is not included within the next 2 blocks
     And the config, funding and ownership accounts are unchanged

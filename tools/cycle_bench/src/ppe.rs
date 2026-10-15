@@ -2,9 +2,8 @@
 //!
 //! Composition cost is the delta between standalone `prover.prove(env, elf)` for
 //! a single program (measured in the main bench) and a full `execute_and_prove`
-//! that wraps the same program in the privacy circuit. Chained-call depth sweep
-//! uses the `chain_caller` test program, whose children execute the token program,
-//! with N=1, 3, 5, 9.
+//! that wraps the same program in the privacy circuit. The send-depth sweep uses a
+//! `scripted` test actor that sends N=1, 3, 5, 9 native transfers out of a private account.
 //!
 //! `Receipt::verify(PRIVACY_PRESERVING_CIRCUIT_ID)` timings (the `G_verify` fee-model
 //! parameter) are measured by the `verify` criterion bench under `benches/verify.rs`,
@@ -44,16 +43,16 @@ pub const fn run_all() -> Vec<PpeBenchResult> {
 pub fn run_all() -> Vec<PpeBenchResult> {
     let mut results = Vec::new();
 
-    // What `AccountManager::MAX_PRIVATE_ACCOUNTS` padding actually costs: a native transfer
-    // occupies 2 of the 7 slots, so a real wallet tx carries 5 dummies.
-    for count in [0_usize, 2, 3, 5, 7] {
+    // What `AccountManager::PADDED_PRIVATE_ACTIONS` padding actually costs: the transfer's private
+    // recipient takes 1 of the 7 actions, so a real wallet tx carries 6 dummies.
+    for count in [0_usize, 2, 3, 6] {
         eprintln!("PPE: running native Transfer with {count} dummy inputs");
         results.push(ppe_impl::run_native_transfer_with_dummies(count));
     }
 
     for depth in [1_u32, 3, 5, 9] {
-        eprintln!("PPE: running chain_caller to native Transfer depth={depth}");
-        results.push(ppe_impl::run_chain_caller(depth));
+        eprintln!("PPE: running scripted to native Transfer depth={depth}");
+        results.push(ppe_impl::run_scripted_transfers(depth));
     }
 
     results

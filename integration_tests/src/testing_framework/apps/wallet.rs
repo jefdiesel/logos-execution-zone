@@ -9,7 +9,7 @@ use anyhow::{Context as _, anyhow};
 use async_trait::async_trait;
 use common::HashType;
 use lee::{AccountId, PrivateKey, PublicKey, program::Program};
-use lee_core::program::InstructionData;
+use lee_core::program::MessageData;
 use program_loader_core::MAX_SEGMENT_DATA_LEN;
 use tempfile::TempDir;
 use testing_framework_app::{AppDeployment, AppHostEnv, DeployContext};
@@ -23,7 +23,9 @@ use wallet::{
         programs::native_token_transfer::AuthTransferSubcommand,
     },
     config::WalletConfigOverrides,
-    program_facades::{native_token_transfer::NativeTokenTransfer, program_loader::ProgramLoader},
+    program_facades::{
+        CreditDelivery, native_token_transfer::NativeTokenTransfer, program_loader::ProgramLoader,
+    },
 };
 
 use super::LezSequencerClient;
@@ -103,8 +105,8 @@ enum WalletRequest {
     },
     SendProgramTransaction {
         accounts: Vec<AccountMention>,
-        instruction_data: InstructionData,
-        program_account_id: AccountId,
+        root: usize,
+        message: MessageData,
         payer: Option<AccountId>,
         response: oneshot::Sender<Result<HashType, String>>,
     },
@@ -218,7 +220,7 @@ impl WalletActor {
                                         to_npk: None,
                                         to_vpk: None,
                                         to_keys: None,
-                                        to_identifier: Some(lee_core::Identifier::ZERO),
+                                        to_pk: None,
                                         amount,
                                     }),
                                 )
@@ -249,12 +251,14 @@ impl WalletActor {
                                 response,
                             } => {
                                 let result = NativeTokenTransfer(&components.wallet)
-                                    .send_public_transfer(
+                                    .transfer(
                                         AccountIdentity::Public(from),
                                         AccountIdentity::Public(to),
                                         amount,
+                                        CreditDelivery::Automatic,
                                     )
-                                    .await;
+                                    .await
+                                    .map(|(tx_hash, _)| tx_hash);
                                 let _unused = response.send(result);
                             }
                             WalletRequest::PrivateTransfer {
@@ -275,7 +279,7 @@ impl WalletActor {
                                         to_npk: None,
                                         to_vpk: None,
                                         to_keys: None,
-                                        to_identifier: Some(lee_core::Identifier::ZERO),
+                                        to_pk: None,
                                         amount,
                                     }),
                                 )
@@ -325,11 +329,12 @@ impl WalletActor {
                                 response,
                             } => {
                                 let result = async {
-                                    let tx_hash = NativeTokenTransfer(&components.wallet)
-                                        .send_public_transfer(
+                                    let (tx_hash, _) = NativeTokenTransfer(&components.wallet)
+                                        .transfer(
                                             AccountIdentity::Public(from),
                                             AccountIdentity::Public(to),
                                             amount,
+                                            CreditDelivery::Automatic,
                                         )
                                         .await
                                         .map_err(|error| anyhow!(error.to_string()))?;
@@ -381,7 +386,7 @@ impl WalletActor {
                                         to_npk: None,
                                         to_vpk: None,
                                         to_keys: None,
-                                        to_identifier: Some(lee_core::Identifier::ZERO),
+                                        to_pk: None,
                                         amount,
                                     }),
                                 )
@@ -407,19 +412,14 @@ impl WalletActor {
                             }
                             WalletRequest::SendProgramTransaction {
                                 accounts,
-                                instruction_data,
-                                program_account_id,
+                                root,
+                                message,
                                 payer,
                                 response,
                             } => {
                                 let result = components
                                     .wallet
-                                    .send_pub_tx_paid_by(
-                                        accounts,
-                                        instruction_data,
-                                        program_account_id,
-                                        payer,
-                                    )
+                                    .send_pub_tx_paid_by(accounts, root, message, payer)
                                     .await
                                     .map_err(|error| format!("{error:?}"));
                                 let _unused = response.send(result);
@@ -689,40 +689,41 @@ impl LezRuntime {
         .await
     }
 
-    /// Signs and submits a public transaction against an arbitrary program,
-    /// with the wallet picking the fee payer, if any, from the signing
-    /// accounts. See [`Self::send_program_transaction_paid_by`].
+    /// Signs and submits a public transaction delivering `message` to the actor
+    /// of `accounts[root]`, with the wallet picking the fee payer, if any, from
+    /// the signing accounts. See [`Self::send_program_transaction_paid_by`].
     pub async fn send_program_transaction(
         &self,
         accounts: Vec<AccountMention>,
-        instruction_data: InstructionData,
-        program_id: AccountId,
+        root: usize,
+        message: MessageData,
     ) -> Result<HashType, DynError> {
-        self.send_program_transaction_paid_by(accounts, instruction_data, program_id, None)
+        self.send_program_transaction_paid_by(accounts, root, message, None)
             .await
     }
 
-    /// Signs and submits a public transaction against the program at
-    /// `program_account_id`: a compiled-in program's account, or the header
-    /// account a runtime deployment claimed.
+    /// Signs and submits a public transaction delivering `message` to the actor
+    /// of `accounts[root]`: an account's actor state under a compiled-in
+    /// program's account, or under the header account a runtime deployment
+    /// claimed.
     ///
     /// `AccountIdentity::Public` entries are signed with the wallet's key for
     /// that account; `AccountIdentity::PublicNoSign` entries are carried as
-    /// unsigned pre-state accounts. `payer`, if given, covers the fee by
-    /// co-signing without joining the pre-state list. The returned hash only
+    /// unsigned declared accounts. `payer`, if given, covers the fee by
+    /// co-signing without joining the declared accounts. The returned hash only
     /// means the sequencer's mempool admitted the transaction; whether it
     /// executes is decided during block building.
     pub async fn send_program_transaction_paid_by(
         &self,
         accounts: Vec<AccountMention>,
-        instruction_data: InstructionData,
-        program_account_id: AccountId,
+        root: usize,
+        message: MessageData,
         payer: Option<AccountId>,
     ) -> Result<HashType, DynError> {
         self.request(|response| WalletRequest::SendProgramTransaction {
             accounts,
-            instruction_data,
-            program_account_id,
+            root,
+            message,
             payer,
             response,
         })

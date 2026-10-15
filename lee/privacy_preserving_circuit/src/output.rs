@@ -1,115 +1,85 @@
 use lee_core::{
-    Commitment, CommitmentSetDigest, DummyInput, EncryptedAccountData, EncryptionScheme,
-    EphemeralSecretKey, MembershipProof, Nullifier, NullifierSecretKey, NullifierWitness,
-    PrivacyPreservingCircuitOutput, PrivateAccountKind, PrivateAction, PrivateWitness,
-    ProgramImageClaim, SharedSecretKey, WitnessKind,
-    account::{Account, AccountId, Nonce},
-    compute_digest_for_path,
-    encryption::{ViewTag, ViewingPublicKey},
-    execution_state::{DeferPublicEffects, ExecutionOutcome},
+    Commitment, CommitmentSetDigest, DummyInput, DummyOutput, EncryptedNote, EncryptionScheme,
+    EphemeralSecretKey, ML_KEM_768_CIPHERTEXT_LEN, Nullifier, PrivacyPreservingCircuitOutput,
+    PrivateAction, PrivateWitness, ProgramImageClaim, ProvenExecution, RecipientEncryption,
+    RootCall, SharedSecretKey,
+    account::{Account, AccountData},
+    execution_state::{PrivatePartOutcome, PublicExecutionContext},
 };
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Each input is a distinct part of the journal; bundling would be artificial"
+)]
 pub fn compute_circuit_output(
-    outcome: ExecutionOutcome<DeferPublicEffects>,
+    outcome: PrivatePartOutcome,
+    public_context: PublicExecutionContext,
+    public_root: Option<RootCall>,
     private_witnesses: &[PrivateWitness],
+    message_spend: Option<((Nullifier, CommitmentSetDigest), DummyOutput)>,
     dummy_inputs: Vec<DummyInput>,
     ciphertext_padding: Option<u32>,
     program_image_claims: Vec<ProgramImageClaim>,
+    recoveries: &[RecipientEncryption],
+    message_seals: Vec<RecipientEncryption>,
 ) -> PrivacyPreservingCircuitOutput {
-    let ExecutionOutcome {
-        block_validity_window,
-        timestamp_validity_window,
-        public: public_actions,
+    let PrivatePartOutcome {
+        validity,
         mut private_accounts,
+        boundary,
+        async_messages,
     } = outcome;
-    let mut output = PrivacyPreservingCircuitOutput {
-        public_actions,
+    let async_messages =
+        lee_core::seal_messages(&async_messages, message_seals, ciphertext_padding)
+            .unwrap_or_else(|e| panic!("{e}"));
+    let mut output = ProvenExecution {
+        boundary,
+        async_messages,
+        recovery_bindings: recoveries
+            .iter()
+            .map(RecipientEncryption::bind_recovery)
+            .collect(),
+        public_root,
         private_actions: Vec::new(),
-        block_validity_window,
-        timestamp_validity_window,
+        validity,
         program_image_claims,
     };
 
-    // Emit one action per private account, covering all its shards.
+    // Emit one action per private account, covering all its actor states.
     for witness in private_witnesses {
-        let PrivateWitness {
-            vpk,
-            random_seed,
-            identifier,
-            kind,
-            nullifier,
-        } = witness;
-        let account_id = witness.account_id();
-        let post_data = private_accounts.remove(&account_id).expect(
-            "initialize admits only root witnesses and finish emits every root private account",
+        let post_data = private_accounts.remove(&witness.account_id()).expect(
+            "every witness is declared as a private account and the private part emits each one",
         );
-
-        let (new_nullifier, new_nonce, view_tag) = match nullifier {
-            NullifierWitness::Init {
-                npk,
-                commitment_root,
-            } => (
-                (
-                    Nullifier::for_account_initialization(&account_id),
-                    *commitment_root,
-                ),
-                Nonce::private_account_nonce_init(&account_id),
-                EncryptedAccountData::compute_view_tag(npk, vpk),
-            ),
-            NullifierWitness::Update {
-                account,
-                view_tag,
-                nsk,
-                membership_proof,
-            } => (
-                compute_update_nullifier_and_set_digest(
-                    membership_proof,
-                    account,
-                    &account_id,
-                    nsk,
-                ),
-                account.nonce.private_account_nonce_increment(nsk),
-                *view_tag,
-            ),
-        };
-
-        let account_kind = match kind {
-            WitnessKind::Regular { .. } => PrivateAccountKind::Regular(*identifier),
-            WitnessKind::Pda {
-                binding: (program, seed),
-            } => PrivateAccountKind::Pda {
-                account_id: *program,
-                seed: *seed,
-                identifier: *identifier,
-            },
-        };
-
-        emit_private_output(
-            &mut output,
-            &Account {
-                nonce: new_nonce,
-                data: post_data,
-            },
-            &account_id,
-            &account_kind,
-            view_tag,
-            vpk,
-            random_seed,
-            new_nullifier,
-            ciphertext_padding,
-        );
+        output
+            .private_actions
+            .push(private_action(witness, post_data, ciphertext_padding));
     }
 
-    for dummy in dummy_inputs {
-        emit_dummy_output(&mut output, dummy, ciphertext_padding);
+    // Pad the output with dummy commitment/nullifier pairs.
+    let padding = dummy_inputs.into_iter().map(|dummy| {
+        (
+            (
+                Nullifier::for_dummy(&dummy.nullifier_seed),
+                dummy.commitment_root,
+            ),
+            dummy.output,
+        )
+    });
+
+    // If a message is consumed, pad its nullifier with a dummy commitment.
+    for (spend, filler) in message_spend.into_iter().chain(padding) {
+        emit_dummy_output(&mut output, spend, filler, ciphertext_padding);
     }
 
     obfuscate_output_ordering(&mut output);
 
-    output
+    PrivacyPreservingCircuitOutput {
+        public_context,
+        execution: output,
+    }
 }
 
-fn obfuscate_output_ordering(output: &mut PrivacyPreservingCircuitOutput) {
+fn obfuscate_output_ordering(output: &mut ProvenExecution) {
     let mut commitments: Vec<_> = output
         .private_actions
         .iter()
@@ -127,21 +97,26 @@ fn obfuscate_output_ordering(output: &mut PrivacyPreservingCircuitOutput) {
 }
 
 fn emit_dummy_output(
-    output: &mut PrivacyPreservingCircuitOutput,
-    dummy: DummyInput,
+    output: &mut ProvenExecution,
+    (nullifier, root): (Nullifier, CommitmentSetDigest),
+    filler: DummyOutput,
     ciphertext_padding: Option<u32>,
 ) {
     if let Some(padding) = ciphertext_padding {
         assert!(
-            dummy.note.ciphertext.as_bytes().len()
+            filler.note.ciphertext.as_bytes().len()
                 >= usize::try_from(padding).expect("pad length fits in usize"),
             "Dummy note shorter than the requested ciphertext padding"
         );
     }
-    // Note: the nullifiers and commitments are generated from seeds.
+    assert_eq!(
+        filler.note.epk.0.len(),
+        ML_KEM_768_CIPHERTEXT_LEN,
+        "Dummy note encapsulation is not ML-KEM-768 ciphertext length"
+    );
+    // Note: the commitments, and the nullifiers of padding, are generated from seeds.
     // The prover is responsible for their randomness.
-    let nullifier = Nullifier::for_dummy(&dummy.nullifier_seed);
-    let commitment = Commitment::for_dummy(&nullifier, &dummy.commitment_seed);
+    let commitment = Commitment::for_dummy(&nullifier, &filler.commitment_seed);
     // Note: the encrypted post states are pushed as fed into the circuit.
     // That means that the prover is responsible for managing the randomness
     // so as to not reveal the padding.
@@ -150,79 +125,74 @@ fn emit_dummy_output(
     // explicitly as these are not uniformly random.
     output.private_actions.push(PrivateAction {
         nullifier,
-        root: dummy.commitment_root,
+        root,
         commitment,
-        encrypted_post_state: dummy.note,
+        encrypted_post_state: filler.note,
     });
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "Inputs are distinct concerns from the variant arms; bundling would be artificial"
-)]
-fn emit_private_output(
-    output: &mut PrivacyPreservingCircuitOutput,
-    post_state: &Account,
-    account_id: &AccountId,
-    kind: &PrivateAccountKind,
-    view_tag: ViewTag,
-    vpk: &ViewingPublicKey,
-    random_seed: &[u8; 32],
-    new_nullifier: (Nullifier, CommitmentSetDigest),
+/// Generate a private action given old and new account data.
+fn private_action(
+    witness: &PrivateWitness,
+    post_data: AccountData,
     ciphertext_padding: Option<u32>,
-) {
-    let commitment_post = Commitment::new(account_id, post_state);
+) -> PrivateAction {
+    let PrivateWitness {
+        vpk,
+        random_seed,
+        kind,
+        nullifier: _,
+        address_openings: _,
+    } = witness;
+    let account_id = witness.account_id();
+    let (nullifier, root, nonce) = witness
+        .transition()
+        .expect("a private account's membership proof must fit its path");
+    let post_state = Account {
+        nonce,
+        data: post_data,
+    };
+    let account_kind = kind.account_kind();
 
-    let esk = EphemeralSecretKey::new(account_id, random_seed, &post_state.nonce);
+    let esk = EphemeralSecretKey::new(&account_id, random_seed, &post_state.nonce);
     let (shared_secret, epk) = SharedSecretKey::encapsulate_deterministic(vpk, &esk);
 
     let encrypted_account = EncryptionScheme::encrypt(
-        post_state,
-        kind,
+        &post_state,
+        &account_kind,
         &shared_secret,
-        &new_nullifier.0,
+        &nullifier,
         ciphertext_padding,
     );
 
-    output.private_actions.push(PrivateAction {
-        nullifier: new_nullifier.0,
-        root: new_nullifier.1,
-        commitment: commitment_post,
-        encrypted_post_state: EncryptedAccountData {
+    PrivateAction {
+        nullifier,
+        root,
+        commitment: Commitment::new(&account_id, &post_state),
+        encrypted_post_state: EncryptedNote {
             ciphertext: encrypted_account,
             epk,
-            view_tag,
         },
-    });
-}
-
-fn compute_update_nullifier_and_set_digest(
-    membership_proof: &MembershipProof,
-    pre_account: &Account,
-    account_id: &AccountId,
-    nsk: &NullifierSecretKey,
-) -> (Nullifier, CommitmentSetDigest) {
-    let commitment_pre = Commitment::new(account_id, pre_account);
-    let set_digest = compute_digest_for_path(&commitment_pre, membership_proof);
-    let nullifier = Nullifier::for_account_update(&commitment_pre, nsk);
-    (nullifier, set_digest)
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::{BTreeSet, HashMap};
 
     use lee_core::{
-        AuthorizationSecretKey, DUMMY_COMMITMENT_HASH, EphemeralPublicKey, Identifier,
-        NullifierPublicKey, PublicAction,
-        account::{AccountData, ShardData},
-        program::{BlockValidityWindow, TimestampValidityWindow},
+        AuthorizationSecretKey, DUMMY_COMMITMENT_HASH, EphemeralPublicKey, NullifierPublicKey,
+        NullifierSecretKey, NullifierWitness, PrivateAccountKind, RegularKey, WitnessKind,
+        account::{AccountId, ActorState, Nonce},
+        encryption::ViewingPublicKey,
+        execution_state::Boundary,
+        program::ValidityWindows,
     };
 
     use super::*;
 
-    const SHARD_A: AccountId = AccountId::new([10; 32]);
-    const SHARD_B: AccountId = AccountId::new([11; 32]);
+    const ACTOR_STATE_A: AccountId = AccountId::new([10; 32]);
+    const ACTOR_STATE_B: AccountId = AccountId::new([11; 32]);
 
     struct Owner {
         ask: AuthorizationSecretKey,
@@ -251,7 +221,6 @@ mod tests {
             AccountId::for_regular_private_account(
                 &NullifierPublicKey::from(&self.nsk()),
                 &self.vpk(),
-                Identifier::ZERO,
             )
         }
 
@@ -259,16 +228,12 @@ mod tests {
             PrivateWitness {
                 vpk: self.vpk(),
                 random_seed: [0; 32],
-                identifier: Identifier::ZERO,
-                kind: WitnessKind::Regular {
-                    ask: Some(self.ask),
-                },
+                kind: WitnessKind::Regular(RegularKey::Authorized(self.ask)),
                 nullifier: NullifierWitness::Update {
                     account,
-                    view_tag: 0,
-                    nsk: self.nsk(),
                     membership_proof: (0, Vec::new()),
                 },
+                address_openings: BTreeSet::new(),
             }
         }
 
@@ -286,64 +251,149 @@ mod tests {
     }
 
     fn emit(
-        public_actions: Vec<PublicAction>,
         private: Vec<(AccountId, AccountData)>,
         witnesses: &[PrivateWitness],
+        message_spend: Option<((Nullifier, CommitmentSetDigest), DummyOutput)>,
+        dummy_inputs: Vec<DummyInput>,
     ) -> PrivacyPreservingCircuitOutput {
         compute_circuit_output(
-            ExecutionOutcome {
-                block_validity_window: BlockValidityWindow::new_unbounded(),
-                timestamp_validity_window: TimestampValidityWindow::new_unbounded(),
-                public: public_actions,
+            PrivatePartOutcome {
+                validity: ValidityWindows::new_unbounded(),
                 private_accounts: private.into_iter().collect(),
+                boundary: Boundary::default(),
+                async_messages: Vec::new(),
             },
-            witnesses,
-            Vec::new(),
+            PublicExecutionContext::default(),
             None,
+            witnesses,
+            message_spend,
+            dummy_inputs,
+            None,
+            Vec::new(),
+            &[],
             Vec::new(),
         )
     }
 
-    fn data(bytes: &[u8]) -> ShardData {
-        bytes.to_vec().try_into().expect("test data is small")
+    fn data(bytes: &[u8]) -> ActorState {
+        bytes.to_vec().into()
     }
 
     #[test]
-    fn one_note_per_private_account_carries_its_touched_shards() {
+    fn one_note_per_private_account_carries_its_touched_actor_states() {
         let owner = Owner::new(3);
         let account = Account {
             nonce: Nonce(7),
             ..Account::funded(100)
-                .with_shard(SHARD_A, data(b"a"))
-                .with_shard(SHARD_B, data(b"b"))
+                .with_actor_state(ACTOR_STATE_A, data(b"a"))
+                .with_actor_state(ACTOR_STATE_B, data(b"b"))
         };
         let rewritten = Account::funded(60)
             .data
-            .with_shard(SHARD_A, data(b"a"))
-            .with_shard(SHARD_B, data(b"b-rewritten"));
+            .with_actor_state(ACTOR_STATE_A, data(b"a"))
+            .with_actor_state(ACTOR_STATE_B, data(b"b-rewritten"));
 
         let output = emit(
-            Vec::new(),
             vec![(owner.account_id(), rewritten.clone())],
             &[owner.update_witness(account.clone())],
+            None,
+            Vec::new(),
         );
 
-        assert_eq!(output.private_actions.len(), 1, "one account, one note");
+        assert_eq!(
+            output.execution.private_actions.len(),
+            1,
+            "one account, one note"
+        );
         let expected = Account {
             nonce: account.nonce.private_account_nonce_increment(&owner.nsk()),
             data: rewritten,
         };
-        let action = &output.private_actions[0];
+        let action = &output.execution.private_actions[0];
         assert_eq!(
             owner.decrypt(action),
-            (
-                PrivateAccountKind::Regular(Identifier::ZERO),
-                expected.clone()
-            )
+            (PrivateAccountKind::Regular, expected.clone())
         );
         assert_eq!(
             action.commitment,
             Commitment::new(&owner.account_id(), &expected)
+        );
+    }
+
+    #[test]
+    fn a_received_message_is_spent_in_an_action_shaped_like_padding() {
+        let owner = Owner::new(3);
+        let account = Account::funded(100);
+        let private = || vec![(owner.account_id(), account.data.clone())];
+        let witnesses = [owner.update_witness(account.clone())];
+        let padding = |count: u8| {
+            (0..count)
+                .map(|tag| DummyInput {
+                    nullifier_seed: [tag; 32],
+                    commitment_root: [4; 32],
+                    output: DummyOutput {
+                        commitment_seed: [tag; 32],
+                        note: note(tag).encrypted_post_state,
+                    },
+                })
+                .collect()
+        };
+        let spend = (Nullifier::from_byte_array([5; 32]), [6; 32]);
+        let filler = DummyOutput {
+            commitment_seed: [7; 32],
+            note: note(7).encrypted_post_state,
+        };
+
+        let receipt = emit(
+            private(),
+            &witnesses,
+            Some((spend, filler.clone())),
+            padding(5),
+        );
+        let call = emit(private(), &witnesses, None, padding(6));
+
+        assert_eq!(
+            receipt.execution.private_actions.len(),
+            call.execution.private_actions.len()
+        );
+        assert!(
+            receipt
+                .execution
+                .private_actions
+                .is_sorted_by_key(|action| action.nullifier.to_byte_array())
+        );
+        let action = receipt
+            .execution
+            .private_actions
+            .iter()
+            .find(|action| action.nullifier == spend.0)
+            .expect("the message's nullifier is spent in one action");
+        assert_eq!(
+            (action.root, action.encrypted_post_state.clone()),
+            (spend.1, filler.note)
+        );
+        assert!(
+            receipt
+                .execution
+                .commitments()
+                .contains(&Commitment::for_dummy(&spend.0, &filler.commitment_seed))
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "Dummy note encapsulation is not ML-KEM-768 ciphertext length")]
+    fn a_dummy_note_whose_encapsulation_is_not_ml_kem_sized_is_refused() {
+        let mut filler = DummyOutput {
+            commitment_seed: [7; 32],
+            note: note(7).encrypted_post_state,
+        };
+        filler.note.epk.0.pop();
+
+        emit(
+            Vec::new(),
+            &[],
+            Some(((Nullifier::from_byte_array([5; 32]), [6; 32]), filler)),
+            Vec::new(),
         );
     }
 
@@ -352,7 +402,7 @@ mod tests {
         let commitment = Commitment::for_dummy(&nullifier, &[tag; 32]);
         let ciphertext = EncryptionScheme::encrypt(
             &Account::default(),
-            &PrivateAccountKind::Regular(Identifier::ZERO),
+            &PrivateAccountKind::Regular,
             &SharedSecretKey([0; 32]),
             &nullifier,
             None,
@@ -361,17 +411,16 @@ mod tests {
             nullifier,
             root: DUMMY_COMMITMENT_HASH,
             commitment,
-            encrypted_post_state: EncryptedAccountData {
+            encrypted_post_state: EncryptedNote {
                 ciphertext,
-                epk: EphemeralPublicKey(vec![tag]),
-                view_tag: 0,
+                epk: EphemeralPublicKey(vec![tag; ML_KEM_768_CIPHERTEXT_LEN]),
             },
         }
     }
 
     #[test]
     fn obfuscate_byte_sorts_commitments_and_nullifiers() {
-        let mut output = PrivacyPreservingCircuitOutput::default();
+        let mut output = ProvenExecution::default();
         for tag in 0..3 {
             output.private_actions.push(note(tag));
         }
@@ -392,7 +441,7 @@ mod tests {
 
     #[test]
     fn obfuscate_keeps_each_nullifier_with_its_ciphertext() {
-        let mut output = PrivacyPreservingCircuitOutput::default();
+        let mut output = ProvenExecution::default();
         for tag in 0..3 {
             output.private_actions.push(note(tag));
         }
