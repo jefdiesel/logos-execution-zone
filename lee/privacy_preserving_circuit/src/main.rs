@@ -1,9 +1,9 @@
 use std::collections::HashMap;
 
 use lee_core::{
-    PrivacyPreservingCircuitInput, ProgramImageWitness,
+    PrivacyPreservingCircuitInput, ProgramImageWitness, ProvingInput,
     account::AccountId,
-    execution_state::ExecutionState,
+    execution_state::{PrivatePart, TransactionEntry},
     native_token::NATIVE_TOKEN_PROGRAM_ID,
     program::{PROGRAM_LOADER_ACCOUNT_ID, ProgramId, read_input_frame},
 };
@@ -15,14 +15,24 @@ mod private_backend;
 
 fn main() {
     let PrivacyPreservingCircuitInput {
+        input,
+        program_image_witnesses,
+        shadow_program_witnesses,
+        responses,
+        sender_presentations,
+        message_seals,
+        predicted_cross_messages,
+    } = borsh::from_slice(&read_input_frame()).expect("circuit input must be valid borsh");
+    let public_root = input.public_root();
+    let ProvingInput {
         root,
+        public_context,
         private_witnesses,
         dummy_inputs,
         ciphertext_padding,
-        program_image_witnesses,
-        shadow_program_witnesses,
-        calls,
-    } = borsh::from_slice(&read_input_frame()).expect("circuit input must be valid borsh");
+        recoveries,
+        private_promotions,
+    } = input;
 
     // The sequencer checks disclosed images against chain state.
     // For undisclosed images, `to_claim` checks header immutability and derives the membership
@@ -47,10 +57,48 @@ fn main() {
         );
     }
 
-    let state =
-        ExecutionState::initialize(root, &private_witnesses).unwrap_or_else(|e| panic!("{e}"));
-    let mut backend = PrivateBackend::new(image_id_by_account_id, calls);
-    let outcome = state.run(&mut backend).unwrap_or_else(|e| panic!("{e}"));
+    // Extract the top-level message and whether it is a consumed async message.
+    let (root, message_spend) = match root {
+        TransactionEntry::Sync(call) => (TransactionEntry::Sync(call), None),
+        TransactionEntry::Async(witness) => {
+            let spend = witness
+                .spend(&private_witnesses)
+                .unwrap_or_else(|e| panic!("{e}"));
+            (
+                TransactionEntry::Async(witness.body),
+                Some((spend, witness.filler)),
+            )
+        }
+    };
+
+    // Generate the private part of the transaction.
+    let private_part = PrivatePart::new(
+        // Feed the public context assumed.
+        public_context.clone(),
+        // The top-level message.
+        root,
+        // All the private actor witnesses.
+        &private_witnesses,
+        // Assumed messages between private and public actors.
+        predicted_cross_messages,
+    )
+    .unwrap_or_else(|e| panic!("{e}"));
+
+    // Generate the backend to execute,
+    let mut backend = PrivateBackend::new(
+        image_id_by_account_id,
+        // Feed the precomputed actor responces.
+        responses,
+        // Feed the presentations of the hidden accounts.
+        sender_presentations,
+        // Feed which async messages will be processed synchronously.
+        private_promotions,
+    );
+
+    // Execute the private part of the transaction.
+    let outcome = private_part
+        .execute(&mut backend)
+        .unwrap_or_else(|e| panic!("{e}"));
     backend.finish();
 
     let program_image_claims = program_image_witnesses
@@ -61,10 +109,15 @@ fn main() {
 
     let output = output::compute_circuit_output(
         outcome,
+        public_context,
+        public_root,
         &private_witnesses,
+        message_spend,
         dummy_inputs,
         ciphertext_padding,
         program_image_claims,
+        &recoveries,
+        message_seals,
     );
 
     env::commit_slice(&lee_core::to_borsh_frame(&output));

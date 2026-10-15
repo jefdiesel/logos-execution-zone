@@ -114,10 +114,10 @@ _wallet() {
                         --to-label)
                             _wallet_complete_account_label "$cur"
                             ;;
-                        --to-npk | --to-vpk | --to-identifier | --amount)
+                        --to-npk | --to-vpk | --amount)
                             ;; # no specific completion
                         *)
-                            COMPREPLY=($(compgen -W "--from --from-label --to --to-label --to-npk --to-vpk --to-identifier --amount" -- "$cur"))
+                            COMPREPLY=($(compgen -W "--from --from-label --to --to-label --to-npk --to-vpk --amount" -- "$cur"))
                             ;;
                     esac
                     ;;

@@ -9,7 +9,7 @@ use anyhow::{Context as _, anyhow};
 use async_trait::async_trait;
 use common::HashType;
 use lee::{AccountId, PrivateKey, PublicKey};
-use lee_core::program::InstructionData;
+use lee_core::program::MessageData;
 use tempfile::TempDir;
 use testing_framework_app::{AppDeployment, AppHostEnv, DeployContext};
 use testing_framework_core::scenario::DynError;
@@ -22,7 +22,7 @@ use wallet::{
         programs::native_token_transfer::AuthTransferSubcommand,
     },
     config::WalletConfigOverrides,
-    program_facades::native_token_transfer::NativeTokenTransfer,
+    program_facades::{CreditDelivery, native_token_transfer::NativeTokenTransfer},
 };
 
 use super::LezSequencerClient;
@@ -102,8 +102,8 @@ enum WalletRequest {
     },
     SendProgramTransaction {
         accounts: Vec<AccountMention>,
-        instruction_data: InstructionData,
-        program_id: AccountId,
+        root: usize,
+        message: MessageData,
         response: oneshot::Sender<Result<HashType, String>>,
     },
     WalletPassword {
@@ -211,7 +211,7 @@ impl WalletActor {
                                         to_npk: None,
                                         to_vpk: None,
                                         to_keys: None,
-                                        to_identifier: Some(lee_core::Identifier::ZERO),
+                                        to_pk: None,
                                         amount,
                                     }),
                                 )
@@ -242,12 +242,14 @@ impl WalletActor {
                                 response,
                             } => {
                                 let result = NativeTokenTransfer(&components.wallet)
-                                    .send_public_transfer(
+                                    .transfer(
                                         AccountIdentity::Public(from),
                                         AccountIdentity::Public(to),
                                         amount,
+                                        CreditDelivery::Automatic,
                                     )
-                                    .await;
+                                    .await
+                                    .map(|(tx_hash, _)| tx_hash);
                                 let _unused = response.send(result);
                             }
                             WalletRequest::PrivateTransfer {
@@ -268,7 +270,7 @@ impl WalletActor {
                                         to_npk: None,
                                         to_vpk: None,
                                         to_keys: None,
-                                        to_identifier: Some(lee_core::Identifier::ZERO),
+                                        to_pk: None,
                                         amount,
                                     }),
                                 )
@@ -318,11 +320,12 @@ impl WalletActor {
                                 response,
                             } => {
                                 let result = async {
-                                    let tx_hash = NativeTokenTransfer(&components.wallet)
-                                        .send_public_transfer(
+                                    let (tx_hash, _) = NativeTokenTransfer(&components.wallet)
+                                        .transfer(
                                             AccountIdentity::Public(from),
                                             AccountIdentity::Public(to),
                                             amount,
+                                            CreditDelivery::Automatic,
                                         )
                                         .await
                                         .map_err(|error| anyhow!(error.to_string()))?;
@@ -374,7 +377,7 @@ impl WalletActor {
                                         to_npk: None,
                                         to_vpk: None,
                                         to_keys: None,
-                                        to_identifier: Some(lee_core::Identifier::ZERO),
+                                        to_pk: None,
                                         amount,
                                     }),
                                 )
@@ -400,13 +403,13 @@ impl WalletActor {
                             }
                             WalletRequest::SendProgramTransaction {
                                 accounts,
-                                instruction_data,
-                                program_id,
+                                root,
+                                message,
                                 response,
                             } => {
                                 let result = components
                                     .wallet
-                                    .send_pub_tx(accounts, instruction_data, program_id)
+                                    .send_pub_tx(accounts, root, message)
                                     .await
                                     .map_err(|error| format!("{error:?}"));
                                 let _unused = response.send(result);
@@ -643,13 +646,13 @@ impl LezRuntime {
     pub async fn send_program_transaction(
         &self,
         accounts: Vec<AccountMention>,
-        instruction_data: InstructionData,
-        program_id: AccountId,
+        root: usize,
+        message: MessageData,
     ) -> Result<HashType, DynError> {
         self.request(|response| WalletRequest::SendProgramTransaction {
             accounts,
-            instruction_data,
-            program_id,
+            root,
+            message,
             response,
         })
         .await

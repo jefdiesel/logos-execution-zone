@@ -4,82 +4,87 @@
 //! Three accounts are maintained, updated at different block intervals (every 1, 10, and 50
 //! blocks), allowing programs to read recent timestamps at various granularities.
 //!
-//! Only the sequencer may invoke this program, as the last transaction in every block.
-//! Each clock account uses this program's shard.
+//! Only the sequencer may tick this program, as the last transaction in every block; the
+//! every-block account then sends the record to the coarser accounts it is due at.
+//! Each clock account uses this program's actor state.
 
 use clock_core::{
     CLOCK_01_PROGRAM_ACCOUNT_ID, CLOCK_10_PROGRAM_ACCOUNT_ID, CLOCK_50_PROGRAM_ACCOUNT_ID,
-    ClockAccountData, Instruction,
+    ClockAccountData, Message,
 };
-use lee_core::program::{Plan, PlanInput, run_program};
+use lee_core::{
+    account::Actor,
+    program::{ReceiveInput, Response, SyncMessage},
+};
 
-#[derive(borsh::BorshSerialize, borsh::BorshDeserialize)]
-enum Effect {
-    Advance(ClockAccountData),
-    Record(ClockAccountData),
-}
+lee_core::actor_entrypoint!(handle_message);
 
-fn main() {
-    run_program(plan, apply)
-}
-
-#[expect(
-    clippy::unnecessary_wraps,
-    reason = "run_program's apply returns None to keep a shard"
-)]
-fn apply(effect: Effect, pre_data: &[u8]) -> Option<Vec<u8>> {
-    Some(match effect {
-        Effect::Advance(data) => {
-            let previous = ClockAccountData::from_bytes(pre_data);
+fn handle_message(input: &ReceiveInput, message: Message) -> Response {
+    match message {
+        Message::Tick {
+            timestamp,
+            block_id,
+        } => {
+            assert_eq!(
+                input.receiver.account_id, CLOCK_01_PROGRAM_ACCOUNT_ID,
+                "Tick is addressed to the every-block clock account"
+            );
+            let previous = ClockAccountData::from_bytes(&input.pre_state);
             assert_eq!(
                 previous.block_id.checked_add(1),
-                Some(data.block_id),
+                Some(block_id),
                 "Clock block id must advance by exactly one from the account's own"
             );
-            data.to_bytes()
+            let updated_data = ClockAccountData {
+                block_id,
+                timestamp,
+            };
+            let record = |account_id| {
+                SyncMessage::new(
+                    Actor::new(account_id, input.receiver.program_account_id),
+                    &Message::Record(updated_data),
+                )
+            };
+
+            // The schedule below is decided from the block ID just checked to be one past the
+            // every-block account's own.
+            let mut response = Response::set_state(updated_data.to_bytes());
+            if block_id.is_multiple_of(10) {
+                response = response.send(record(CLOCK_10_PROGRAM_ACCOUNT_ID));
+            }
+            if block_id.is_multiple_of(50) {
+                response = response.send(record(CLOCK_50_PROGRAM_ACCOUNT_ID));
+            }
+            response
         }
-        Effect::Record(data) => data.to_bytes(),
-    })
-}
-
-fn plan(input: &PlanInput, instruction: Instruction) -> Plan {
-    let Ok([pre_01, pre_10, pre_50]) = <&[_; 3]>::try_from(input.accounts.as_slice()) else {
-        panic!("Invalid number of input accounts");
-    };
-
-    // Verify the accounts correspond to the expected clock account IDs.
-    if pre_01.account_id != CLOCK_01_PROGRAM_ACCOUNT_ID
-        || pre_10.account_id != CLOCK_10_PROGRAM_ACCOUNT_ID
-        || pre_50.account_id != CLOCK_50_PROGRAM_ACCOUNT_ID
-    {
-        panic!("Invalid input accounts");
+        Message::Record(data) => {
+            assert!(
+                input.from_own_program(),
+                "Clock records are only sent by the every-block clock account"
+            );
+            Response::set_state(data.to_bytes())
+        }
+        Message::AssertTimestamp { at_least, at_most } => {
+            let ClockAccountData { timestamp, .. } = ClockAccountData::from_bytes(&input.pre_state);
+            assert!(
+                at_least <= timestamp && timestamp <= at_most,
+                "Clock timestamp {timestamp} is outside [{at_least}, {at_most}]"
+            );
+            Response::keep_state()
+        }
     }
-
-    let Instruction {
-        timestamp,
-        block_id,
-    } = instruction;
-    let updated_data = ClockAccountData {
-        block_id,
-        timestamp,
-    };
-
-    let mut plan = Plan::new(input);
-    // The schedule below is decided from the proposed block ID, which the transaction is only
-    // accepted with if `Advance` finds it one past the every-block account's own.
-    plan.effect(pre_01, &Effect::Advance(updated_data));
-    if block_id.is_multiple_of(10) {
-        plan.effect(pre_10, &Effect::Record(updated_data));
-    }
-    if block_id.is_multiple_of(50) {
-        plan.effect(pre_50, &Effect::Record(updated_data));
-    }
-    plan
 }
 
 #[cfg(test)]
 mod tests {
+    use lee_core::{
+        account::{AccountId, ActorState},
+        program::Transition,
+    };
+
     use super::*;
+
+    const CLOCK: AccountId = AccountId::new([1; 32]);
 
     fn data(block_id: u64) -> ClockAccountData {
         ClockAccountData {
@@ -88,11 +93,76 @@ mod tests {
         }
     }
 
+    fn tick(block_id: u64) -> Message {
+        Message::Tick {
+            timestamp: 1_700_000_000,
+            block_id,
+        }
+    }
+
+    fn run(
+        account_id: AccountId,
+        origin: Option<AccountId>,
+        pre: ClockAccountData,
+        message: Message,
+    ) -> Transition {
+        let receiver = Actor::new(account_id, CLOCK);
+        let input = ReceiveInput {
+            receiver,
+            from: origin.map(|sender| Actor::new(sender, sender)),
+            is_authorized: false,
+            pre_state: ActorState::from(pre.to_bytes()),
+            message: borsh::to_vec(&message).unwrap(),
+        };
+        handle_message(&input, message).into_transition(input)
+    }
+
+    fn written(data: ClockAccountData) -> Option<ActorState> {
+        Some(ActorState::from(data.to_bytes()))
+    }
+
+    fn record_to(account_id: AccountId, data: ClockAccountData) -> SyncMessage {
+        SyncMessage::new(Actor::new(account_id, CLOCK), &Message::Record(data))
+    }
+
     #[test]
     fn the_every_block_account_advances_by_one() {
+        let transition = run(CLOCK_01_PROGRAM_ACCOUNT_ID, None, data(7), tick(8));
+
+        assert_eq!(transition.response.post_state, written(data(8)));
+        assert!(
+            transition.response.sync_messages.is_empty()
+                && transition.response.async_messages.is_empty()
+        );
+    }
+
+    #[test]
+    fn a_tick_records_into_the_coarser_accounts_it_is_due_at() {
+        let at_ten = run(CLOCK_01_PROGRAM_ACCOUNT_ID, None, data(9), tick(10));
         assert_eq!(
-            apply(Effect::Advance(data(8)), &data(7).to_bytes()),
-            Some(data(8).to_bytes())
+            (
+                at_ten.response.sync_messages,
+                at_ten.response.async_messages
+            ),
+            (
+                vec![record_to(CLOCK_10_PROGRAM_ACCOUNT_ID, data(10))],
+                Vec::new()
+            )
+        );
+
+        let at_fifty = run(CLOCK_01_PROGRAM_ACCOUNT_ID, None, data(49), tick(50));
+        assert_eq!(
+            (
+                at_fifty.response.sync_messages,
+                at_fifty.response.async_messages
+            ),
+            (
+                vec![
+                    record_to(CLOCK_10_PROGRAM_ACCOUNT_ID, data(50)),
+                    record_to(CLOCK_50_PROGRAM_ACCOUNT_ID, data(50)),
+                ],
+                Vec::new()
+            )
         );
     }
 
@@ -100,20 +170,76 @@ mod tests {
     #[should_panic(expected = "Clock block id must advance by exactly one")]
     fn a_block_id_that_skips_ahead_is_refused() {
         // The block ID drives the 10/50 schedule, so a forged one would off schedule.
-        apply(Effect::Advance(data(9)), &data(7).to_bytes());
+        let _transition = run(CLOCK_01_PROGRAM_ACCOUNT_ID, None, data(7), tick(9));
     }
 
     #[test]
     #[should_panic(expected = "Clock block id must advance by exactly one")]
     fn a_block_id_that_repeats_is_refused() {
-        apply(Effect::Advance(data(7)), &data(7).to_bytes());
+        let _transition = run(CLOCK_01_PROGRAM_ACCOUNT_ID, None, data(7), tick(7));
+    }
+
+    #[test]
+    #[should_panic(expected = "Tick is addressed to the every-block clock account")]
+    fn only_the_every_block_account_takes_a_tick() {
+        let _transition = run(CLOCK_10_PROGRAM_ACCOUNT_ID, None, data(9), tick(10));
     }
 
     #[test]
     fn a_coarser_account_stores_the_same_values() {
-        assert_eq!(
-            apply(Effect::Record(data(50)), &data(40).to_bytes()),
-            Some(data(50).to_bytes())
+        let sender = Some(CLOCK);
+        let transition = run(
+            CLOCK_50_PROGRAM_ACCOUNT_ID,
+            sender,
+            data(40),
+            Message::Record(data(50)),
+        );
+
+        assert_eq!(transition.response.post_state, written(data(50)));
+    }
+
+    #[test]
+    #[should_panic(expected = "Clock records are only sent by the every-block clock account")]
+    fn a_record_from_another_program_is_refused() {
+        let sender = Some(AccountId::new([3; 32]));
+        let _transition = run(
+            CLOCK_50_PROGRAM_ACCOUNT_ID,
+            sender,
+            data(40),
+            Message::Record(data(50)),
+        );
+    }
+
+    #[test]
+    fn a_timestamp_within_bounds_is_kept() {
+        let transition = run(
+            CLOCK_50_PROGRAM_ACCOUNT_ID,
+            None,
+            data(40),
+            Message::AssertTimestamp {
+                at_least: 1_699_999_999,
+                at_most: 1_700_000_001,
+            },
+        );
+
+        assert_eq!(transition.response.post_state, None);
+        assert!(
+            transition.response.sync_messages.is_empty()
+                && transition.response.async_messages.is_empty()
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "Clock timestamp 1700000000 is outside [1700000001, 1700000002]")]
+    fn a_timestamp_outside_bounds_is_refused() {
+        let _transition = run(
+            CLOCK_50_PROGRAM_ACCOUNT_ID,
+            None,
+            data(40),
+            Message::AssertTimestamp {
+                at_least: 1_700_000_001,
+                at_most: 1_700_000_002,
+            },
         );
     }
 }

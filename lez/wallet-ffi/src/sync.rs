@@ -54,6 +54,47 @@ pub unsafe extern "C" fn wallet_ffi_sync_to_block(
     }
 }
 
+/// Rediscover the private accounts this wallet's keys hold, from genesis through the current tip.
+///
+/// Keeps every other record, the last synced block and the spent-nullifier cache. A failed
+/// rescan leaves the accounts unchanged.
+///
+/// # Parameters
+/// - `handle`: Valid wallet handle
+///
+/// # Returns
+/// - `Success` if the rescan completed
+/// - `SyncError` if the rescan failed
+/// - Error code on other failures
+///
+/// # Safety
+/// - `handle` must be a valid wallet handle from `wallet_ffi_create_new` or `wallet_ffi_open`
+#[no_mangle]
+pub unsafe extern "C" fn wallet_ffi_rescan_private_accounts(
+    handle: *mut WalletHandle,
+) -> WalletFfiError {
+    let wrapper = match get_wallet(handle) {
+        Ok(w) => w,
+        Err(e) => return e,
+    };
+
+    let mut wallet = match wrapper.core.lock() {
+        Ok(w) => w,
+        Err(e) => {
+            print_error(format!("Failed to lock wallet: {e}"));
+            return WalletFfiError::InternalError;
+        }
+    };
+
+    match block_on(wallet.rescan_private_accounts()) {
+        Ok(()) => WalletFfiError::Success,
+        Err(e) => {
+            print_error(format!("Rescan failed: {e}"));
+            WalletFfiError::SyncError
+        }
+    }
+}
+
 /// Get the last synced block number.
 ///
 /// # Parameters

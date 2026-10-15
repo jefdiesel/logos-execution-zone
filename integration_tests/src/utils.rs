@@ -4,16 +4,21 @@ use anyhow::{Context as _, Result, ensure};
 use common::HashType;
 use kameo::actor::ActorRef;
 use key_protocol::key_management::key_tree::chain_index::ChainIndex;
-use lee_core::account::{AccountId, ProgramShardSelector};
+use lee_core::{
+    RecipientEncryption,
+    account::{AccountId, Actor},
+    program::MessageBody,
+};
 use log::info;
 use sequencer_bedrock_actor::{BedrockActor, protocol::GetAccreditedKeys};
 use sequencer_core::Ed25519PublicKey;
 use sequencer_service_rpc::{RpcClient as _, SequencerClient};
-use test_fixtures::{TestContext, verify_commitment_is_in_state};
+use test_fixtures::{TestContext, private_mention, public_mention, verify_commitment_is_in_state};
 use wallet::{
     cli::{
         CliAccountMention, Command, SubcommandReturnValue,
         account::{AccountSubcommand, NewSubcommand},
+        pending::PendingSubcommand,
         programs::native_token_transfer::AuthTransferSubcommand,
     },
     storage::key_chain::FoundPrivateAccount,
@@ -24,6 +29,12 @@ pub const L2_TO_L1_TIMEOUT: Duration = Duration::from_mins(6);
 /// Maximum time a single [`wait_until`] may poll before giving up.
 const PHASE_TIMEOUT: Duration = Duration::from_secs(360);
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
+
+pub fn no_seal(_body: &MessageBody) -> Result<RecipientEncryption, lee::error::LeeError> {
+    Err(lee::error::LeeError::InvalidInput(
+        "No durable async message is sealed".to_owned(),
+    ))
+}
 
 /// Polls `check` until it reports ready, failing with `what` on timeout.
 pub async fn wait_until<F, Fut>(what: &str, mut check: F) -> Result<()>
@@ -123,7 +134,7 @@ pub async fn new_account(
     Ok(account_id)
 }
 
-/// Send `amount` from `from` to `to` via an authenticated transfer (identifier 0).
+/// Send `amount` from `from` to `to` via an authenticated transfer.
 pub async fn send(
     ctx: &mut TestContext,
     from: CliAccountMention,
@@ -136,11 +147,42 @@ pub async fn send(
         to_npk: None,
         to_vpk: None,
         to_keys: None,
-        to_identifier: Some(lee_core::Identifier::ZERO),
+        to_pk: None,
         amount,
     });
     wallet::cli::execute_subcommand(ctx.wallet_mut(), command).await?;
     Ok(())
+}
+
+/// A fresh private account holding `amount`, funded from the context's first public account and
+/// committed on chain.
+pub async fn funded_private_account(ctx: &mut TestContext, amount: u128) -> Result<AccountId> {
+    let account = new_account(ctx, true, None).await?;
+    let funder = ctx.existing_public_accounts()[0];
+    send(
+        ctx,
+        public_mention(funder),
+        private_mention(account),
+        amount,
+    )
+    .await?;
+    let commitment = ctx
+        .wallet()
+        .get_private_account_commitment(account)
+        .context("the funded account is unknown to the wallet")?;
+    wait_until("the funded account to be committed", || async {
+        Ok(verify_commitment_is_in_state(commitment, ctx.sequencer_client()).await)
+    })
+    .await?;
+    Ok(account)
+}
+
+/// The native balance of a private account the wallet records.
+pub fn private_balance(ctx: &TestContext, account_id: AccountId) -> Result<u128> {
+    Ok(restored_private_account(ctx, account_id, "private account")
+        .account
+        .data
+        .native_balance()?)
 }
 
 /// Retrieve the native token balance for `account_id`.
@@ -153,17 +195,22 @@ pub async fn account_balance(ctx: &TestContext, account_id: AccountId) -> anyhow
 
 /// Fetch the full account state for `account_id` from the sequencer.
 pub async fn get_account(ctx: &TestContext, account_id: AccountId) -> anyhow::Result<lee::Account> {
-    Ok(ctx.sequencer_client().get_account(account_id).await?)
+    Ok(ctx
+        .sequencer_client()
+        .get_account(account_id)
+        .await?
+        .unwrap_or_default())
 }
 
 pub async fn get_account_view(
     ctx: &TestContext,
-    shard_selector: ProgramShardSelector,
+    actor_state_selector: Actor,
 ) -> anyhow::Result<lee::Account> {
     Ok(ctx
         .sequencer_client()
-        .get_account_view(shard_selector)
-        .await?)
+        .get_account_view(actor_state_selector)
+        .await?
+        .unwrap_or_default())
 }
 
 /// Fetch the current commitment for `account_id` and assert it is present in the sequencer state.
@@ -184,9 +231,25 @@ pub async fn assert_private_commitment_in_state(
 pub async fn sync_private(ctx: &mut TestContext) -> anyhow::Result<()> {
     wallet::cli::execute_subcommand(
         ctx.wallet_mut(),
-        Command::Account(AccountSubcommand::SyncPrivate {}),
+        Command::Account(AccountSubcommand::SyncPrivate { rescan: false }),
     )
     .await?;
+    Ok(())
+}
+
+/// Receive every message pending for the wallet's accounts through `wallet pending receive`, which
+/// waits for each receipt and stores the account it credits.
+pub async fn receive_pending(ctx: &mut TestContext) -> anyhow::Result<()> {
+    for pending in ctx.wallet_mut().owned_pending_messages().await? {
+        wallet::cli::execute_subcommand(
+            ctx.wallet_mut(),
+            Command::Pending(PendingSubcommand::Receive {
+                position: pending.position,
+                inputs: Box::default(),
+            }),
+        )
+        .await?;
+    }
     Ok(())
 }
 

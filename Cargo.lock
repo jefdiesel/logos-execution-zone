@@ -1205,8 +1205,10 @@ name = "bridge_core"
 version = "0.1.0"
 dependencies = [
  "borsh",
+ "lee",
  "lee_core",
  "risc0-zkvm",
+ "serde",
  "sha2 0.10.9",
 ]
 
@@ -1515,6 +1517,7 @@ dependencies = [
  "serde",
  "serde_json",
  "system_accounts",
+ "test_guest_core",
  "test_methods",
  "testnet_initial_state",
  "thiserror 2.0.18",
@@ -2069,7 +2072,7 @@ dependencies = [
  "bridge_lock_core",
  "common",
  "cross_zone_inbox_core",
- "cross_zone_marker_core",
+ "cross_zone_outbox_core",
  "hex",
  "lee",
  "lee_core",
@@ -2105,6 +2108,7 @@ name = "cross_zone_inbox_core"
 version = "0.1.0"
 dependencies = [
  "borsh",
+ "cross_zone_marker_core",
  "lee_core",
  "risc0-zkvm",
  "serde",
@@ -2116,7 +2120,6 @@ version = "0.1.0"
 dependencies = [
  "borsh",
  "cross_zone_inbox_core",
- "cross_zone_marker_core",
  "lee_core",
 ]
 
@@ -2124,6 +2127,7 @@ dependencies = [
 name = "cross_zone_marker_core"
 version = "0.1.0"
 dependencies = [
+ "borsh",
  "lee_core",
  "risc0-zkvm",
 ]
@@ -2495,7 +2499,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ccc2776f0c61eca1ca32528f85548abd1a4be8fb53d1b21c013e4f18da1e7090"
 dependencies = [
  "data-encoding",
- "syn 2.0.117",
+ "syn 1.0.109",
 ]
 
 [[package]]
@@ -3234,13 +3238,13 @@ checksum = "2acce4a10f12dc2fb14a218589d4f1f62ef011b2d0cc4b3cb1bba8e94da14649"
 
 [[package]]
 name = "fastbloom"
-version = "0.14.1"
+version = "0.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4e7f34442dbe69c60fe8eaf58a8cafff81a1f278816d8ab4db255b3bef4ac3c4"
+checksum = "ef975e30683b2d965054bb0a836f8973857c4ebf6acf274fe46617cd285060d8"
 dependencies = [
- "getrandom 0.3.4",
+ "foldhash 0.2.0",
  "libm",
- "rand 0.9.4",
+ "portable-atomic",
  "siphasher",
 ]
 
@@ -3326,6 +3330,17 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 1.0.109",
+]
+
+[[package]]
+name = "ffi_types"
+version = "0.1.0"
+dependencies = [
+ "cbindgen",
+ "common",
+ "indexer_service_protocol",
+ "lee",
+ "lee_core",
 ]
 
 [[package]]
@@ -3670,11 +3685,9 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "899def5c37c4fd7b2664648c28120ecec138e4d395b459e5ca34f9cce2dd77fd"
 dependencies = [
  "cfg-if",
- "js-sys",
  "libc",
  "r-efi 5.3.0",
  "wasip2",
- "wasm-bindgen",
 ]
 
 [[package]]
@@ -4617,13 +4630,13 @@ dependencies = [
  "ping_core",
  "program_loader_core",
  "programs",
- "risc0-binfmt",
  "serde",
  "serde_json",
  "serde_with",
  "storage",
  "tempfile",
- "test_methods",
+ "test_guest_core",
+ "test_programs",
  "testnet_initial_state",
  "thiserror 2.0.18",
  "tokio",
@@ -4636,10 +4649,12 @@ version = "0.1.0"
 dependencies = [
  "cbindgen",
  "env_logger",
+ "ffi_types",
  "futures",
  "indexer_core",
  "indexer_service_protocol",
  "lee",
+ "lee_core",
  "log",
  "serde_json",
  "tokio",
@@ -4766,7 +4781,6 @@ dependencies = [
  "indexer_service_rpc",
  "jsonrpsee",
  "lee",
- "lee_core",
  "programs",
  "sequencer_service_rpc",
  "serde",
@@ -4788,7 +4802,6 @@ dependencies = [
  "bytesize",
  "common",
  "cross_zone_inbox_core",
- "cross_zone_marker_core",
  "cross_zone_outbox_core",
  "cucumber",
  "fee_core",
@@ -4821,7 +4834,7 @@ dependencies = [
  "system_accounts",
  "tempfile",
  "test_fixtures",
- "test_methods",
+ "test_guest_core",
  "test_programs",
  "testing-framework",
  "testing-framework-app",
@@ -5621,6 +5634,7 @@ dependencies = [
  "risc0-zkvm",
  "rpds",
  "semver",
+ "serde",
  "serde_with",
  "sha2 0.10.9",
  "test-case",
@@ -5635,7 +5649,6 @@ version = "0.1.0"
 dependencies = [
  "base58",
  "borsh",
- "bytesize",
  "chacha20",
  "derive_more",
  "ml-kem",
@@ -9715,15 +9728,16 @@ dependencies = [
 
 [[package]]
 name = "quinn-proto"
-version = "0.11.15"
+version = "0.11.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4fcb935c5bec503c2f0e306bdd3e58bb9029dcb14fa8d9ac76e3a5256ac0763e"
+checksum = "0e750cca55fe4f0439a15d0bb529da9651e79993e8e72c61a899a36d462befbe"
 dependencies = [
  "bytes",
  "fastbloom",
- "getrandom 0.3.4",
+ "getrandom 0.4.2",
  "lru-slab",
- "rand 0.9.4",
+ "rand 0.10.1",
+ "rand_pcg",
  "ring",
  "rustc-hash",
  "rustls",
@@ -9873,6 +9887,15 @@ name = "rand_core"
 version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "63b8176103e19a2643978565ca18b50549f6101881c443590420e4dc998a3c69"
+
+[[package]]
+name = "rand_pcg"
+version = "0.10.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "caa0f4137e1c0a72f4c651489402276c8e8e1cf081f3b0ba156d2cbeef09e86a"
+dependencies = [
+ "rand_core 0.10.1",
+]
 
 [[package]]
 name = "rand_xorshift"
@@ -10775,9 +10798,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.45"
+version = "0.23.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634"
+checksum = "48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf"
 dependencies = [
  "aws-lc-rs",
  "log",
@@ -11124,6 +11147,7 @@ dependencies = [
  "anyhow",
  "borsh",
  "bridge_core",
+ "bridge_lock_core",
  "bytesize",
  "chain_state",
  "chrono",
@@ -11161,6 +11185,7 @@ dependencies = [
  "serde_json",
  "system_accounts",
  "tempfile",
+ "test_guest_core",
  "test_programs",
  "testnet_initial_state",
  "thiserror 2.0.18",
@@ -11234,6 +11259,7 @@ dependencies = [
  "cbindgen",
  "common",
  "env_logger",
+ "ffi_types",
  "kameo",
  "lee",
  "lee_core",
@@ -11315,7 +11341,6 @@ dependencies = [
  "lee",
  "log",
  "metrics-exporter-prometheus",
- "programs",
  "sequencer_bedrock_actor",
  "sequencer_channel_config_actor",
  "sequencer_core",
@@ -11325,7 +11350,6 @@ dependencies = [
  "sequencer_slasher_actor",
  "sequencer_stake_core",
  "sequencer_storage_actor",
- "system_accounts",
  "tokio",
  "tokio-util",
  "wallet",
@@ -12458,6 +12482,7 @@ version = "0.1.0"
 dependencies = [
  "borsh",
  "lee_core",
+ "risc0-zkvm",
 ]
 
 [[package]]
@@ -12481,7 +12506,6 @@ dependencies = [
 name = "test_program_guests"
 version = "0.1.0"
 dependencies = [
- "borsh",
  "clock_core",
  "lee_core",
  "risc0-zkvm",
@@ -12699,11 +12723,13 @@ source = "git+https://github.com/logos-blockchain/logos-blockchain-testing.git?r
 name = "testnet_initial_state"
 version = "0.1.0"
 dependencies = [
+ "borsh",
  "fee_core",
  "key_protocol",
  "lee",
  "lee_core",
  "programs",
+ "rand 0.8.6",
  "serde",
  "system_accounts",
 ]
@@ -13763,6 +13789,7 @@ dependencies = [
  "async-stream",
  "bincode",
  "bip39",
+ "borsh",
  "bridge_core",
  "clap",
  "common",
@@ -13774,6 +13801,7 @@ dependencies = [
  "humantime-serde",
  "indicatif",
  "itertools 0.14.0",
+ "jsonrpsee",
  "key_protocol",
  "keycard_wallet",
  "lee",
@@ -13787,10 +13815,13 @@ dependencies = [
  "risc0-zkos-v1compat",
  "rpassword",
  "sequencer_service_rpc",
+ "sequencer_stake_core",
  "serde",
  "serde_json",
  "system_accounts",
  "tempfile",
+ "test_guest_core",
+ "test_programs",
  "testnet_initial_state",
  "thiserror 2.0.18",
  "tokio",
