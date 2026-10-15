@@ -33,6 +33,14 @@ pub enum BlockIngestError {
         /// Why the fee transaction's reward account is not allowed.
         reason: String,
     },
+    #[error(
+        "Transaction {tx_index} invokes system_upgrader outside the one slot before the fee \
+         transaction"
+    )]
+    MisplacedSystemUpgraderTransaction {
+        /// Index of the offending transaction within the block body.
+        tx_index: u64,
+    },
     #[error("Transaction {tx_index} failed fee classification: {reason}")]
     InvalidFeeClass {
         /// Index of the failing transaction within the block body.
@@ -92,6 +100,7 @@ impl BlockIngestError {
             | Self::InvalidClockTransaction
             | Self::InvalidFeeTransaction
             | Self::InvalidRewardTarget { .. }
+            | Self::MisplacedSystemUpgraderTransaction { .. }
             | Self::InvalidFeeClass { .. }
             | Self::MissingFeeDeclaration { .. }
             | Self::GasCapExceeded { .. }

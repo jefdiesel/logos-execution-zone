@@ -1070,6 +1070,9 @@ impl From<indexer_core::BlockIngestError> for BlockIngestError {
             indexer_core::BlockIngestError::InvalidRewardTarget { reason } => {
                 Self::InvalidRewardTarget { reason }
             }
+            indexer_core::BlockIngestError::MisplacedSystemUpgraderTransaction { tx_index } => {
+                Self::MisplacedSystemUpgraderTransaction { tx_index }
+            }
             indexer_core::BlockIngestError::InvalidFeeClass { tx_index, reason } => {
                 Self::InvalidFeeClass { tx_index, reason }
             }
