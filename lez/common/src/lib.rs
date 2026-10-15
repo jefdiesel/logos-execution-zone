@@ -14,6 +14,8 @@ pub mod transaction;
 // TODO: Compile only for tests
 pub mod test_utils;
 
+pub type PageLimit = u32;
+
 #[derive(
     Default,
     Copy,

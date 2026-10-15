@@ -1,11 +1,10 @@
 use std::future::Future;
 
-use common::{block::Block, transaction::LeeTransaction};
+use common::{PageLimit, block::Block, transaction::LeeTransaction};
 use futures::{
     FutureExt as _, StreamExt as _, TryFutureExt as _, TryStreamExt as _, future::ready, stream,
 };
 use kameo::{
-    Actor,
     actor::{ActorRef, WeakActorRef},
     error::{ActorStopReason, Infallible},
     mailbox::{MailboxReceiver, Signal},
@@ -13,16 +12,19 @@ use kameo::{
     reply::DelegatedReply,
 };
 use lee_core::{
-    BlockId,
-    account::{Balance, Nonce, ProgramShardSelector},
+    BlockId, CommitmentPosition, EncryptedNote, MembershipProof,
+    account::{Actor, Balance, Nonce},
+    program::Publication,
 };
 use log::{info, warn};
 use mempool::MemPoolHandle;
 use sequencer_actors_common::EraseMessage as _;
 use sequencer_bedrock_actor::BedrockActorTrait;
 use sequencer_core::{
-    ChannelConfigActor, SequencerCore, SubmitConfig, TransactionOrigin, config::SequencerConfig,
-    gossip::AccreditedKeysReceiver, task_group::TaskGroup,
+    ChannelConfigActor, SequencerCore, SubmitConfig, TransactionOrigin,
+    config::SequencerConfig,
+    gossip::{AccreditedKeysReceiver, MaxBlockSizeReceiver},
+    task_group::TaskGroup,
 };
 use sequencer_slasher_actor::SlasherActor;
 use sequencer_storage_actor::StorageActorTrait;
@@ -34,8 +36,9 @@ use crate::{
         ChannelId, FeeStateQuote, GetAccount, GetAccountBalance, GetAccountNonces, GetAccountReply,
         GetAccountTransactions, GetAccountView, GetBlock, GetBlockByHash, GetBlockRange,
         GetChannelId, GetCrossZoneDeadLetters, GetCrossZoneDeadLettersReply, GetFeeQuote,
-        GetLastBlockId, GetProofsAndRoot, GetTransaction, ProduceBlock, RequeueCrossZoneDeadLetter,
-        RequeueCrossZoneDeadLetterReply, Transaction,
+        GetLastBlockId, GetMessagePath, GetProofsAndRoot, GetPublications, GetRecoveryBinding,
+        GetTransaction, ProduceBlock, RequeueCrossZoneDeadLetter, RequeueCrossZoneDeadLetterReply,
+        Transaction,
     },
 };
 
@@ -45,6 +48,7 @@ mod tests;
 
 /// How many block lookups a single [`GetBlockRange`] keeps in flight.
 const BLOCK_RANGE_CONCURRENCY: usize = 16;
+const MAX_PUBLICATIONS_PER_REQUEST: PageLimit = 256;
 
 pub struct ExecutorActor<S: StorageActorTrait, B: BedrockActorTrait> {
     mempool_handle: MemPoolHandle<(TransactionOrigin, LeeTransaction)>,
@@ -127,11 +131,17 @@ impl<S: StorageActorTrait, B: BedrockActorTrait> ExecutorActor<S, B> {
     pub fn staked_keys_watch(&self) -> AccreditedKeysReceiver {
         self.sequencer.staked_keys_watch()
     }
+
+    /// The chain's `max_block_size`, which admission caps transactions at.
+    #[must_use]
+    pub fn max_block_size_watch(&self) -> MaxBlockSizeReceiver {
+        self.sequencer.max_block_size_watch()
+    }
 }
 
 impl<S: StorageActorTrait, B: BedrockActorTrait> ExecutorActorTrait for ExecutorActor<S, B> {}
 
-impl<S: StorageActorTrait, B: BedrockActorTrait> Actor for ExecutorActor<S, B> {
+impl<S: StorageActorTrait, B: BedrockActorTrait> kameo::Actor for ExecutorActor<S, B> {
     type Args = Self;
     type Error = Error;
 
@@ -191,7 +201,7 @@ impl<S: StorageActorTrait, B: BedrockActorTrait> Message<ProduceBlock> for Execu
                 }
                 log::info!(
                     "Block with id {id} created by {}",
-                    self.sequencer.bedrock_public_key_hex()
+                    self.sequencer.channel_signing_public_key_hex()
                 );
             }
             Err(err) if err.is::<sequencer_core::ChannelMovedWhileBuilding>() => {
@@ -382,14 +392,14 @@ impl<S: StorageActorTrait, B: BedrockActorTrait> Message<GetAccountNonces> for E
 }
 
 impl<S: StorageActorTrait, B: BedrockActorTrait> Message<GetProofsAndRoot> for ExecutorActor<S, B> {
-    type Reply = (
-        Vec<Option<lee_core::MembershipProof>>,
-        lee_core::CommitmentSetDigest,
-    );
+    type Reply = crate::protocol::ProofsAndRoot;
 
     async fn handle(
         &mut self,
-        GetProofsAndRoot { commitments }: GetProofsAndRoot,
+        GetProofsAndRoot {
+            commitments,
+            message_position,
+        }: GetProofsAndRoot,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         self.sequencer
@@ -398,7 +408,9 @@ impl<S: StorageActorTrait, B: BedrockActorTrait> Message<GetProofsAndRoot> for E
                     .iter()
                     .map(|commitment| state.get_proof_for_commitment(commitment))
                     .collect();
-                (proofs, state.commitment_root())
+                let message_path =
+                    message_position.and_then(|position| state.get_proof_for_position(position));
+                (proofs, message_path, state.commitment_root())
             })
             .await
     }
@@ -415,7 +427,7 @@ impl<S: StorageActorTrait, B: BedrockActorTrait> Message<GetAccount> for Executo
         GetAccountReply {
             account: self
                 .sequencer
-                .with_state(|state| state.get_account_by_id(account_id))
+                .with_state(|state| state.get_account_by_id_ref(account_id).cloned())
                 .await,
         }
     }
@@ -427,8 +439,8 @@ impl<S: StorageActorTrait, B: BedrockActorTrait> Message<GetAccountView> for Exe
     async fn handle(
         &mut self,
         GetAccountView {
-            shard_selector:
-                ProgramShardSelector {
+            actor_state_selector:
+                Actor {
                     account_id,
                     program_account_id,
                 },
@@ -440,12 +452,59 @@ impl<S: StorageActorTrait, B: BedrockActorTrait> Message<GetAccountView> for Exe
             .with_state(|state| {
                 state
                     .get_account_by_id_ref(account_id)
-                    .map_or_else(Default::default, |account| {
-                        account.project([program_account_id])
-                    })
+                    .map(|account| account.project([program_account_id]))
             })
             .await;
         GetAccountReply { account }
+    }
+}
+
+impl<S: StorageActorTrait, B: BedrockActorTrait> Message<GetPublications> for ExecutorActor<S, B> {
+    type Reply = Vec<(CommitmentPosition, Publication)>;
+
+    async fn handle(
+        &mut self,
+        GetPublications {
+            from_position,
+            limit,
+        }: GetPublications,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        let limit = usize::try_from(limit.min(MAX_PUBLICATIONS_PER_REQUEST))
+            .expect("the request limit fits in usize");
+        self.sequencer
+            .with_state(|state| state.publications_from(from_position).take(limit).collect())
+            .await
+    }
+}
+
+impl<S: StorageActorTrait, B: BedrockActorTrait> Message<GetMessagePath> for ExecutorActor<S, B> {
+    type Reply = Option<MembershipProof>;
+
+    async fn handle(
+        &mut self,
+        GetMessagePath { position }: GetMessagePath,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        self.sequencer
+            .with_state(|state| state.get_proof_for_position(position))
+            .await
+    }
+}
+
+impl<S: StorageActorTrait, B: BedrockActorTrait> Message<GetRecoveryBinding>
+    for ExecutorActor<S, B>
+{
+    type Reply = Option<EncryptedNote>;
+
+    async fn handle(
+        &mut self,
+        GetRecoveryBinding { address }: GetRecoveryBinding,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        self.sequencer
+            .with_state(|state| state.recovery_binding(address).cloned())
+            .await
     }
 }
 

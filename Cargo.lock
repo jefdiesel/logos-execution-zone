@@ -1205,8 +1205,10 @@ name = "bridge_core"
 version = "0.1.0"
 dependencies = [
  "borsh",
+ "lee",
  "lee_core",
  "risc0-zkvm",
+ "serde",
  "sha2 0.10.9",
 ]
 
@@ -1515,6 +1517,7 @@ dependencies = [
  "serde",
  "serde_json",
  "system_accounts",
+ "test_guest_core",
  "test_methods",
  "testnet_initial_state",
  "thiserror 2.0.18",
@@ -1986,6 +1989,7 @@ dependencies = [
  "cbindgen",
  "common",
  "env_logger",
+ "ffi_types",
  "kameo",
  "key_protocol",
  "lee",
@@ -2092,7 +2096,7 @@ dependencies = [
  "bridge_lock_core",
  "common",
  "cross_zone_inbox_core",
- "cross_zone_marker_core",
+ "cross_zone_outbox_core",
  "hex",
  "lee",
  "lee_core",
@@ -2128,6 +2132,7 @@ name = "cross_zone_inbox_core"
 version = "0.1.0"
 dependencies = [
  "borsh",
+ "cross_zone_marker_core",
  "lee_core",
  "risc0-zkvm",
  "serde",
@@ -2139,7 +2144,6 @@ version = "0.1.0"
 dependencies = [
  "borsh",
  "cross_zone_inbox_core",
- "cross_zone_marker_core",
  "lee_core",
 ]
 
@@ -2147,6 +2151,7 @@ dependencies = [
 name = "cross_zone_marker_core"
 version = "0.1.0"
 dependencies = [
+ "borsh",
  "lee_core",
  "risc0-zkvm",
 ]
@@ -3349,6 +3354,17 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 1.0.109",
+]
+
+[[package]]
+name = "ffi_types"
+version = "0.1.0"
+dependencies = [
+ "cbindgen",
+ "common",
+ "indexer_service_protocol",
+ "lee",
+ "lee_core",
 ]
 
 [[package]]
@@ -4638,13 +4654,13 @@ dependencies = [
  "ping_core",
  "program_loader_core",
  "programs",
- "risc0-binfmt",
  "serde",
  "serde_json",
  "serde_with",
  "storage",
  "tempfile",
- "test_methods",
+ "test_guest_core",
+ "test_programs",
  "testnet_initial_state",
  "thiserror 2.0.18",
  "tokio",
@@ -4657,10 +4673,12 @@ version = "0.1.0"
 dependencies = [
  "cbindgen",
  "env_logger",
+ "ffi_types",
  "futures",
  "indexer_core",
  "indexer_service_protocol",
  "lee",
+ "lee_core",
  "log",
  "serde_json",
  "tokio",
@@ -4787,7 +4805,6 @@ dependencies = [
  "indexer_service_rpc",
  "jsonrpsee",
  "lee",
- "lee_core",
  "programs",
  "sequencer_service_rpc",
  "serde",
@@ -4806,11 +4823,9 @@ dependencies = [
  "borsh",
  "bridge_core",
  "bridge_lock_core",
- "bytesize",
  "common",
  "core_ffi",
  "cross_zone_inbox_core",
- "cross_zone_marker_core",
  "cross_zone_outbox_core",
  "cucumber",
  "fee_core",
@@ -4842,7 +4857,7 @@ dependencies = [
  "system_accounts",
  "tempfile",
  "test_fixtures",
- "test_methods",
+ "test_guest_core",
  "test_programs",
  "testing-framework",
  "testing-framework-app",
@@ -5641,6 +5656,7 @@ dependencies = [
  "risc0-zkvm",
  "rpds",
  "semver",
+ "serde",
  "serde_with",
  "sha2 0.10.9",
  "test-case",
@@ -5655,7 +5671,6 @@ version = "0.1.0"
 dependencies = [
  "base58",
  "borsh",
- "bytesize",
  "chacha20",
  "derive_more",
  "ml-kem",
@@ -10805,9 +10820,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.45"
+version = "0.23.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634"
+checksum = "48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf"
 dependencies = [
  "aws-lc-rs",
  "log",
@@ -11154,7 +11169,7 @@ dependencies = [
  "anyhow",
  "borsh",
  "bridge_core",
- "bytesize",
+ "bridge_lock_core",
  "chain_state",
  "chrono",
  "clock_core",
@@ -11191,6 +11206,7 @@ dependencies = [
  "serde_json",
  "system_accounts",
  "tempfile",
+ "test_guest_core",
  "test_programs",
  "testnet_initial_state",
  "thiserror 2.0.18",
@@ -11232,7 +11248,6 @@ dependencies = [
  "logos-blockchain-zone-sdk",
  "mempool",
  "mockall",
- "num-bigint 0.4.6",
  "num-traits",
  "ping_core",
  "programs",
@@ -11315,7 +11330,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "borsh",
- "bytesize",
  "clap",
  "common",
  "env_logger",
@@ -11337,6 +11351,7 @@ dependencies = [
  "sequencer_slasher_actor",
  "sequencer_stake_core",
  "sequencer_storage_actor",
+ "serde_json",
  "system_accounts",
  "tokio",
  "tokio-util",
@@ -12431,7 +12446,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bip39",
- "bytesize",
  "common",
  "env_logger",
  "futures",
@@ -12470,6 +12484,7 @@ version = "0.1.0"
 dependencies = [
  "borsh",
  "lee_core",
+ "risc0-zkvm",
 ]
 
 [[package]]
@@ -12493,7 +12508,6 @@ dependencies = [
 name = "test_program_guests"
 version = "0.1.0"
 dependencies = [
- "borsh",
  "clock_core",
  "lee_core",
  "risc0-zkvm",
@@ -12711,11 +12725,13 @@ source = "git+https://github.com/logos-blockchain/logos-blockchain-testing.git?r
 name = "testnet_initial_state"
 version = "0.1.0"
 dependencies = [
+ "borsh",
  "fee_core",
  "key_protocol",
  "lee",
  "lee_core",
  "programs",
+ "rand 0.8.6",
  "serde",
  "system_accounts",
 ]
@@ -13775,6 +13791,7 @@ dependencies = [
  "async-stream",
  "bincode",
  "bip39",
+ "borsh",
  "bridge_core",
  "clap",
  "common",
@@ -13786,6 +13803,7 @@ dependencies = [
  "humantime-serde",
  "indicatif",
  "itertools 0.14.0",
+ "jsonrpsee",
  "key_protocol",
  "keycard_wallet",
  "lee",
@@ -13799,10 +13817,13 @@ dependencies = [
  "risc0-zkos-v1compat",
  "rpassword",
  "sequencer_service_rpc",
+ "sequencer_stake_core",
  "serde",
  "serde_json",
  "system_accounts",
  "tempfile",
+ "test_guest_core",
+ "test_programs",
  "testnet_initial_state",
  "thiserror 2.0.18",
  "tokio",

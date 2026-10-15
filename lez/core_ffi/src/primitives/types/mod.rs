@@ -199,22 +199,6 @@ impl From<NullifierPublicKey> for FfiNullifierPublicKey {
     }
 }
 
-pub type FfiIdentifier = FfiBytes32;
-
-impl From<lee_core::Identifier> for FfiIdentifier {
-    fn from(value: lee_core::Identifier) -> Self {
-        Self {
-            data: value.into_value(),
-        }
-    }
-}
-
-impl From<FfiIdentifier> for lee_core::Identifier {
-    fn from(value: FfiIdentifier) -> Self {
-        Self::new(value.data)
-    }
-}
-
 impl From<SharedSecretKey> for FfiBytes32 {
     fn from(value: SharedSecretKey) -> Self {
         Self { data: value.0 }

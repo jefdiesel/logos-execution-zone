@@ -32,7 +32,7 @@ use logos_blockchain_zone_sdk::{
     CommonHttpClient,
     adapter::{Node as _, NodeHttpClient},
 };
-use sequencer_service::GenesisAction;
+use sequencer_service::{DepositRecipient, GenesisAction};
 use tempfile::TempDir;
 use test_fixtures::{
     BlockingTestContext, MultiZoneTestContextBuilder, ZoneTestContextBuilder,
@@ -42,7 +42,7 @@ use test_fixtures::{
     },
     setup::SequencerSetup,
 };
-use wallet::AccountIdentity;
+use wallet::{AccountIdentity, program_facades::sequencer_stake::SequencerStake};
 
 use crate::{
     L2_TO_L1_TIMEOUT, account_balance, ffi_helpers::primitives::primitives_ffi_free_cstring,
@@ -67,7 +67,7 @@ unsafe extern "C" {
     pub unsafe fn sequencer_ffi_query_account(
         sequencer: *const SequencerServiceFFI,
         account_id: FfiAccountId,
-    ) -> PointerResult<FfiAccount, FfiOperationError>;
+    ) -> PointerResult<FfiOption<FfiAccount>, OperationStatus>;
 
     pub unsafe fn sequencer_ffi_query_block_vec(
         sequencer: *const SequencerServiceFFI,
@@ -102,7 +102,7 @@ unsafe extern "C" {
 /// Comfortably above `system_accounts::DEFAULT_MINIMUM_SEQUENCER_STAKE`.
 pub const FUNDING_BALANCE: u128 = 2 * system_accounts::DEFAULT_MINIMUM_SEQUENCER_STAKE;
 
-/// Bedrock signing key of the sequencer that stakes its way in.
+/// Channel signing key of the sequencer that stakes its way in.
 pub const JOINER_SIGNING_KEY: [u8; 32] = [0x42; 32];
 
 /// A leader node with an FFI node staked into its channel.
@@ -150,13 +150,23 @@ pub fn wait_for_sequencer_ffi_block(
     }
 }
 
+pub fn queried_account(sequencer: &SequencerServiceFFI, account_id: AccountId) -> Option<Account> {
+    // SAFETY: `sequencer` is a valid reference for the duration of the call.
+    let res =
+        unsafe { sequencer_ffi_query_account(std::ptr::from_ref(sequencer), account_id.into()) };
+    assert!(res.error.is_ok(), "Failed to fetch account {account_id}");
+    // SAFETY: the query returned a valid option, read and converted exactly once.
+    let account: Option<FfiAccount> = unsafe { res.value.read() }.into();
+    account.map(|account| account.try_into().expect("Data must fit"))
+}
+
 /// Sets up blocking context with one leader node
 /// and joins FFI node through staking flow.
 pub fn joining_setup() -> Result<JoiningSetup> {
     let joining_sequencer_key = Ed25519Key::from_bytes(&JOINER_SIGNING_KEY).public_key();
     let joining_stake_key =
         sequencer_stake_core::SequencerKey::new(joining_sequencer_key.to_bytes())
-            .expect("a Bedrock key is a valid Ed25519 public key");
+            .expect("a channel signing public key is a valid Ed25519 public key");
 
     let funding_private_key = PrivateKey::new_os_random();
     let funding_id = AccountId::from(&PublicKey::new_from_private_key(&funding_private_key));
@@ -166,7 +176,9 @@ pub fn joining_setup() -> Result<JoiningSetup> {
             ZoneTestContextBuilder::new(MultiNodeTestContextConfig::default())
                 .with_sequencer_partial_config(fast_blocks())
                 .with_genesis(vec![GenesisAction::SupplyAccount {
-                    account_id: funding_id,
+                    recipient: DepositRecipient::Identified(PublicAccountEvidence::Key(
+                        PublicKey::new_from_private_key(&funding_private_key),
+                    )),
                     balance: FUNDING_BALANCE.try_into().expect("Must fit"),
                 }]),
         )
@@ -197,31 +209,18 @@ pub fn joining_setup() -> Result<JoiningSetup> {
 
     let funds_id = system_accounts::stake_funds_account_id(&ownership_id);
 
-    let stake_instruction_data =
-        Program::serialize_instruction(sequencer_stake_core::Instruction::Stake {
-            sequencer_key: joining_stake_key,
-            amount: FUNDING_BALANCE,
-            has_record: false,
-        })
-        .context("Failed to serialize Stake instruction")?;
-
     log::info!(
         "Submitting Stake transaction for sequencer key {}",
         hex::encode(joining_sequencer_key.to_bytes())
     );
-    let config_id = system_accounts::sequencer_stake_config_account_id();
     let stake_id = programs::sequencer_stake_account_id();
     ctx.block_on(|ctx| async {
-        ctx.wallet()
-            .send_pub_tx(
-                vec![
-                    AccountIdentity::Public(funding_id).balance(),
-                    AccountIdentity::Public(ownership_id).select_program_shard(stake_id),
-                    AccountIdentity::PublicNoSign(funds_id).balance(),
-                    AccountIdentity::PublicNoSign(config_id).select_program_shard(stake_id),
-                ],
-                stake_instruction_data,
-                stake_id,
+        SequencerStake(ctx.wallet())
+            .send_stake(
+                AccountIdentity::Public(ownership_id),
+                AccountIdentity::Public(funding_id),
+                joining_stake_key,
+                FUNDING_BALANCE,
             )
             .await
             .map_err(|err| anyhow::anyhow!("Failed to submit Stake transaction: {err:?}"))
@@ -234,7 +233,7 @@ pub fn joining_setup() -> Result<JoiningSetup> {
             Ok(!get_account(ctx, ownership_id)
                 .await?
                 .data
-                .shard(stake_id)
+                .actor_state(stake_id)
                 .is_empty())
         })
     })?;
@@ -245,7 +244,7 @@ pub fn joining_setup() -> Result<JoiningSetup> {
             .context("Failed to read the stake ownership account")
     })?;
     assert!(
-        !ownership_account.data.shard(stake_id).is_empty(),
+        !ownership_account.data.actor_state(stake_id).is_empty(),
         "ownership account should now hold a sequencer_stake record"
     );
     let staked_balance = ctx.block_on(|ctx| account_balance(ctx, funds_id))?;
@@ -254,7 +253,7 @@ pub fn joining_setup() -> Result<JoiningSetup> {
         "the funds PDA should hold the staked balance"
     );
     let record = sequencer_stake_core::StakeRecord::from_bytes(
-        ownership_account.data.shard(stake_id).as_ref(),
+        ownership_account.data.actor_state(stake_id).as_ref(),
     )
     .context("ownership account data did not decode as a StakeRecord")?;
     assert_eq!(record.sequencer_key, joining_stake_key);
@@ -300,7 +299,7 @@ pub fn joining_setup() -> Result<JoiningSetup> {
     // Only now start a node behind the key, against a channel that already has a chain.
     let setup = SequencerSetup::new(fast_blocks(), ctx.ctx().bedrock_addr())
         .with_channel_id(bedrock_channel_id())
-        .with_bedrock_signing_key(UnsecuredEd25519Key::from_bytes(&JOINER_SIGNING_KEY))
+        .with_channel_signing_key(UnsecuredEd25519Key::from_bytes(&JOINER_SIGNING_KEY))
         .joining_existing_channel();
 
     let temp_sequencer_dir =

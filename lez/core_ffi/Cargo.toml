@@ -5,6 +5,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+ffi_types.workspace = true
 lee.workspace = true
 lee_core.workspace = true
 sequencer_service.workspace = true

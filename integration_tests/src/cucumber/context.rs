@@ -258,16 +258,16 @@ impl LezScenarioContext {
             .map_err(StepError::query_failed_boxed)
     }
 
-    /// Signs and submits a public transaction against an arbitrary program
-    /// through the scenario wallet.
+    /// Signs and submits a public transaction delivering `message` to the actor of
+    /// `accounts[root]` through the scenario wallet.
     pub async fn send_program_transaction(
         &self,
         accounts: Vec<wallet::AccountMention>,
-        instruction_data: lee_core::program::InstructionData,
-        program_id: lee::AccountId,
+        root: usize,
+        message: lee_core::program::MessageData,
     ) -> Result<HashType, StepError> {
         self.wallet()
-            .send_program_transaction(accounts, instruction_data, program_id)
+            .send_program_transaction(accounts, root, message)
             .await
             .map_err(StepError::query_failed_boxed)
     }

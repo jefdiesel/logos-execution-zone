@@ -23,6 +23,9 @@ pub const DEFAULT_SEQUENCER_WITHDRAW_THRESHOLD: u16 = 1;
 /// Blocks an unstake waits before release.
 pub const DEFAULT_SEQUENCER_EXIT_DELAY: u64 = 100;
 
+/// Largest block a sequencer builds, in bytes.
+pub const DEFAULT_MAX_BLOCK_SIZE: u64 = 1024 * 1024;
+
 pub type Slots = u32;
 
 #[must_use]
@@ -70,12 +73,9 @@ pub fn fee_account_ids() -> [AccountId; 3] {
 /// The fee-state account initialized with the genesis market state.
 #[must_use]
 pub fn fee_state_account() -> Account {
-    Account::default().with_shard(
+    Account::default().with_actor_state(
         programs::fee_account_id(),
-        fee_core::state::FeeState::genesis()
-            .to_bytes()
-            .try_into()
-            .expect("FeeState data should fit"),
+        fee_core::state::FeeState::genesis().to_bytes().into(),
     )
 }
 
@@ -109,7 +109,7 @@ pub fn sequencer_stake_config_account(
     channel_params: Option<sequencer_stake_core::ChannelParams>,
     channel_id: Option<[u8; 32]>,
 ) -> Account {
-    Account::default().with_shard(
+    Account::default().with_actor_state(
         programs::sequencer_stake_account_id(),
         sequencer_stake_core::SequencerStakeConfig {
             channel_params,
@@ -117,21 +117,19 @@ pub fn sequencer_stake_config_account(
             entries: BTreeMap::new(),
         }
         .to_bytes()
-        .try_into()
-        .expect("sequencer stake config data should fit"),
+        .into(),
     )
 }
 
 #[must_use]
 pub fn clock_account() -> Account {
-    Account::default().with_shard(
+    Account::default().with_actor_state(
         programs::clock_account_id(),
         ClockAccountData {
             block_id: 0,
             timestamp: 0,
         }
         .to_bytes()
-        .try_into()
-        .expect("Clock account data should fit"),
+        .into(),
     )
 }

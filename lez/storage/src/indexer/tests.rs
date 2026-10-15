@@ -29,7 +29,7 @@ fn settled_block(
     mut transactions: Vec<common::transaction::LeeTransaction>,
     state: &lee::V03State,
 ) -> Block {
-    use common::transaction::{LeeTransaction, clock_invocation, fee_invocation};
+    use common::transaction::{FeePayee, LeeTransaction, clock_invocation, fee_invocation};
     let timestamp = id.saturating_mul(100);
     let (summary, payout) = if id == lee::GENESIS_BLOCK_ID {
         // Genesis transactions are fee-exempt
@@ -42,7 +42,9 @@ fn settled_block(
     };
     let producer = common::test_utils::producer_account_for_testing();
     transactions.push(LeeTransaction::Public(fee_invocation(
-        summary, payout, producer,
+        summary,
+        payout,
+        FeePayee::Present(producer),
     )));
     transactions.push(LeeTransaction::Public(clock_invocation(id, timestamp)));
     common::block::HashableBlockData {

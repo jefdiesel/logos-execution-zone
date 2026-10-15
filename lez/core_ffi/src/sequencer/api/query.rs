@@ -274,7 +274,7 @@ pub unsafe extern "C" fn sequencer_ffi_query_block_by_hash(
 ///
 /// # Returns
 ///
-/// A `PointerResult<FfiAccount, FfiOperationError>` indicating success or failure.
+/// A `PointerResult<FfiOption<FfiAccount>, OperationStatus>` indicating success or failure.
 ///
 /// # Safety
 ///
@@ -284,7 +284,7 @@ pub unsafe extern "C" fn sequencer_ffi_query_block_by_hash(
 pub unsafe extern "C" fn sequencer_ffi_query_account(
     sequencer: *const SequencerServiceFFI,
     account_id: FfiAccountId,
-) -> PointerResult<FfiAccount, FfiOperationError> {
+) -> PointerResult<FfiOption<FfiAccount>, FfiOperationError> {
     if sequencer.is_null() {
         log::error!("Attempted to query a null sequencer pointer. This is a bug. Aborting.");
         return PointerResult::from_error(FfiOperationError::NullPointer);
@@ -306,7 +306,7 @@ pub unsafe extern "C" fn sequencer_ffi_query_account(
             log::error!("Failed to query account: {e:#}");
             PointerResult::from_error(FfiOperationError::QueryError)
         },
-        |account| PointerResult::from_value(account.account.into()),
+        |account| PointerResult::from_value(account.account.map(FfiAccount::from).into()),
     )
 }
 
@@ -325,6 +325,10 @@ pub unsafe extern "C" fn sequencer_ffi_query_account(
 ///
 /// The caller must ensure that:
 /// - `sequencer` is a valid pointer to a [`SequencerServiceFFI`] instance.
+/// - `transaction` is initialized throughout, inactive payloads included: a private body's
+///   `public_root` without `has_public_root`, and the `delivery` of an `EndPrivateSubtree` or
+///   `EndPublicSubtree` step, are converted and freed too, so they must be empty, not
+///   uninitialized.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn sequencer_ffi_send_transaction(
     sequencer: *const SequencerServiceFFI,

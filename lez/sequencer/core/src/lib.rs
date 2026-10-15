@@ -1,14 +1,15 @@
 #![allow(dead_code, reason = "TODO")]
 
 use std::{
-    collections::{HashSet, VecDeque},
+    collections::{BTreeMap, HashSet, VecDeque},
     path::Path,
     sync::Arc,
     time::{Duration, Instant},
 };
 
-use anyhow::{Context as _, Result, anyhow};
-use borsh::BorshDeserialize;
+use anyhow::{Context as _, Result, anyhow, ensure};
+use borsh::BorshDeserialize as _;
+use bridge_core::{BridgeAmount, DepositMetadata, DepositRecipient};
 use chain_state::{
     AcceptOutcome, Anchor, AnchorConsistencyCheck, ChainConsistency, ChainMismatch, ChainState,
     ChannelEntry, PublishRecord, Tip,
@@ -16,19 +17,21 @@ use chain_state::{
 use common::{
     HashType,
     block::{BedrockStatus, Block, BlockMeta, HashableBlockData},
-    transaction::{LeeTransaction, TxEvents, clock_invocation, fee_invocation},
+    transaction::{FeePayee, LeeTransaction, TxEvents, clock_invocation, fee_invocation},
 };
 use config::{GenesisAction, SequencerConfig};
 use cross_zone_inbox_core::CrossZoneMessage;
 use futures::StreamExt as _;
 use kameo::actor::{ActorRef, Spawn as _};
-use lee::{AccountId, ProgramShardSelector, PublicTransaction, public_transaction::Message};
+use lee::{
+    AccountId, Actor, PublicAccountEvidence, PublicTransaction, public_transaction::Message,
+};
 use lee_core::GENESIS_BLOCK_ID;
 use log::{debug, error, info, warn};
 use logos_blockchain_binary_codec::bincode::{DeserializeOp as _, SerializeOp as _};
 pub use logos_blockchain_core::mantle::{NoteId, ops::channel::MsgId};
-use logos_blockchain_key_management_system_service::keys::ED25519_SECRET_KEY_SIZE;
 pub use logos_blockchain_key_management_system_service::keys::Ed25519PublicKey;
+use logos_blockchain_key_management_system_service::keys::{ED25519_SECRET_KEY_SIZE, ZkPublicKey};
 use logos_blockchain_zone_sdk::{
     Slot, ZoneMessage,
     sequencer::{DepositInfo, SequencerCheckpoint, WithdrawArg},
@@ -59,7 +62,8 @@ use tokio_retry::{Retry, strategy::FixedInterval};
 
 use crate::{
     gossip::{
-        AccreditedKeys, AccreditedKeysReceiver, AccreditedKeysSender, accredited_keys_channel,
+        AccreditedKeys, AccreditedKeysReceiver, AccreditedKeysSender, MaxBlockSizeReceiver,
+        MaxBlockSizeSender, accredited_keys_channel,
     },
     logging::{log_rewind, log_update},
     task_group::TaskGroup,
@@ -89,6 +93,13 @@ const RETIRE_DISPATCH_AFTER_FAILURES: u32 = 3;
 /// since store-drained work is taken before the mempool. The rest wait one
 /// block; nothing is dropped.
 const MAX_DISPATCHES_PER_BLOCK: usize = 16;
+
+/// File in a sequencer home holding the Ed25519 key the node signs its channel inscriptions with,
+/// which is the key its stake accredits.
+pub const CHANNEL_SIGNING_KEY_FILE: &str = "channel_signing_key";
+/// File in a sequencer home holding the public key of the Bedrock wallet key that pays its
+/// inscriptions, in hex.
+pub const BEDROCK_FUNDING_PUBLIC_KEY_FILE: &str = "bedrock_funding_public_key";
 
 /// Fixed, public key behind a genesis-only funding account: the bridge can
 /// only be called top-level, not from `Stake`, so this account is a
@@ -170,9 +181,28 @@ impl From<TransactionOrigin> for sequencer_core_metrics::TransactionOrigin {
     }
 }
 
-#[derive(Clone, Debug, BorshDeserialize)]
-struct DepositMetadata {
-    recipient_id: lee::AccountId,
+/// Whom a bridge deposit credits.
+enum Credited<'recipient> {
+    /// A public account, declared with the admission evidence it carries.
+    Public(&'recipient PublicAccountEvidence),
+    /// A private address, left undeclared so its credit is published under its recovery binding.
+    Private(AccountId),
+}
+
+impl Credited<'_> {
+    fn account_id(&self) -> AccountId {
+        match self {
+            Self::Public(evidence) => evidence.account_id(),
+            Self::Private(address) => *address,
+        }
+    }
+
+    const fn evidence(&self) -> Option<&PublicAccountEvidence> {
+        match self {
+            Self::Public(evidence) => Some(evidence),
+            Self::Private(_) => None,
+        }
+    }
 }
 
 pub struct SequencerCore<S: StorageActorTrait, B: BedrockActorTrait> {
@@ -195,8 +225,9 @@ pub struct SequencerCore<S: StorageActorTrait, B: BedrockActorTrait> {
     /// Keys with stake on record, which the mesh admits channel-config
     /// messages from.
     staked_keys_tx: AccreditedKeysSender,
+    max_block_size_tx: MaxBlockSizeSender,
     /// Signs this node's approval of a slash.
-    bedrock_signing_key: Ed25519Key,
+    channel_signing_key: Ed25519Key,
     /// Collects the accredited signatures a channel config update needs.
     config_manager: ActorRef<ChannelConfigActor>,
     /// The config draft zone-sdk last funded for us, submitted once its
@@ -321,26 +352,21 @@ impl<S: StorageActorTrait, B: BedrockActorTrait> SequencerCore<S, B> {
     ) -> Result<(Self, MemPoolHandle<(TransactionOrigin, LeeTransaction)>)> {
         sequencer_core_metrics::init();
 
-        // A block over Bedrock's inscription cap is unpublishable; fail at
-        // startup rather than stalling at the first oversized block.
-        assert!(
-            config.max_block_size.as_u64() <= config::MAX_PUBLISHABLE_BLOCK_SIZE,
-            "max_block_size {} exceeds Bedrock's inscription limit of {} bytes",
-            config.max_block_size,
-            config::MAX_PUBLISHABLE_BLOCK_SIZE,
-        );
+        if let Some(genesis) = &config.genesis {
+            check_startup_channel_params(&genesis.channel_params, &config)?;
+        }
 
-        let bedrock_signing_key =
-            load_or_create_signing_key(&config.home.join("bedrock_signing_key"))
-                .expect("Failed to load or create bedrock signing key");
+        let channel_signing_key =
+            load_or_create_signing_key(&config.home.join(CHANNEL_SIGNING_KEY_FILE))
+                .expect("Failed to load or create channel signing key");
         log::info!(
-            "Bedrock signing public key: {}",
-            hex::encode(bedrock_signing_key.public_key().to_bytes())
+            "Channel signing public key: {}",
+            hex::encode(channel_signing_key.public_key().to_bytes())
         );
 
         let own_sequencer_key =
-            sequencer_stake_core::SequencerKey::new(bedrock_signing_key.public_key().to_bytes())
-                .expect("our own Bedrock public key is a valid Ed25519 public key");
+            sequencer_stake_core::SequencerKey::new(channel_signing_key.public_key().to_bytes())
+                .expect("our own channel signing public key is a valid Ed25519 public key");
 
         // Only seed our own key into genesis as the bootstrap sequencer if the
         // channel doesn't exist yet. Otherwise it's someone else's channel and
@@ -359,6 +385,11 @@ impl<S: StorageActorTrait, B: BedrockActorTrait> SequencerCore<S, B> {
         if channel_already_exists {
             info!("Channel already exists; joining as a non channel creator");
         } else {
+            ensure!(
+                config.genesis.is_some(),
+                "Channel {} does not exist, and creating it needs a `genesis` config",
+                config.bedrock_config.channel_id
+            );
             info!("Channel does not exist yet; starting it as channel creator");
         }
         let bootstrap_sequencer_key = (!channel_already_exists).then_some(own_sequencer_key);
@@ -400,7 +431,7 @@ impl<S: StorageActorTrait, B: BedrockActorTrait> SequencerCore<S, B> {
         let slasher = SlasherActor::spawn(
             SlasherActor::load(
                 storage_ref.clone(),
-                bedrock_signing_key.clone(),
+                channel_signing_key.clone(),
                 stake_config,
                 *config.bedrock_config.channel_id.as_ref(),
             )
@@ -408,12 +439,14 @@ impl<S: StorageActorTrait, B: BedrockActorTrait> SequencerCore<S, B> {
         );
 
         let config_manager = ChannelConfigActor::spawn_with_mailbox(
-            ChannelConfigActor::new(bedrock_signing_key.clone()),
+            ChannelConfigActor::new(channel_signing_key.clone()),
             kameo::mailbox::bounded(channel_config::MAILBOX_CAPACITY),
         );
 
         let (accredited_keys_tx, _) = accredited_keys_channel();
         let (staked_keys_tx, _) = accredited_keys_channel();
+        let (max_block_size_tx, _) =
+            tokio::sync::watch::channel(config::MAX_PUBLISHABLE_BLOCK_SIZE);
 
         // Cross-zone messaging: start a watcher per configured peer. The inbox
         // config account is seeded into genesis state in `build_genesis_state`.
@@ -435,6 +468,12 @@ impl<S: StorageActorTrait, B: BedrockActorTrait> SequencerCore<S, B> {
             Self::verify_and_reconstruct(&bedrock_ref, &storage_ref, &chain, is_fresh_start)
                 .await
                 .context("Failed to verify/reconstruct sequencer state from Bedrock")?;
+        // A joining node's config carries no channel params, so check the finalized chain's.
+        let final_params = committee_discovery::channel_params(chain.lock().await.final_state());
+        if let Some(params) = final_params {
+            check_startup_channel_params(&params, &config)
+                .context("This node cannot run on this channel")?;
+        }
 
         // Publish our blocks only when we are bootstrapping a channel that does
         // not exist yet (no channel tip). If the channel already exists (another
@@ -531,7 +570,14 @@ impl<S: StorageActorTrait, B: BedrockActorTrait> SequencerCore<S, B> {
 
         // The committee the slasher loaded with predates catch-up and the
         // bootstrap publishes.
-        refresh_committee(&slasher, &chain, &accredited_keys_tx, &staked_keys_tx).await;
+        refresh_committee(
+            &slasher,
+            &chain,
+            &accredited_keys_tx,
+            &staked_keys_tx,
+            &max_block_size_tx,
+        )
+        .await;
 
         let finalized_config = zone_checkpoint(&storage_ref)
             .await
@@ -549,8 +595,9 @@ impl<S: StorageActorTrait, B: BedrockActorTrait> SequencerCore<S, B> {
             slasher,
             accredited_keys_tx,
             staked_keys_tx,
+            max_block_size_tx,
             config_manager,
-            bedrock_signing_key,
+            channel_signing_key,
             config_draft: None,
             finalized_config,
             applied_seq: None,
@@ -1049,6 +1096,7 @@ impl<S: StorageActorTrait, B: BedrockActorTrait> SequencerCore<S, B> {
                 &self.chain,
                 &self.accredited_keys_tx,
                 &self.staked_keys_tx,
+                &self.max_block_size_tx,
             )
             .await;
         }
@@ -1651,7 +1699,7 @@ impl<S: StorageActorTrait, B: BedrockActorTrait> SequencerCore<S, B> {
         // itself. Draining here also subsumes the old
         // startup replay.
         //
-        // Skip deposits whose receipt has a nonempty bridge shard.
+        // Skip deposits whose receipt has a nonempty bridge actor state.
         // Reverting a block also reverts its receipts, allowing those deposits to be retried.
         let pending_deposits: VecDeque<LeeTransaction> = self
             .storage_ref
@@ -1673,25 +1721,22 @@ impl<S: StorageActorTrait, B: BedrockActorTrait> SequencerCore<S, B> {
             })
             .collect();
 
-        let max_block_size = usize::try_from(self.sequencer_config.max_block_size.as_u64())
-            .expect("`max_block_size` should fit into usize");
+        let max_block_size = usize::try_from(
+            committee_discovery::channel_params(&working_state)
+                .context("The chain holds no channel params")?
+                .max_block_size,
+        )
+        .expect("`max_block_size` should fit into usize");
 
         let new_block_timestamp = u64::try_from(chrono::Utc::now().timestamp_millis())
             .expect("Timestamp must be positive");
 
         // Look up this sequencer's stake ownership account as the reward target.
         let own_sequencer_key = sequencer_stake_core::SequencerKey::new(
-            self.bedrock_signing_key.public_key().to_bytes(),
+            self.channel_signing_key.public_key().to_bytes(),
         )
-        .expect("our own Bedrock public key is a valid Ed25519 public key");
-        let producer_account = committee_discovery::read_config(&working_state)
-            .and_then(|config| {
-                config
-                    .entries
-                    .get(&own_sequencer_key)
-                    .map(|entry| entry.account_id)
-            })
-            .context("no stake entry for our own sequencer key; aborting block production")?;
+        .expect("our own channel signing public key is a valid Ed25519 public key");
+        let payee = reward_payee(&working_state, own_sequencer_key)?;
 
         let opening = chain_state::apply::opening_fee_state(&working_state);
         let mut summary = fee_core::BlockFeeSummary::default();
@@ -1701,7 +1746,7 @@ impl<S: StorageActorTrait, B: BedrockActorTrait> SequencerCore<S, B> {
         let placeholder_fee_lee_tx = LeeTransaction::Public(fee_invocation(
             fee_core::BlockFeeSummary::default(),
             0,
-            producer_account,
+            payee,
         ));
         let clock_tx = clock_invocation(new_block_height, new_block_timestamp);
         let clock_lee_tx = LeeTransaction::Public(clock_tx.clone());
@@ -1744,28 +1789,29 @@ impl<S: StorageActorTrait, B: BedrockActorTrait> SequencerCore<S, B> {
             if block_size > max_block_size {
                 // Would a block carrying nothing but this still be too big? Then
                 // it does not fit in any block and deferring it defers it for
-                // ever. A store-drained transaction is at the head of the queue
-                // every turn, so breaking here would stop production reaching
-                // anything behind it, including the whole mempool, permanently.
-                // Count it against the delivery instead so it is given up on.
+                // ever. A deferred transaction is at the head of the queue every
+                // turn, so breaking here would stop production reaching anything
+                // behind it, including the whole mempool, permanently. Give up on
+                // it instead.
                 //
                 // Measured on its own rather than from `block_size`, which also
                 // counts whatever this block already holds: a transaction that
                 // merely does not fit *today* is the ordinary deferral below.
-                if from_store
-                    && !self.fits_in_an_empty_block(
-                        &tx,
-                        &[placeholder_fee_lee_tx.clone(), clock_lee_tx.clone()],
-                        new_block_height,
-                        prev_block_hash,
-                        new_block_timestamp,
-                    )?
-                {
+                if !Self::fits_in_an_empty_block(
+                    &tx,
+                    &[placeholder_fee_lee_tx.clone(), clock_lee_tx.clone()],
+                    max_block_size,
+                    new_block_height,
+                    prev_block_hash,
+                    new_block_timestamp,
+                )? {
                     error!(
-                        "Sequencer-drained transaction {tx_hash} cannot fit in any block under the \
+                        "Transaction {tx_hash} cannot fit in any block under the \
                          {max_block_size} byte limit; giving up on it rather than stalling production",
                     );
-                    self.count_dispatch_failure(&tx).await;
+                    if from_store {
+                        self.count_dispatch_failure(&tx).await;
+                    }
                     continue;
                 }
 
@@ -1872,7 +1918,7 @@ impl<S: StorageActorTrait, B: BedrockActorTrait> SequencerCore<S, B> {
         let fee_tx = fee_invocation(
             summary,
             chain_state::apply::block_payout(&opening, &summary),
-            producer_account,
+            payee,
         );
         working_state
             .transition_from_public_transaction(&fee_tx, new_block_height, new_block_timestamp)
@@ -1951,17 +1997,22 @@ impl<S: StorageActorTrait, B: BedrockActorTrait> SequencerCore<S, B> {
         self.staked_keys_tx.subscribe()
     }
 
+    #[must_use]
+    pub fn max_block_size_watch(&self) -> MaxBlockSizeReceiver {
+        self.max_block_size_tx.subscribe()
+    }
+
     /// Handle to the channel-config actor, for the service to feed gossip into.
     #[must_use]
     pub const fn config_manager_ref(&self) -> &ActorRef<ChannelConfigActor> {
         &self.config_manager
     }
 
-    /// This node's Bedrock public key, hex — the identity the channel's
+    /// This node's channel signing public key, hex — the identity the channel's
     /// accredited keys and round-robin are keyed by.
     #[must_use]
-    pub fn bedrock_public_key_hex(&self) -> String {
-        hex::encode(self.bedrock_signing_key.public_key().to_bytes())
+    pub fn channel_signing_public_key_hex(&self) -> String {
+        hex::encode(self.channel_signing_key.public_key().to_bytes())
     }
 
     /// Returns the list of stored pending blocks.
@@ -1983,9 +2034,9 @@ impl<S: StorageActorTrait, B: BedrockActorTrait> SequencerCore<S, B> {
     /// the store re-feeds every turn, is a permanent stall unless it is given up
     /// on.
     fn fits_in_an_empty_block(
-        &self,
         tx: &LeeTransaction,
         system_txs: &[LeeTransaction],
+        max_block_size: usize,
         block_id: u64,
         prev_block_hash: HashType,
         timestamp: u64,
@@ -1999,9 +2050,7 @@ impl<S: StorageActorTrait, B: BedrockActorTrait> SequencerCore<S, B> {
         let size = borsh::to_vec(&alone)
             .context("Failed to serialize block for size check")?
             .len();
-        let max = usize::try_from(self.sequencer_config.max_block_size.as_u64())
-            .expect("`max_block_size` should fit into usize");
-        Ok(size <= max)
+        Ok(size <= max_block_size)
     }
 
     /// Counts one failed production attempt against `tx` if it is a cross-zone
@@ -2188,7 +2237,7 @@ fn deposit_already_minted(state: &lee::V03State, deposit_op_id: HashType) -> boo
     let receipt_id = bridge_core::deposit_receipt_account_id(bridge_program_id, deposit_op_id.0);
     state
         .get_account_by_id_ref(receipt_id)
-        .is_some_and(|receipt| !receipt.data.shard(bridge_program_id).is_empty())
+        .is_some_and(|receipt| !receipt.data.actor_state(bridge_program_id).is_empty())
 }
 
 /// Whether a cross-zone delivery is already on the chain we are building on.
@@ -2209,10 +2258,34 @@ fn dispatch_already_delivered(state: &lee::V03State, message: &CrossZoneMessage)
         message.src_block_id,
     );
     state.get_account_by_id_ref(shard_id).is_some_and(|shard| {
-        cross_zone_inbox_core::SeenShard::from_bytes(shard.data.shard(inbox_program_id).as_ref())
-            .is_ok_and(|seen| {
-                seen.binds(&message.src_block_hash) && seen.contains(message.src_tx_index)
-            })
+        cross_zone_inbox_core::SeenShard::from_bytes(
+            shard.data.actor_state(inbox_program_id).as_ref(),
+        )
+        .is_ok_and(|seen| {
+            seen.binds(&message.src_block_hash) && seen.contains(message.src_tx_index)
+        })
+    })
+}
+
+/// How the fee transaction pays this sequencer's stake ownership account, refusing production while
+/// neither public state nor a recovery binding lets it be paid.
+fn reward_payee(
+    state: &lee::V03State,
+    own_sequencer_key: sequencer_stake_core::SequencerKey,
+) -> Result<FeePayee> {
+    let producer_account = committee_discovery::read_config(state)
+        .and_then(|config| {
+            config
+                .entries
+                .get(&own_sequencer_key)
+                .map(|entry| entry.account_id)
+        })
+        .context("no stake entry for our own sequencer key; aborting block production")?;
+    FeePayee::for_producer(state, producer_account).with_context(|| {
+        format!(
+            "our reward account {producer_account} is neither in public state nor bound to a \
+             recovery note, so its fees cannot be paid; bind it before producing"
+        )
     })
 }
 
@@ -2262,6 +2335,21 @@ fn config_target(
     })
 }
 
+/// Refuses a `max_block_size` no block can use, and warns when this node's blocks are too slow
+/// to hold a turn.
+fn check_startup_channel_params(
+    params: &config::ChannelParams,
+    config: &SequencerConfig,
+) -> Result<()> {
+    if !config::keeps_turn(params, config.block_create_timeout) {
+        warn!(
+            "block_create_timeout ({:?}) is not under posting_timeout ({}s): this node loses its turn between its own blocks",
+            config.block_create_timeout, params.posting_timeout
+        );
+    }
+    config::check_max_block_size(params)
+}
+
 /// Hands the slasher and the gossip mesh the committee the head now holds. The
 /// produce path also refreshes it, but only a producing node takes turns.
 async fn refresh_committee<S: StorageActorTrait>(
@@ -2269,11 +2357,19 @@ async fn refresh_committee<S: StorageActorTrait>(
     chain: &Mutex<ChainState>,
     accredited_keys_tx: &AccreditedKeysSender,
     staked_keys_tx: &AccreditedKeysSender,
+    max_block_size_tx: &MaxBlockSizeSender,
 ) {
     let config = committee_discovery::read_config(chain.lock().await.head_state());
     let Some(config) = config else {
         return;
     };
+    if let Some(params) = config.channel_params {
+        max_block_size_tx.send_if_modified(|current| {
+            let changed = *current != params.max_block_size;
+            *current = params.max_block_size;
+            changed
+        });
+    }
     // The mesh screens against the same committee the slasher gates on.
     let keys: AccreditedKeys = config
         .accredited_committee_members()
@@ -2389,11 +2485,19 @@ fn build_genesis_state(
     // Config txs seed the config accounts by transaction, so every node
     // reconstructs them by replaying the genesis block. Every cross-zone config
     // is initialized: each builtin has a user-callable InitConfig, so an empty
-    // config shard would be left for whoever calls it first. The inbox's is
+    // config actor state would be left for whoever calls it first. The inbox's is
     // receiving-zones-only.
     // The self-stake is appended here, so every index below is an index into
     // this list, not into `config.genesis`.
     let genesis_actions = effective_genesis_actions(config, bootstrap_sequencer_key);
+    // A node joining an existing channel builds a placeholder genesis, which the channel's
+    // replaces.
+    let channel_params = config
+        .genesis
+        .as_ref()
+        .map_or_else(config::default_channel_params, |genesis| {
+            genesis.channel_params
+        });
 
     let cross_zone_declared = config.cross_zone.as_ref();
     assert!(
@@ -2421,17 +2525,27 @@ fn build_genesis_state(
         .filter_map(|(index, action)| {
             let index = u64::try_from(index).expect("genesis action count fits in u64");
             match action {
-                GenesisAction::SupplyAccount {
-                    account_id,
-                    balance,
-                } => Some(build_supply_account_genesis_transaction(
-                    account_id,
-                    *balance,
-                    genesis_deposit_op_id(index),
-                )),
+                GenesisAction::SupplyAccount { recipient, balance } => {
+                    Some(build_supply_account_genesis_transaction(
+                        recipient,
+                        *balance,
+                        genesis_deposit_op_id(index),
+                    ))
+                }
+                GenesisAction::SupplyPrivateAccount { address, balance } => Some(
+                    bridge_deposit_tx(
+                        genesis_deposit_op_id(index),
+                        &Credited::Private(*address),
+                        *balance,
+                    )
+                    .expect("Failed to serialize genesis deposit instruction"),
+                ),
                 GenesisAction::SupplyBridgeLockHolding { holder, amount } => {
                     Some(build_supply_account_genesis_transaction(
-                        &cross_zone::bridge_lock_holding_account_id(*holder),
+                        &DepositRecipient::Identified(PublicAccountEvidence::Pda {
+                            program: programs::bridge_lock_account_id(),
+                            seed: bridge_lock_core::holding_seed(&holder.into_value()),
+                        }),
                         *amount,
                         genesis_deposit_op_id(index),
                     ))
@@ -2442,10 +2556,8 @@ fn build_genesis_state(
         });
 
     let staked = founding_stakes(&genesis_actions);
-    let bootstrap_stake_txs = build_stake_genesis_transactions(
-        &staked,
-        config.bedrock_config.channel_params.minimum_sequencer_stake,
-    );
+    let bootstrap_stake_txs =
+        build_stake_genesis_transactions(&staked, channel_params.minimum_sequencer_stake);
 
     // The genesis fee transaction credits the first staked sequencer's ownership account.
     //
@@ -2463,7 +2575,7 @@ fn build_genesis_state(
     let genesis_summary = fee_core::BlockFeeSummary::default();
     let genesis_payout = chain_state::apply::block_payout(&genesis_opening, &genesis_summary);
     let genesis_txs: Vec<_> = std::iter::once(build_init_channel_params_transaction(
-        config.bedrock_config.channel_params,
+        channel_params,
         *config.bedrock_config.channel_id.as_ref(),
     ))
     .chain(cross_zone_config_txs)
@@ -2473,7 +2585,7 @@ fn build_genesis_state(
     .chain(std::iter::once(fee_invocation(
         genesis_summary,
         genesis_payout,
-        producer,
+        FeePayee::Present(producer),
     )))
     .chain(std::iter::once(clock_invocation(GENESIS_BLOCK_ID, 0)))
     .collect();
@@ -2514,9 +2626,9 @@ fn founding_stakes(genesis: &[GenesisAction]) -> Vec<FoundingStake> {
                     signature: stake_signature.clone(),
                 })
             }
-            GenesisAction::SupplyAccount { .. } | GenesisAction::SupplyBridgeLockHolding { .. } => {
-                None
-            }
+            GenesisAction::SupplyAccount { .. }
+            | GenesisAction::SupplyPrivateAccount { .. }
+            | GenesisAction::SupplyBridgeLockHolding { .. } => None,
         })
         .collect()
 }
@@ -2530,7 +2642,10 @@ fn effective_genesis_actions(
     config: &SequencerConfig,
     bootstrap_sequencer_key: Option<sequencer_stake_core::SequencerKey>,
 ) -> Vec<GenesisAction> {
-    let mut actions = config.genesis.clone();
+    let Some(genesis) = &config.genesis else {
+        return Vec::new();
+    };
+    let mut actions = genesis.actions.clone();
     if actions
         .iter()
         .any(|action| matches!(action, GenesisAction::StakeSequencer { .. }))
@@ -2550,7 +2665,7 @@ fn effective_genesis_actions(
                 0,
                 key,
                 &owner,
-                config.bedrock_config.channel_params.minimum_sequencer_stake,
+                genesis.channel_params.minimum_sequencer_stake,
             ),
         }
     }));
@@ -2564,7 +2679,7 @@ fn founding_committee(
     config: &SequencerConfig,
     own_key: sequencer_stake_core::SequencerKey,
 ) -> Option<Vec<Ed25519PublicKey>> {
-    let mut keys: Vec<_> = founding_stakes(&config.genesis)
+    let mut keys: Vec<_> = founding_stakes(&effective_genesis_actions(config, None))
         .into_iter()
         .map(|stake| stake.key)
         .collect();
@@ -2606,30 +2721,39 @@ pub fn genesis_stake_message(
     let funding_nonce = u128::try_from(index).expect("founding sequencer count fits in u128");
 
     let sequencer_stake_program_id = programs::sequencer_stake_account_id();
-    Message::try_new(
-        sequencer_stake_program_id,
-        vec![
-            ProgramShardSelector::native_balance(genesis_stake_funding_account()),
-            ProgramShardSelector::new(ownership_id, sequencer_stake_program_id),
-            ProgramShardSelector::native_balance(system_accounts::stake_funds_account_id(
-                &ownership_id,
-            )),
-            ProgramShardSelector::new(
-                system_accounts::sequencer_stake_config_account_id(),
-                sequencer_stake_program_id,
-            ),
-        ],
-        vec![
-            lee_core::account::Nonce(funding_nonce),
-            lee_core::account::Nonce(0),
-        ],
-        sequencer_stake_core::Instruction::Stake {
-            sequencer_key,
-            amount,
-            has_record: false,
-        },
-    )
-    .expect("Failed to build genesis Stake message")
+    let ownership = Actor::new(ownership_id, sequencer_stake_program_id);
+    Message {
+        admission_evidence: vec![PublicAccountEvidence::Pda {
+            program: sequencer_stake_program_id,
+            seed: sequencer_stake_core::stake_funds_seed(&ownership_id),
+        }],
+        ..Message::try_new(
+            ownership,
+            vec![
+                ownership,
+                Actor::native_balance(system_accounts::stake_funds_account_id(&ownership_id)),
+                Actor::native_balance(genesis_stake_funding_account()),
+                Actor::new(
+                    system_accounts::sequencer_stake_config_account_id(),
+                    sequencer_stake_program_id,
+                ),
+            ],
+            BTreeMap::from([
+                (
+                    genesis_stake_funding_account(),
+                    lee_core::account::Nonce(funding_nonce),
+                ),
+                (ownership_id, lee_core::account::Nonce(0)),
+            ]),
+            sequencer_stake_core::Message::Stake {
+                sequencer_key,
+                amount,
+                has_record: false,
+                funding: genesis_stake_funding_account(),
+            },
+        )
+        .expect("Failed to build genesis Stake message")
+    }
 }
 
 /// Signs the founding sequencer at `index`'s genesis `Stake`, for an operator
@@ -2653,15 +2777,15 @@ fn build_init_channel_params_transaction(
     channel_params: config::ChannelParams,
     channel_id: [u8; 32],
 ) -> PublicTransaction {
-    let sequencer_stake_program_id = programs::sequencer_stake_account_id();
+    let config = Actor::new(
+        system_accounts::sequencer_stake_config_account_id(),
+        programs::sequencer_stake_account_id(),
+    );
     let message = Message::try_new(
-        sequencer_stake_program_id,
-        vec![ProgramShardSelector::new(
-            system_accounts::sequencer_stake_config_account_id(),
-            sequencer_stake_program_id,
-        )],
-        vec![],
-        sequencer_stake_core::Instruction::InitChannelParams {
+        config,
+        vec![config],
+        BTreeMap::new(),
+        sequencer_stake_core::Message::InitChannelParams {
             params: channel_params,
             channel_id,
         },
@@ -2685,15 +2809,18 @@ fn build_stake_genesis_transactions(
 
     let funding_key = lee::PrivateKey::try_new(GENESIS_STAKE_FUNDING_KEY).unwrap();
     let funding_public_key = lee::PublicKey::new_from_private_key(&funding_key);
-    let amount = u64::try_from(minimum_stake).expect("minimum sequencer stake exceeds u64");
+    let funding =
+        DepositRecipient::Identified(PublicAccountEvidence::Key(funding_public_key.clone()));
+    let amount =
+        BridgeAmount::try_from(minimum_stake).expect("minimum sequencer stake exceeds u64");
 
-    // One deposit per stake, so no total has to fit `u64`. They precede the
+    // One deposit per stake, so no total has to fit a `BridgeAmount`. They precede the
     // stakes because each one funds the account the stakes draw on.
     let mut txs: Vec<_> = staked
         .iter()
         .map(|stake| {
             build_supply_account_genesis_transaction(
-                &genesis_stake_funding_account(),
+                &funding,
                 amount,
                 genesis_deposit_op_id(stake.genesis_index),
             )
@@ -2727,10 +2854,12 @@ fn build_stake_genesis_transactions(
 /// Bridge-lock holder balances configured for this zone's genesis.
 fn bridge_lock_holdings(
     genesis: &[GenesisAction],
-) -> impl Iterator<Item = (lee::AccountId, u64)> + '_ {
+) -> impl Iterator<Item = (lee::AccountId, BridgeAmount)> + '_ {
     genesis.iter().filter_map(|action| match action {
         GenesisAction::SupplyBridgeLockHolding { holder, amount } => Some((*holder, *amount)),
-        GenesisAction::SupplyAccount { .. } | GenesisAction::StakeSequencer { .. } => None,
+        GenesisAction::SupplyAccount { .. }
+        | GenesisAction::SupplyPrivateAccount { .. }
+        | GenesisAction::StakeSequencer { .. } => None,
     })
 }
 
@@ -2762,31 +2891,65 @@ fn genesis_deposit_op_id(index: u64) -> [u8; 32] {
 }
 
 fn build_supply_account_genesis_transaction(
-    account_id: &AccountId,
-    amount: u64,
+    recipient: &DepositRecipient,
+    amount: BridgeAmount,
     op_id: [u8; 32],
 ) -> PublicTransaction {
-    let bridge_program_id = programs::bridge_account_id();
-    let receipt_id = bridge_core::deposit_receipt_account_id(bridge_program_id, op_id);
+    bridge_deposit_tx(op_id, &Credited::Public(recipient.evidence()), amount)
+        .expect("Failed to serialize genesis deposit instruction")
+}
 
-    let message = Message::try_new(
-        bridge_program_id,
-        vec![
-            ProgramShardSelector::native_balance(system_accounts::bridge_account_id()),
-            ProgramShardSelector::native_balance(*account_id),
-            ProgramShardSelector::new(receipt_id, bridge_program_id),
-        ],
-        Vec::new(),
-        bridge_core::Instruction::Deposit {
-            l1_deposit_op_id: op_id,
-            recipient_id: *account_id,
-            amount,
-        },
-    )
-    .expect("Failed to serialize genesis deposit instruction");
+fn bridge_deposit_tx(
+    op_id: [u8; 32],
+    credited: &Credited<'_>,
+    amount: BridgeAmount,
+) -> Result<PublicTransaction, lee::error::LeeError> {
+    let receipt = bridge_receipt_actor(op_id);
+    let recipient_id = credited.account_id();
+    let message = Message {
+        admission_evidence: std::iter::once(PublicAccountEvidence::Pda {
+            program: programs::bridge_account_id(),
+            seed: bridge_core::deposit_receipt_seed(op_id),
+        })
+        .chain(credited.evidence().cloned())
+        .collect(),
+        ..Message::try_new(
+            receipt,
+            bridge_deposit_actors(receipt, credited),
+            BTreeMap::new(),
+            bridge_core::Message::Deposit {
+                l1_deposit_op_id: op_id,
+                recipient_id,
+                amount,
+            },
+        )?
+    };
     let witness_set = lee::public_transaction::WitnessSet::from_raw_parts(Vec::new());
 
-    PublicTransaction::new(message, witness_set)
+    Ok(PublicTransaction::new(message, witness_set))
+}
+
+/// The deposit-receipt actor a `Deposit` for `op_id` is addressed to.
+fn bridge_receipt_actor(op_id: [u8; 32]) -> Actor {
+    let bridge_program_id = programs::bridge_account_id();
+    Actor::new(
+        bridge_core::deposit_receipt_account_id(bridge_program_id, op_id),
+        bridge_program_id,
+    )
+}
+
+/// The receipt, then the bridge custody and the public recipient the deposit's transfer moves
+/// balance between. A private recipient is not declared: its credit is published to it.
+fn bridge_deposit_actors(receipt: Actor, credited: &Credited<'_>) -> Vec<Actor> {
+    let custody = Actor::native_balance(system_accounts::bridge_account_id());
+    match credited {
+        Credited::Public(evidence) => vec![
+            receipt,
+            custody,
+            Actor::native_balance(evidence.account_id()),
+        ],
+        Credited::Private(_) => vec![receipt, custody],
+    }
 }
 
 fn pending_deposit_event_record(deposit: &DepositInfo) -> PendingDepositEventRecord {
@@ -2802,78 +2965,53 @@ fn build_bridge_deposit_tx_from_event(event: &PendingDepositEventRecord) -> Resu
     let metadata = DepositMetadata::try_from_slice(&event.metadata)
         .context("Failed to decode finalized Bedrock deposit metadata")?;
 
-    let bridge_program_id = programs::bridge_account_id();
-    // The receipt PDA carries the exactly-once check: the program reads it to
-    // detect a replay, so it must be in the tx's account list.
-    let receipt_id =
-        bridge_core::deposit_receipt_account_id(bridge_program_id, event.deposit_op_id.0);
-
-    let message = Message::try_new(
-        bridge_program_id,
-        vec![
-            ProgramShardSelector::native_balance(system_accounts::bridge_account_id()),
-            ProgramShardSelector::native_balance(metadata.recipient_id),
-            ProgramShardSelector::new(receipt_id, bridge_program_id),
-        ],
-        Vec::new(),
-        bridge_core::Instruction::Deposit {
-            l1_deposit_op_id: event.deposit_op_id.0,
-            recipient_id: metadata.recipient_id,
-            amount: event.amount,
-        },
-    )
-    .context("Failed to build bridge deposit message")?;
-
-    let witness_set = lee::public_transaction::WitnessSet::from_raw_parts(Vec::new());
-    Ok(LeeTransaction::Public(PublicTransaction::new(
-        message,
-        witness_set,
-    )))
+    // The receipt PDA carries the exactly-once check: the deposit is addressed to it,
+    // and its own actor state detects a replay.
+    Ok(LeeTransaction::Public(
+        bridge_deposit_tx(
+            event.deposit_op_id.0,
+            &Credited::Public(metadata.recipient.evidence()),
+            event.amount,
+        )
+        .context("Failed to build bridge deposit message")?,
+    ))
 }
 
 /// A `FinalizeUnstake` for every release whose exit delay has passed in `state`.
 fn build_finalize_unstake_txs(state: &lee::V03State) -> VecDeque<LeeTransaction> {
-    let Some(params) = committee_discovery::channel_params(state) else {
-        return VecDeque::new();
-    };
     committee_discovery::finalize_unstake_candidates(state)
         .into_iter()
-        .filter_map(|(ownership_id, sequencer_key, pending)| {
-            build_finalize_unstake_tx(ownership_id, sequencer_key, pending, params.exit_delay)
+        .filter_map(|(ownership_id, sequencer_key, destination)| {
+            build_finalize_unstake_tx(state, ownership_id, sequencer_key, destination)
                 .map_err(|err| warn!("Failed to build FinalizeUnstake tx: {:#}", anyhow!(err)))
                 .ok()
         })
         .collect()
 }
 
-// Unsigned: FinalizeUnstake needs no authorization, per the program.
+// Unsigned: FinalizeUnstake needs no authorization, per the program. The payout destination is
+// declared only when settlement admits it as public.
 fn build_finalize_unstake_tx(
+    state: &lee::V03State,
     ownership_id: AccountId,
     sequencer_key: sequencer_stake_core::SequencerKey,
-    pending: sequencer_stake_core::PendingUnstake,
-    exit_delay: u64,
+    destination: AccountId,
 ) -> Result<LeeTransaction> {
-    let sequencer_stake_program_id = programs::sequencer_stake_account_id();
+    let config = Actor::new(
+        system_accounts::sequencer_stake_config_account_id(),
+        programs::sequencer_stake_account_id(),
+    );
+    let admitted = state.get_account_by_id_ref(destination).is_some();
     let message = Message::try_new(
-        sequencer_stake_program_id,
-        vec![
-            ProgramShardSelector::new(ownership_id, sequencer_stake_program_id),
-            ProgramShardSelector::native_balance(system_accounts::stake_funds_account_id(
-                &ownership_id,
-            )),
-            ProgramShardSelector::native_balance(pending.destination),
-            ProgramShardSelector::new(
-                system_accounts::sequencer_stake_config_account_id(),
-                sequencer_stake_program_id,
-            ),
-        ],
-        vec![],
-        sequencer_stake_core::Instruction::FinalizeUnstake {
-            sequencer_key,
-            amount: pending.amount,
-            requested_at: pending.requested_at,
-            exit_delay,
-        },
+        config,
+        [
+            config,
+            Actor::native_balance(system_accounts::stake_funds_account_id(&ownership_id)),
+        ]
+        .into_iter()
+        .chain(admitted.then_some(Actor::native_balance(destination))),
+        BTreeMap::new(),
+        sequencer_stake_core::Message::FinalizeUnstake { sequencer_key },
     )
     .context("Failed to build FinalizeUnstake message")?;
 
@@ -2901,26 +3039,27 @@ fn resubmittable_txs(block: &Block) -> Vec<LeeTransaction> {
 
 #[must_use]
 fn is_sequencer_only_tx(tx: &LeeTransaction) -> bool {
-    matches!(tx, LeeTransaction::Public(tx)
-        if is_sequencer_only_program(tx.message().program_account_id))
+    let Some((to, _)) = tx.public_call() else {
+        return false;
+    };
+    is_sequencer_only_program(to.program_account_id)
 }
 
 /// The cross-zone message an inbox dispatch delivers, or `None` if `tx` is not
 /// a dispatch.
 #[must_use]
 fn extract_cross_zone_dispatch(tx: &LeeTransaction) -> Option<CrossZoneMessage> {
-    let LeeTransaction::Public(tx) = tx else {
-        return None;
-    };
-
-    let message = tx.message();
-    if message.program_account_id != programs::cross_zone_inbox_account_id() {
+    let (to, message) = tx.public_call()?;
+    if to.program_account_id != programs::cross_zone_inbox_account_id() {
         return None;
     }
 
-    match borsh::from_slice::<cross_zone_inbox_core::Instruction>(&message.instruction_data) {
-        Ok(cross_zone_inbox_core::Instruction::Dispatch(msg)) => Some(msg),
-        Ok(cross_zone_inbox_core::Instruction::InitConfig(_)) | Err(_) => None,
+    match borsh::from_slice::<cross_zone_inbox_core::Message>(message) {
+        Ok(cross_zone_inbox_core::Message::Dispatch(msg)) => Some(msg),
+        Ok(
+            cross_zone_inbox_core::Message::Mark(_) | cross_zone_inbox_core::Message::InitConfig(_),
+        )
+        | Err(_) => None,
     }
 }
 
@@ -3018,51 +3157,35 @@ async fn settle_reconstructed_deliveries<S: StorageActorTrait>(
 
 #[must_use]
 fn extract_bridge_deposit_id(tx: &LeeTransaction) -> Option<HashType> {
-    let LeeTransaction::Public(tx) = tx else {
-        return None;
-    };
-
-    let message = tx.message();
-    if message.program_account_id != programs::bridge_account_id() {
+    let (to, message) = tx.public_call()?;
+    if to.program_account_id != programs::bridge_account_id() {
         return None;
     }
 
-    let instruction =
-        borsh::from_slice::<bridge_core::Instruction>(&message.instruction_data).ok()?;
-
-    match instruction {
-        bridge_core::Instruction::Deposit {
+    match borsh::from_slice::<bridge_core::Message>(message).ok()? {
+        bridge_core::Message::Deposit {
             l1_deposit_op_id, ..
         } => Some(HashType(l1_deposit_op_id)),
-        bridge_core::Instruction::Withdraw { .. } => None,
+        bridge_core::Message::Withdraw { .. } => None,
     }
 }
 
 #[must_use]
 fn extract_bridge_withdraw_data(tx: &LeeTransaction) -> Option<WithdrawArg> {
-    let LeeTransaction::Public(tx) = tx else {
-        return None;
-    };
-
-    let message = tx.message();
-    if message.program_account_id != programs::bridge_account_id() {
+    let (to, message) = tx.public_call()?;
+    if to.program_account_id != programs::bridge_account_id() {
         return None;
     }
 
-    let instruction =
-        borsh::from_slice::<bridge_core::Instruction>(&message.instruction_data).ok()?;
-
-    let bridge_core::Instruction::Withdraw {
+    let bridge_core::Message::Withdraw {
         amount,
         bedrock_account_pk,
-    } = instruction
+    } = borsh::from_slice::<bridge_core::Message>(message).ok()?
     else {
         return None;
     };
 
-    let recipient_pk = logos_blockchain_key_management_system_service::keys::ZkPublicKey::from(
-        BigUint::from_bytes_le(&bedrock_account_pk),
-    );
+    let recipient_pk = ZkPublicKey::from(BigUint::from_bytes_le(&bedrock_account_pk));
 
     Some(WithdrawArg {
         outputs: logos_blockchain_core::mantle::ledger::Outputs::new(
@@ -3088,8 +3211,24 @@ fn withdrawal_reconciliation_key(note_id: &NoteId) -> WithdrawalReconciliationKe
     WithdrawalReconciliationKey { released_note_id }
 }
 
+/// Parses a Bedrock wallet public key from hex.
+pub fn parse_funding_public_key(hex_key: &str) -> Result<ZkPublicKey> {
+    serde_json::from_value(serde_json::Value::String(hex_key.trim().to_owned()))
+        .context("not a Bedrock public key in hex")
+}
+
+/// Loads the home's [`BEDROCK_FUNDING_PUBLIC_KEY_FILE`].
+pub fn load_funding_public_key(home: &Path) -> Result<ZkPublicKey> {
+    let path = home.join(BEDROCK_FUNDING_PUBLIC_KEY_FILE);
+    let hex_key = std::fs::read_to_string(&path)
+        .with_context(|| format!("Failed to read {}", path.display()))?;
+    parse_funding_public_key(&hex_key).with_context(|| format!("Invalid key in {}", path.display()))
+}
+
 /// Load key bytes from file or generate a new set if it doesn't exist.
 fn load_or_create_key_bytes(path: &Path) -> Result<[u8; ED25519_SECRET_KEY_SIZE]> {
+    use std::{io::Write as _, os::unix::fs::OpenOptionsExt as _};
+
     if path.exists() {
         let key_bytes = std::fs::read(path)?;
 
@@ -3103,7 +3242,13 @@ fn load_or_create_key_bytes(path: &Path) -> Result<[u8; ED25519_SECRET_KEY_SIZE]
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(path, key_bytes)?;
+        // Readable by the owner only.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)?
+            .write_all(&key_bytes)?;
         Ok(key_bytes)
     }
 }

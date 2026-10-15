@@ -32,6 +32,7 @@ members = [
   "lez/sequencer/actors/slasher",
   "lez/sequencer/actors/storage",
   "lez/sequencer/actors/bedrock",
+  "lez/ffi_types",
   "lez/indexer/core",
   "lez/indexer/service",
   "lez/indexer/service/protocol",
@@ -103,6 +104,7 @@ sequencer_slasher_actor = { path = "lez/sequencer/actors/slasher" }
 sequencer_storage_actor = { path = "lez/sequencer/actors/storage" }
 sequencer_bedrock_actor = { path = "lez/sequencer/actors/bedrock" }
 sequencer_service = { path = "lez/sequencer/service" }
+ffi_types = { path = "lez/ffi_types" }
 indexer_core = { path = "lez/indexer/core" }
 indexer_service = { path = "lez/indexer/service" }
 indexer_service_protocol = { path = "lez/indexer/service/protocol" }
