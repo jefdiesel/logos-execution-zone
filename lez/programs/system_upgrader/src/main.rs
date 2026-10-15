@@ -3,8 +3,8 @@
 //! Owns every system program's address as a PDA and upgrades a system program in two steps:
 //! `Schedule` records the new segment chain and the block it applies from in the registry; `Apply`
 //! checks and clears that record, then has the program loader point the program's header at the
-//! new chain, authorized through the program's PDA seed. Every message is handled at the
-//! registry's actor.
+//! new chain, authorized through the program's PDA seed. `Cancel` clears a pending record without
+//! upgrading. Every message is handled at the registry's actor.
 
 use lee_core::program::{LoaderMessage, PdaSeed, ReceiveInput, Response, SyncMessage};
 use system_upgrader_core::{
@@ -59,6 +59,23 @@ fn handle_message(input: &ReceiveInput, message: Message) -> Response {
                         immutable: false,
                     },
                 ))
+        }
+        Message::Cancel {
+            name,
+            first_segment,
+            from_height,
+        } => {
+            let pending = pending_mut(&mut registry, &name);
+            assert_eq!(
+                *pending,
+                Some(ScheduledUpgrade {
+                    first_segment,
+                    from_height,
+                }),
+                "the upgrade does not match the system program's schedule"
+            );
+            *pending = None;
+            Response::set_state(registry.to_bytes())
         }
     }
 }
