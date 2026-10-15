@@ -168,7 +168,7 @@ mod inner {
                     ),
                     (recipient_id, Account::default()),
                 ])
-                .with_named_programs([(bridge_account_id(), bridge())]);
+                .with_named_programs([(bridge_account_id(), bridge(), true)]);
 
             let tx = deposit_tx(op_id, recipient_id, amount);
             let events = state.transition_from_public_transaction(&tx, 1, 0).unwrap();

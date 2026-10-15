@@ -232,7 +232,11 @@ pub fn initial_state(cross_zone: bool) -> V03State {
     lee::V03State::new()
         .with_public_accounts(initial_public_accounts())
         .with_recovery_bindings(initial_recovery_bindings())
-        .with_named_programs(initial_programs(cross_zone))
+        .with_named_programs(
+            initial_programs(cross_zone)
+                .into_iter()
+                .map(|(account_id, program)| (account_id, program, true)),
+        )
 }
 
 #[cfg(test)]

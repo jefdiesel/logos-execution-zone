@@ -49,7 +49,7 @@ fn insert_program() {
     let account_id = AccountId::from_builtin_program(program_to_insert.id());
     assert!(!state.public_state.contains_key(&account_id));
 
-    state.insert_program(&program_to_insert, true);
+    state.insert_program(&program_to_insert);
 
     // Walks the full segment chain regardless of how many chunks the elf split into,
     // exercising the same reconstruction a real caller uses.
@@ -80,10 +80,13 @@ fn genesis_immutable_program_lands_immutable_mirror_commitment() {
 
 #[test]
 fn genesis_mutable_program_lands_no_immutable_mirror_commitment() {
-    let state =
-        V03State::new().with_genesis_programs([(crate::test_methods::forges_echo(), false)]);
     let header_account_id =
         lee_core::account::AccountId::from_builtin_program(crate::test_methods::forges_echo().id());
+    let state = V03State::new().with_named_programs([(
+        header_account_id,
+        crate::test_methods::forges_echo(),
+        false,
+    )]);
     let program_header = lee_core::program::ProgramHeader::from_loader_actor_state(
         state.public_state[&header_account_id]
             .data

@@ -208,20 +208,6 @@ impl V03State {
         self.private_state.0.digest()
     }
 
-    /// Initializes state with given public account balances leaving other account fields at their
-    /// default values.
-    #[must_use]
-    pub fn with_public_account_balances(
-        mut self,
-        balances: impl IntoIterator<Item = (AccountId, u128)>,
-    ) -> Self {
-        for (account_id, balance) in balances {
-            self.public_state
-                .insert_mut(account_id, Account::funded(balance));
-        }
-        self
-    }
-
     /// Initializes state with given public accounts.
     #[must_use]
     pub fn with_public_accounts(
@@ -262,43 +248,22 @@ impl V03State {
         self
     }
 
+    /// Seeds each program at its given address, `immutable` or not.
     #[must_use]
     pub fn with_named_programs(
         mut self,
-        programs: impl IntoIterator<Item = (AccountId, Program)>,
+        programs: impl IntoIterator<Item = (AccountId, Program, bool)>,
     ) -> Self {
-        for (account_id, program) in programs {
-            self.insert_program_at(account_id, &program, true);
+        for (account_id, program, immutable) in programs {
+            self.insert_program_at(account_id, &program, immutable);
         }
         self
     }
 
-    #[must_use]
-    pub fn with_programs(self, programs: impl IntoIterator<Item = Program>) -> Self {
-        self.with_genesis_programs(programs.into_iter().map(|program| (program, true)))
-    }
-
-    #[must_use]
-    pub fn with_genesis_programs(
-        mut self,
-        programs: impl IntoIterator<Item = (Program, bool)>,
-    ) -> Self {
-        for (program, immutable) in programs {
-            self.insert_program(&program, immutable);
-        }
-        self
-    }
-
-    /// Seeds a builtin as a loader-owned header pointing at a segment chain holding its
+    /// Seeds a program as a loader-owned header pointing at a segment chain holding its
     /// `user_elf`, chunked the same way a live `program_loader` deploy would.
-    pub(crate) fn insert_program(&mut self, program: &Program, immutable: bool) {
-        self.insert_program_at(
-            AccountId::from_builtin_program(program.id()),
-            program,
-            immutable,
-        );
-    }
-
+    ///
+    /// FIXME: This function should be gated for tests-only and genesis-only.
     fn insert_program_at(
         &mut self,
         header_account_id: AccountId,
@@ -643,6 +608,34 @@ impl V03State {
 
 #[cfg(any(test, feature = "test-utils"))]
 impl V03State {
+    /// Seeds each program immutable, at the address derived from its image ID.
+    #[must_use]
+    pub fn with_programs(mut self, programs: impl IntoIterator<Item = Program>) -> Self {
+        for program in programs {
+            self.insert_program(&program);
+        }
+        self
+    }
+
+    /// Seeds `program` immutable, at the address derived from its image ID.
+    pub(crate) fn insert_program(&mut self, program: &Program) {
+        self.insert_program_at(AccountId::from_builtin_program(program.id()), program, true);
+    }
+
+    /// Initializes state with given public account balances leaving other account fields at their
+    /// default values.
+    #[must_use]
+    pub fn with_public_account_balances(
+        self,
+        balances: impl IntoIterator<Item = (AccountId, u128)>,
+    ) -> Self {
+        self.with_public_accounts(
+            balances
+                .into_iter()
+                .map(|(account_id, balance)| (account_id, Account::funded(balance))),
+        )
+    }
+
     pub fn force_insert_account(&mut self, account_id: AccountId, account: Account) {
         self.public_state.insert_mut(account_id, account);
     }
@@ -662,7 +655,7 @@ impl V03State {
 }
 
 /// The deterministic `AccountId` a genesis-seeded builtin's `index`-th segment lives at.
-/// Only `insert_program` needs this — a live deploy has a real signer to pick addresses instead.
+/// Only `insert_program_at` needs this — a live deploy has a real signer to pick addresses instead.
 fn genesis_segment_account_id(header_account_id: AccountId, index: usize) -> AccountId {
     use sha2::{Digest as _, Sha256};
     const GENESIS_SEGMENT_ID_PREFIX: &[u8; 32] = b"/LEE/v0.3/AccountId/GenesisSeg/\x00";
