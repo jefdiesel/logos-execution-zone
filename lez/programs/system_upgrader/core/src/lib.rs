@@ -1,4 +1,4 @@
-//! `system_upgrader`: upgrades the system programs, each one of its PDAs
+//! `system_upgrader`: upgrades and installs the system programs, each one of its PDAs
 //! (`PdaSeed::for_system_program(name)`). Pending upgrades live in its registry. Only the block
 //! producer includes its transactions.
 
@@ -35,6 +35,12 @@ pub enum Message {
         first_segment: AccountId,
         from_height: BlockId,
     },
+    /// Deploys a new, mutable system program `name` from the chain at `first_segment`. Declares
+    /// its loader actor ([`loader_actor`]), which holds no header yet.
+    Install {
+        name: SystemProgramName,
+        first_segment: AccountId,
+    },
 }
 
 /// A pending upgrade, stored in the [`Registry`] under the system program's name.
@@ -45,7 +51,7 @@ pub struct ScheduledUpgrade {
 }
 
 /// Every upgradable system program, by name, with its pending upgrade, if any. Held in the
-/// registry's actor state ([`registry_actor`]): seeded at genesis.
+/// registry's actor state ([`registry_actor`]): seeded at genesis, extended by `Install`.
 #[derive(Clone, Debug, Default, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub struct Registry {
     pub programs: BTreeMap<SystemProgramName, Option<ScheduledUpgrade>>,

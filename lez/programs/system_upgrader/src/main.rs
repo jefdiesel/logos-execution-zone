@@ -4,7 +4,8 @@
 //! `Schedule` records the new segment chain and the block it applies from in the registry; `Apply`
 //! checks and clears that record, then has the program loader point the program's header at the
 //! new chain, authorized through the program's PDA seed. `Cancel` clears a pending record without
-//! upgrading. Every message is handled at the registry's actor.
+//! upgrading, and `Install` deploys a new system program the same way. Every message is handled at
+//! the registry's actor.
 
 use lee_core::program::{LoaderMessage, PdaSeed, ReceiveInput, Response, SyncMessage};
 use system_upgrader_core::{
@@ -76,6 +77,22 @@ fn handle_message(input: &ReceiveInput, message: Message) -> Response {
             );
             *pending = None;
             Response::set_state(registry.to_bytes())
+        }
+        Message::Install {
+            name,
+            first_segment,
+        } => {
+            assert!(
+                registry.programs.insert(name, None).is_none(),
+                "system program is already registered"
+            );
+            Response::set_state(registry.to_bytes()).send(loader_message(
+                &name,
+                &LoaderMessage::CreateHeader {
+                    first_segment,
+                    immutable: false,
+                },
+            ))
         }
     }
 }

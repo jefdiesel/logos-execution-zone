@@ -242,6 +242,16 @@ mod inner {
                 )
             }
 
+            fn install_tx(name: SystemProgramName, first_segment: AccountId) -> PublicTransaction {
+                system_upgrader_tx(
+                    &[loader_actor(&name)],
+                    &Message::Install {
+                        name,
+                        first_segment,
+                    },
+                )
+            }
+
             fn registry(state: &V03State) -> Registry {
                 Registry::from_bytes(
                     state
@@ -514,6 +524,55 @@ mod inner {
                     "got: {err}"
                 );
                 assert_eq!(schedule(&state), None);
+            }
+
+            #[test]
+            fn installing_a_new_system_program_deploys_it_mutable() {
+                let (mut state, ids) = staged();
+                let name = SystemProgramName::new(b"new_system_program");
+                let program = AccountId::from_system_program_name(&name);
+
+                state
+                    .transition_from_public_transaction(&install_tx(name, ids[0]), 1, 0)
+                    .expect("a new system program installs");
+                assert_eq!(
+                    state.get_program_image_id(program),
+                    Some(ping_receiver().id())
+                );
+                let header = lee_core::program::ProgramHeader::from_loader_actor_state(
+                    state
+                        .get_account_by_id(program)
+                        .data
+                        .actor_state(PROGRAM_LOADER_ACCOUNT_ID),
+                )
+                .unwrap();
+                assert!(
+                    !header.immutable,
+                    "an installed system program is upgradable"
+                );
+                assert_eq!(
+                    registry(&state).programs.get(&name),
+                    Some(&None),
+                    "an installed system program is registered, with nothing pending"
+                );
+            }
+
+            #[test]
+            fn installing_over_an_existing_system_program_is_refused() {
+                let (mut state, ids) = staged();
+
+                let err = state
+                    .transition_from_public_transaction(&install_tx(CLOCK_NAME, ids[0]), 1, 0)
+                    .expect_err("clock is already registered");
+                assert!(
+                    err.to_string()
+                        .contains("system program is already registered"),
+                    "got: {err}"
+                );
+                assert_eq!(
+                    state.get_program_image_id(clock_account_id()),
+                    Some(clock().id())
+                );
             }
 
             #[test]
