@@ -162,17 +162,19 @@ pub fn joining_setup_with_stake() -> Result<JoiningSetup> {
     let funding_private_key = PrivateKey::new_os_random();
     let funding_id = AccountId::from(&PublicKey::new_from_private_key(&funding_private_key));
 
-    let mut ctx = Box::new(MultiZoneTestContextBuilder::default()
-        .with_zone(
-            ZoneTestContextBuilder::new(MultiNodeTestContextConfig::default())
-                .with_sequencer_partial_config(fast_blocks())
-                .with_genesis(vec![GenesisAction::SupplyAccount {
-                    account_id: funding_id,
-                    balance: FUNDING_BALANCE.try_into().expect("Must fit"),
-                }]),
-        )
-        .build_blocking()
-        .context("Failed to build test context")?);
+    let mut ctx = Box::new(
+        MultiZoneTestContextBuilder::default()
+            .with_zone(
+                ZoneTestContextBuilder::new(MultiNodeTestContextConfig::default())
+                    .with_sequencer_partial_config(fast_blocks())
+                    .with_genesis(vec![GenesisAction::SupplyAccount {
+                        account_id: funding_id,
+                        balance: FUNDING_BALANCE.try_into().expect("Must fit"),
+                    }]),
+            )
+            .build_blocking()
+            .context("Failed to build test context")?,
+    );
 
     // Import the funding key directly; it's not one of the wallet's default accounts.
     ctx.ctx_mut()
@@ -346,14 +348,16 @@ pub fn joining_setup_with_stake() -> Result<JoiningSetup> {
 /// Sets up blocking context with one leader node
 /// and joins FFI node without staking flow.
 pub fn joining_setup_no_stake() -> Result<JoiningSetup> {
-    let ctx = Box::new(MultiZoneTestContextBuilder::default()
-        .with_zone(
-            ZoneTestContextBuilder::new(MultiNodeTestContextConfig::default())
-                .with_sequencer_partial_config(fast_blocks())
-                .with_genesis(vec![]),
-        )
-        .build_blocking()
-        .context("Failed to build test context")?);
+    let ctx = Box::new(
+        MultiZoneTestContextBuilder::default()
+            .with_zone(
+                ZoneTestContextBuilder::new(MultiNodeTestContextConfig::default())
+                    .with_sequencer_partial_config(fast_blocks())
+                    .with_genesis(vec![]),
+            )
+            .build_blocking()
+            .context("Failed to build test context")?,
+    );
 
     let bedrock_url = addr_to_url(UrlProtocol::Http, ctx.ctx().bedrock_addr())
         .context("Failed to build the Bedrock node URL")?;
@@ -381,11 +385,11 @@ pub fn joining_setup_no_stake() -> Result<JoiningSetup> {
 
     let raw_config_path = config_c_string.into_raw();
 
-    let borrowed_runtime = unsafe{ core_ffi::primitives::runtime::Runtime::from_borrowed(ctx.runtime()) };
+    let borrowed_runtime =
+        unsafe { core_ffi::primitives::runtime::Runtime::from_borrowed(ctx.runtime()) };
 
     let sequencer_ffi_res =
-    unsafe { sequencer_ffi_start_sequencer(
-        &raw const borrowed_runtime, raw_config_path) };
+        unsafe { sequencer_ffi_start_sequencer(&raw const borrowed_runtime, raw_config_path) };
 
     // SAFETY: cstring was constructed from valid string.
     unsafe {

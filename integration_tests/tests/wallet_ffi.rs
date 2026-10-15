@@ -450,8 +450,6 @@ fn test_wallet_ffi_get_balance_public() -> Result<()> {
         wallet_ffi_destroy(wallet_ffi_handle);
     }
 
-    log::info!("##################################### Wallet dropped");
-
     // SAFETY: sequencer_ffi created by FFI, it is valid.
     unsafe {
         sequencer_ffi_helpers::sequencer_ffi_stop_sequencer(sequencer_ffi_res.value);

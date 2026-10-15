@@ -599,10 +599,10 @@ typedef struct FfiBytes32 FfiCommitment;
  * Pointer is not guaranteed. You should check the error field before
  * dereferencing the pointer.
  */
-typedef struct PointerResult_u8__FfiOperationError {
-  uint8_t *value;
+typedef struct PointerResult_FfiHashType__FfiOperationError {
+  FfiHashType *value;
   enum FfiOperationError error;
-} PointerResult_u8__FfiOperationError;
+} PointerResult_FfiHashType__FfiOperationError;
 
 /**
  * Simple wrapper around a pointer to a value or an error.
@@ -1271,8 +1271,8 @@ struct PointerResult_FfiProofsAndRoot__FfiOperationError sequencer_ffi_query_pro
  * The caller must ensure that:
  * - `sequencer` is a valid pointer to a [`SequencerServiceFFI`] instance.
  */
-struct PointerResult_u8__FfiOperationError sequencer_ffi_send_transaction(const struct SequencerServiceFFI *sequencer,
-                                                                          struct FfiTransaction transaction);
+struct PointerResult_FfiHashType__FfiOperationError sequencer_ffi_send_transaction(const struct SequencerServiceFFI *sequencer,
+                                                                                   struct FfiTransaction transaction);
 
 /**
  * Query the transaction by hash from sequencer.
