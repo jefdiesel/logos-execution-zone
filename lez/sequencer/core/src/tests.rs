@@ -2672,6 +2672,7 @@ fn resubmittable_txs_keeps_an_approved_system_change_and_drops_apply() {
         name: programs::CLOCK_NAME,
         first_segment: AccountId::new([1; 32]),
         from_height: 5,
+        approvals: vec![],
     });
     let apply = system_upgrader_tx(&system_upgrader_core::Message::Apply {
         name: programs::CLOCK_NAME,

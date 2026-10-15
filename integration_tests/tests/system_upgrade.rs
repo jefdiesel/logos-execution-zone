@@ -15,19 +15,55 @@ use lee_core::program::{PROGRAM_LOADER_ACCOUNT_ID, ProgramHeader, ProgramId};
 use sequencer_service_rpc::RpcClient as _;
 use test_fixtures::{
     MultiZoneTestContextBuilder, ZoneTestContextBuilder,
-    config::{MultiNodeTestContextConfig, SequencerPartialConfig},
+    config::{self, MultiNodeTestContextConfig, SequencerPartialConfig},
 };
 use tokio::test;
 use wallet::program_facades::program_loader::ProgramLoader;
 
-/// Blocks between scheduling and the upgrade's height.
+/// Blocks between scheduling and the upgrade's height, and the approvals' lifetime.
 const UPGRADE_DELAY: u64 = 5;
+const APPROVAL_LIFETIME: u64 = 30;
 
 fn fast_blocks() -> SequencerPartialConfig {
     SequencerPartialConfig {
         block_create_timeout: Duration::from_secs(2),
         ..SequencerPartialConfig::default()
     }
+}
+
+/// Approvals of `proposal` by every sequencer in a two-node zone, the whole committee.
+async fn committee_approvals(
+    ctx: &TestContext,
+    proposal: &system_upgrader_core::Proposal,
+    valid_until: u64,
+) -> Result<Vec<system_upgrader_core::Approval>> {
+    use sequencer_stake_core::ed25519_dalek::{Signer as _, SigningKey};
+
+    let committee = get_account_view(ctx, system_upgrader_core::committee_actor()).await?;
+    let channel_id = sequencer_stake_core::SequencerStakeConfig::from_bytes(
+        committee
+            .data
+            .actor_state(programs::sequencer_stake_account_id()),
+    )
+    .and_then(|config| config.channel_id)
+    .context("the committee config has no channel id")?;
+    let message = system_upgrader_core::approval_message(channel_id, proposal, valid_until);
+
+    [
+        config::BEDROCK_SIGNING_KEY,
+        *config::sequencer_signing_key_from_seed(1).to_bytes(),
+    ]
+    .iter()
+    .map(|secret| {
+        let key = SigningKey::from_bytes(secret);
+        Ok(system_upgrader_core::Approval {
+            signer: sequencer_stake_core::SequencerKey::new(key.verifying_key().to_bytes())
+                .context("a sequencer key is a curve point")?,
+            valid_until,
+            signature: key.sign(&message).to_bytes().to_vec(),
+        })
+    })
+    .collect()
 }
 
 async fn image_id(ctx: &TestContext, program: AccountId) -> Result<ProgramId> {
@@ -38,18 +74,22 @@ async fn image_id(ctx: &TestContext, program: AccountId) -> Result<ProgramId> {
     Ok(header.image_id)
 }
 
-/// The new code is uploaded and the producer schedules `bridge`'s upgrade, and from the upgrade's
-/// height `bridge` runs it while blocks keep coming.
+/// The new code is uploaded, the committee approves `bridge`'s upgrade and the producer schedules
+/// it, and from the upgrade's height `bridge` runs it while blocks keep coming.
 #[test]
-async fn a_scheduled_system_upgrade_goes_live_at_its_height() -> Result<()> {
+async fn an_approved_system_upgrade_goes_live_at_its_height() -> Result<()> {
     let new_code = test_programs::scripted();
     let user_elf = new_code.user_elf()?;
 
     let bridge = programs::bridge_account_id();
     let mut ctx = MultiZoneTestContextBuilder::default()
         .with_zone(
-            ZoneTestContextBuilder::new(MultiNodeTestContextConfig::default())
-                .with_sequencer_partial_config(fast_blocks()),
+            // Two sequencers: the approval threshold needs both.
+            ZoneTestContextBuilder::new(MultiNodeTestContextConfig {
+                num_nodes: 2,
+                ..MultiNodeTestContextConfig::default()
+            })
+            .with_sequencer_partial_config(fast_blocks()),
         )
         .build()
         .await?;
@@ -78,20 +118,28 @@ async fn a_scheduled_system_upgrade_goes_live_at_its_height() -> Result<()> {
         ctx.wallet().poll_transaction(tx_hash).await?;
     }
 
-    // The producer includes the `Schedule`. Until approval tooling lands, the test hands it to the
-    // node directly.
+    // The committee approves the upgrade, and the producer includes the approved `Schedule`.
+    // Until approval tooling lands, the test hands it to the node directly.
     let now = ctx.sequencer_client().get_last_block_id().await?;
     let from_height = now.saturating_add(UPGRADE_DELAY);
+    let proposal = system_upgrader_core::Proposal::Schedule {
+        name: programs::BRIDGE_NAME,
+        first_segment: segment_ids[0],
+        from_height,
+    };
+    let approvals =
+        committee_approvals(&ctx, &proposal, now.saturating_add(APPROVAL_LIFETIME)).await?;
     let registry = system_upgrader_core::registry_actor();
     let schedule = LeeTransaction::Public(lee::PublicTransaction::new(
         lee::public_transaction::Message::try_new(
             registry,
-            [registry],
+            [registry, system_upgrader_core::committee_actor()],
             BTreeMap::new(),
             system_upgrader_core::Message::Schedule {
                 name: programs::BRIDGE_NAME,
                 first_segment: segment_ids[0],
                 from_height,
+                approvals,
             },
         )?,
         lee::public_transaction::WitnessSet::from_raw_parts(vec![]),

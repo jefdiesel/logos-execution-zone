@@ -4,12 +4,15 @@
 //! `Schedule` records the new segment chain and the block it applies from in the registry; `Apply`
 //! checks and clears that record, then has the program loader point the program's header at the
 //! new chain, authorized through the program's PDA seed. `Cancel` clears a pending record without
-//! upgrading, and `Install` deploys a new system program the same way. Every message is handled at
-//! the registry's actor.
+//! upgrading, and `Install` deploys a new system program the same way. `Schedule`, `Cancel` and
+//! `Install` carry the sequencer committee's approvals, which `sequencer_stake` verifies. Every
+//! message is handled at the registry's actor.
 
 use lee_core::program::{LoaderMessage, PdaSeed, ReceiveInput, Response, SyncMessage};
+use sequencer_stake_core::Message as StakeMessage;
 use system_upgrader_core::{
-    Message, Registry, ScheduledUpgrade, SystemProgramName, loader_actor, registry_account_id,
+    APPROVAL_DOMAIN, Message, Registry, ScheduledUpgrade, SystemProgramName, committee_actor,
+    loader_actor, registry_account_id,
 };
 
 lee_core::actor_entrypoint!(handle_message);
@@ -25,12 +28,23 @@ fn handle_message(input: &ReceiveInput, message: Message) -> Response {
         "system_upgrader messages are handled at its registry"
     );
     let mut registry = Registry::from_bytes(&input.pre_state).expect("registry decodes");
+    let approval_check = message.proposal().map(|(proposal, approvals)| {
+        SyncMessage::new(
+            committee_actor(),
+            &StakeMessage::VerifyApprovals {
+                domain: APPROVAL_DOMAIN,
+                payload: proposal.to_bytes(),
+                approvals: approvals.to_vec(),
+            },
+        )
+    });
 
-    match message {
+    let response = match message {
         Message::Schedule {
             name,
             first_segment,
             from_height,
+            ..
         } => {
             let pending = pending_mut(&mut registry, &name);
             assert!(
@@ -65,6 +79,7 @@ fn handle_message(input: &ReceiveInput, message: Message) -> Response {
             name,
             first_segment,
             from_height,
+            ..
         } => {
             let pending = pending_mut(&mut registry, &name);
             assert_eq!(
@@ -81,6 +96,7 @@ fn handle_message(input: &ReceiveInput, message: Message) -> Response {
         Message::Install {
             name,
             first_segment,
+            ..
         } => {
             assert!(
                 registry.programs.insert(name, None).is_none(),
@@ -94,6 +110,10 @@ fn handle_message(input: &ReceiveInput, message: Message) -> Response {
                 },
             ))
         }
+    };
+    match approval_check {
+        Some(check) => response.send(check),
+        None => response,
     }
 }
 

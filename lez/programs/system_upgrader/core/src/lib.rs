@@ -1,6 +1,7 @@
 //! `system_upgrader`: upgrades and installs the system programs, each one of its PDAs
-//! (`PdaSeed::for_system_program(name)`). Pending upgrades live in its registry. Only the block
-//! producer includes its transactions.
+//! (`PdaSeed::for_system_program(name)`). Pending upgrades live in its registry. Every change but
+//! `Apply` must be approved by the zone's sequencer committee, and only the block producer
+//! includes its transactions.
 
 use std::collections::BTreeMap;
 
@@ -11,17 +12,25 @@ use lee_core::{
     account::{AccountId, Actor},
     program::{PROGRAM_LOADER_ACCOUNT_ID, PdaSeed},
 };
+pub use sequencer_stake_core::{CommitteeApproval as Approval, SequencerKey};
+use sequencer_stake_core::{
+    committee_approval_message, sequencer_stake_account_id, sequencer_stake_config_account_id,
+};
 
+/// Separates the committee's approvals of system changes from its other approvals.
+pub const APPROVAL_DOMAIN: [u8; 32] = *b"/LEZ/v0.3/SystemApproval/0000000";
 const REGISTRY_SEED: [u8; 32] = *b"/LEZ/v0.3/SystemRegistry/0000000";
 
 /// Sent at the top level to the registry's actor ([`registry_actor`]). Variants are append-only.
 #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub enum Message {
     /// Schedules `name` to switch to the chain at `first_segment` from block `from_height`.
+    /// Declares the committee's actor ([`committee_actor`]), which verifies the approvals.
     Schedule {
         name: SystemProgramName,
         first_segment: AccountId,
         from_height: BlockId,
+        approvals: Vec<Approval>,
     },
     /// Applies `name`'s pending upgrade, from its height, and clears it. Declares the system
     /// program's loader actor ([`loader_actor`]), which it sends the new chain to.
@@ -29,18 +38,96 @@ pub enum Message {
         name: SystemProgramName,
         from_height: BlockId,
     },
-    /// Clears `name`'s pending upgrade, at any height, if it is exactly this one.
+    /// Clears `name`'s pending upgrade, at any height, if it is exactly this one. Declares the
+    /// committee's actor.
+    Cancel {
+        name: SystemProgramName,
+        first_segment: AccountId,
+        from_height: BlockId,
+        approvals: Vec<Approval>,
+    },
+    /// Deploys a new, mutable system program `name` from the chain at `first_segment`. Declares
+    /// the committee's actor and its loader actor ([`loader_actor`]), which holds no header yet.
+    Install {
+        name: SystemProgramName,
+        first_segment: AccountId,
+        approvals: Vec<Approval>,
+    },
+}
+
+impl Message {
+    /// The change the committee approves, with its approvals; `None` for `Apply`.
+    #[must_use]
+    pub fn proposal(&self) -> Option<(Proposal, &[Approval])> {
+        match self {
+            Self::Schedule {
+                name,
+                first_segment,
+                from_height,
+                approvals,
+            } => Some((
+                Proposal::Schedule {
+                    name: *name,
+                    first_segment: *first_segment,
+                    from_height: *from_height,
+                },
+                approvals,
+            )),
+            Self::Cancel {
+                name,
+                first_segment,
+                from_height,
+                approvals,
+            } => Some((
+                Proposal::Cancel {
+                    name: *name,
+                    first_segment: *first_segment,
+                    from_height: *from_height,
+                },
+                approvals,
+            )),
+            Self::Install {
+                name,
+                first_segment,
+                approvals,
+            } => Some((
+                Proposal::Install {
+                    name: *name,
+                    first_segment: *first_segment,
+                },
+                approvals,
+            )),
+            Self::Apply { .. } => None,
+        }
+    }
+}
+
+/// What the committee approves: the change itself, naming the action so an approval for one can't
+/// be used for another.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, BorshSerialize, BorshDeserialize)]
+pub enum Proposal {
+    Schedule {
+        name: SystemProgramName,
+        first_segment: AccountId,
+        from_height: BlockId,
+    },
     Cancel {
         name: SystemProgramName,
         first_segment: AccountId,
         from_height: BlockId,
     },
-    /// Deploys a new, mutable system program `name` from the chain at `first_segment`. Declares
-    /// its loader actor ([`loader_actor`]), which holds no header yet.
     Install {
         name: SystemProgramName,
         first_segment: AccountId,
     },
+}
+
+impl Proposal {
+    /// What the committee signs over, after [`APPROVAL_DOMAIN`] and the channel id.
+    #[must_use]
+    pub fn to_bytes(&self) -> Vec<u8> {
+        borsh::to_vec(self).expect("a proposal serializes")
+    }
 }
 
 /// A pending upgrade, stored in the [`Registry`] under the system program's name.
@@ -77,6 +164,28 @@ impl Registry {
     pub fn scheduled(&self, name: &SystemProgramName) -> Option<ScheduledUpgrade> {
         self.programs.get(name).copied().flatten()
     }
+}
+
+/// Bytes a committee member signs. The channel id keeps an approval to one zone.
+#[must_use]
+pub fn approval_message(
+    channel_id: [u8; 32],
+    proposal: &Proposal,
+    valid_until: BlockId,
+) -> Vec<u8> {
+    committee_approval_message(
+        APPROVAL_DOMAIN,
+        channel_id,
+        &proposal.to_bytes(),
+        valid_until,
+    )
+}
+
+/// The sequencer committee's config, under `sequencer_stake`: it verifies approvals.
+#[must_use]
+pub fn committee_actor() -> Actor {
+    let program = sequencer_stake_account_id();
+    Actor::new(sequencer_stake_config_account_id(program), program)
 }
 
 /// Where the [`Registry`] lives: a PDA of `system_upgrader`.

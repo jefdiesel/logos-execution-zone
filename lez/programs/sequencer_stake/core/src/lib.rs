@@ -129,6 +129,25 @@ pub enum Message {
         destination: AccountId,
         requested_at: u64,
     },
+
+    /// Asserts that `approvals` of `payload` meet the committee's threshold, on the rules `Slash`
+    /// applies, and bounds the transaction to the earliest `valid_until` among them. Each
+    /// signature is over [`committee_approval_message`]. Changes nothing.
+    VerifyApprovals {
+        /// Separates what one caller's approvals approve from another's.
+        domain: [u8; 32],
+        payload: Vec<u8>,
+        approvals: Vec<CommitteeApproval>,
+    },
+}
+
+/// One accredited sequencer's approval of a payload, usable through block `valid_until`.
+#[derive(Clone, Debug, PartialEq, Eq, borsh::BorshSerialize, borsh::BorshDeserialize)]
+pub struct CommitteeApproval {
+    pub signer: SequencerKey,
+    pub valid_until: u64,
+    /// Ed25519 signature over [`committee_approval_message`].
+    pub signature: Vec<u8>,
 }
 
 /// One accredited sequencer's signature over [`slash_approval_message`].
@@ -329,6 +348,22 @@ pub fn slash_approval_message(
     message.extend_from_slice(&channel_id);
     message.extend_from_slice(&sequencer_key.to_bytes());
     message.extend_from_slice(&inscription);
+    message
+}
+
+/// Bytes a committee member signs to approve `payload`: the channel id keeps the approval to one
+/// zone, and `domain` to one kind of change.
+#[must_use]
+pub fn committee_approval_message(
+    domain: [u8; 32],
+    channel_id: [u8; 32],
+    payload: &[u8],
+    valid_until: u64,
+) -> Vec<u8> {
+    let mut message = domain.to_vec();
+    message.extend_from_slice(&channel_id);
+    message.extend_from_slice(payload);
+    message.extend_from_slice(&valid_until.to_le_bytes());
     message
 }
 
