@@ -49,7 +49,7 @@ pub enum AuthTransferSubcommand {
         )]
         to_name: Option<String>,
         /// The LNS registry program `--to-name` resolves through. On the LEZ v0.3
-        /// testnet: 66nUvzJtTxA729aUpTcAWDrb7cV9Heb2bDzceHQhLYad.
+        /// testnet: 2PXg3SSmh5hvECTz4xcfV2d5YvxwyF6yVhpnjTokzCkX.
         #[arg(long, env = "LEZ_NAMES_REGISTRY")]
         names_registry: Option<lee::AccountId>,
         /// amount - amount of balance to move.
