@@ -109,6 +109,7 @@ jobs:
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
           step "system packages"; sudo apt-get update -q && sudo apt-get install -y -q build-essential clang libclang-dev libssl-dev pkg-config libpcsclite-dev || exit 1
           R0=$(sed -n 's/^risc0-zkvm = { version = "\([^"]*\)".*/\1/p' Cargo.toml)
+          export GITHUB_TOKEN="$GH_TOKEN"
           step "rzup (risc0 $R0)"; curl -L https://risczero.com/install | bash && export PATH="$HOME/.risc0/bin:$PATH" && rzup install cargo-risczero "$R0" && rzup install rust || exit 1
           step "build"; P=$PWD/testnet/run testnet/sequencer/build.sh --examples || exit 1
           step "up.sh"; testnet/up.sh --examples --block-time 5 || exit 1

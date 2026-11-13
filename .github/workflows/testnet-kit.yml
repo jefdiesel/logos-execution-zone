@@ -40,6 +40,10 @@ jobs:
       - name: System packages (as testnet/README.md lists them)
         run: sudo apt-get update -q && sudo apt-get install -y -q build-essential clang libclang-dev libssl-dev pkg-config libpcsclite-dev
       - name: risc0 (rzup; the example guests are built with its Rust toolchain)
+        env:
+          # rzup asks the GitHub API for releases; unauthenticated, a shared runner IP hits the
+          # rate limit.
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           curl -L https://risczero.com/install | bash
           echo "$HOME/.risc0/bin" >> "$GITHUB_PATH"
@@ -135,6 +139,8 @@ jobs:
           testnet/down.sh || true
           mv testnet/run/bin "$RUNNER_TEMP/bin" && rm -rf testnet/run && mkdir -p testnet/run && mv "$RUNNER_TEMP/bin" testnet/run/bin
       - name: With r0vm 3.0.5 from rzup
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           curl -L https://risczero.com/install | bash
           export PATH="$HOME/.risc0/bin:$PATH"

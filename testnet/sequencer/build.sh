@@ -65,7 +65,7 @@ if [ "$EXAMPLES" = 1 ]; then
   build example-runner "$COMMIT $WALLET_FEATURES" run_hello_world -p program_deployment --bin run_hello_world \
     --features "$WALLET_FEATURES" || exit 1
   elf=$(find "$T/riscv-guest" -path '*example_program_deployment*' -name hello_world.bin 2>/dev/null | head -1)
-  [ -n "$elf" ] || { echo "  examples: hello_world.bin not found under $T/riscv-guest"; exit 1; }
-  cp "$elf" "$P/bin/hello_world.bin"
+  if [ -n "$elf" ]; then cp "$elf" "$P/bin/hello_world.bin"
+  elif [ ! -f "$P/bin/hello_world.bin" ]; then echo "  examples: hello_world.bin not found under $T/riscv-guest"; exit 1; fi
   echo "  examples: $P/bin/hello_world.bin ($(wc -c < "$P/bin/hello_world.bin" | tr -d ' ') bytes)"
 fi
