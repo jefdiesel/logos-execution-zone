@@ -1,0 +1,62 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- launchd agent for a kit chain's sequencer. Fill in the paths (absolute; no ~), then:
+       testnet/down.sh     (launchd takes over from up.sh's background process)
+       cp local.lez-testnet-chain.plist ~/Library/LaunchAgents/
+       launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/local.lez-testnet-chain.plist
+     Stop: launchctl bootout gui/$(id -u)/local.lez-testnet-chain
+     If the home is on an external volume, launchd may need Full Disk Access for the binary
+     (System Settings > Privacy & Security); grant it to the real file, and again after a rebuild.
+     A sequencer built without the `prove` feature also needs RISC0_SERVER_PATH (r0vm 3.0.5). -->
+<plist version="1.0">
+<dict>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>PATH</key>
+		<string>/usr/bin:/bin:/usr/sbin:/sbin</string>
+		<key>RUST_LOG</key>
+		<string>warn</string>
+	</dict>
+	<!-- launchd's default soft limit is 256 open files: too few for RocksDB. -->
+	<key>HardResourceLimits</key>
+	<dict>
+		<key>NumberOfFiles</key>
+		<integer>10240</integer>
+	</dict>
+	<key>SoftResourceLimits</key>
+	<dict>
+		<key>NumberOfFiles</key>
+		<integer>4096</integer>
+	</dict>
+	<!-- Restart after a crash, not after a clean stop; wait 60 s between restarts. -->
+	<key>KeepAlive</key>
+	<dict>
+		<key>SuccessfulExit</key>
+		<false/>
+	</dict>
+	<key>ThrottleInterval</key>
+	<integer>60</integer>
+	<key>Label</key>
+	<string>local.lez-testnet-chain</string>
+	<key>Nice</key>
+	<integer>5</integer>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/path/to/kit-home/bin/sequencer_service</string>
+		<string>start</string>
+		<string>/path/to/kit-home/chain/home</string>
+		<string>--rpc-listen-address</string>
+		<string>127.0.0.1:3040</string>
+		<string>--metrics-listen-address</string>
+		<string>127.0.0.1:3041</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>StandardErrorPath</key>
+	<string>/path/to/kit-home/logs/sequencer.log</string>
+	<key>StandardOutPath</key>
+	<string>/path/to/kit-home/logs/sequencer.log</string>
+	<key>WorkingDirectory</key>
+	<string>/path/to/kit-home</string>
+</dict>
+</plist>

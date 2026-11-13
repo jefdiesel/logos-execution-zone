@@ -1,0 +1,29 @@
+# systemd unit for a kit chain's sequencer (user or system unit). Fill in the paths, then:
+#   cp lez-testnet-chain.service ~/.config/systemd/user/ && systemctl --user daemon-reload
+#   testnet/down.sh            # the unit takes over from up.sh's background process
+#   systemctl --user enable --now lez-testnet-chain
+#   loginctl enable-linger $USER   # keep it running after you log out
+# The home must have been set up by up.sh once. Ports match <home>/kit.env (here the defaults).
+# The proxy and faucet can get units of their own the same way (ExecStart = their python3 line).
+[Unit]
+Description=LEZ 0.4 test network sequencer (kit)
+After=network-online.target
+
+[Service]
+Type=simple
+Environment=RUST_LOG=warn
+ExecStart=/path/to/kit-home/bin/sequencer_service start /path/to/kit-home/chain/home \
+  --rpc-listen-address 127.0.0.1:3040 --metrics-listen-address 127.0.0.1:3041
+# A clean stop: the sequencer exits on SIGINT within a few seconds.
+KillSignal=SIGINT
+TimeoutStopSec=60
+Restart=on-failure
+RestartSec=60
+# RocksDB keeps table files open; raise the descriptor limit (see PATCHES.md, WAL/fd cap).
+LimitNOFILE=10240
+Nice=5
+StandardOutput=append:/path/to/kit-home/logs/sequencer.log
+StandardError=append:/path/to/kit-home/logs/sequencer.log
+
+[Install]
+WantedBy=default.target

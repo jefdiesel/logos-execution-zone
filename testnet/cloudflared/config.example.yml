@@ -1,0 +1,38 @@
+# cloudflared config for a kit chain's RPC: only POST / reaches the filter (lez-rpc-proxy.py).
+# Locally managed (the ingress lives in this file, reviewable). Create the tunnel and its DNS:
+#   cloudflared tunnel create lez-testnet                       # writes ~/.cloudflared/<UUID>.json
+#   cloudflared tunnel route dns lez-testnet rpc.example.org     # proxied CNAME to <UUID>.cfargotunnel.com
+# copy this file to ~/.cloudflared/config-lez-testnet.yml with the UUID, path and host filled in, then
+#   cloudflared tunnel --config ~/.cloudflared/config-lez-testnet.yml run
+# Add the WAF rule and the rate-limit rule from PUBLIC.md before the DNS record answers.
+# Cost: tunnel traffic is not billed and no Worker runs; junk is blocked at the edge.
+
+tunnel: <TUNNEL-UUID>
+credentials-file: /home/<you>/.cloudflared/<TUNNEL-UUID>.json
+no-autoupdate: true
+# Pin the metrics port so it can't collide with another tunnel's; loopback only.
+metrics: 127.0.0.1:20249
+loglevel: info
+
+originRequest:
+  connectTimeout: 5s
+  tlsTimeout: 5s
+  tcpKeepAlive: 30s
+  noHappyEyeballs: true
+  # Few, reused connections to the filter; it allows 96 and closes idle ones after 75 s.
+  keepAliveConnections: 16
+  keepAliveTimeout: 30s
+  disableChunkedEncoding: true
+
+ingress:
+  # The faucet, if you run one (faucet/start.sh): its own path.
+  # - hostname: rpc.example.org
+  #   path: ^/faucet$
+  #   service: http://127.0.0.1:3046
+  # Only POST / reaches the filter (the WAF rule also refuses every other method/path at the edge).
+  - hostname: rpc.example.org
+    path: ^/$
+    service: http://127.0.0.1:3045
+  - hostname: rpc.example.org
+    service: http_status:404
+  - service: http_status:404

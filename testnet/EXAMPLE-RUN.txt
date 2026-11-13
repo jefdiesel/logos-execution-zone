@@ -1,0 +1,111 @@
+EXAMPLE RUN of testnet/ (LEZ v0.4.0-rc3 + the WAL/fd patch), 2026-11-13, macOS 15 on an Apple M4.
+A clean clone of this branch, then what a newcomer types. Only paths were shortened: the kit home
+is shown as ~/lez-test and the binaries as ~/prebuilt/. Account ids and public keys are from a
+throwaway chain. Nothing secret is printed by the kit (the recovery phrase goes to a mode-600 file).
+
+Binaries: sequencer_service (--features standalone,prove) and wallet (--features lee/prove) were
+built from this same source tree with the same cargo commands sequencer/build.sh runs, then passed
+in with SEQ_BIN/WALLET_BIN, because the build host's shared build queue was busy. The from-source
+path (build.sh inside up.sh) is run by the testnet-kit GitHub workflow on every push.
+
+$ git clone --branch testnet-0.4 https://github.com/jefdiesel/logos-execution-zone.git && cd logos-execution-zone
+$ export SEQ_BIN=<sequencer_service built from this tree> WALLET_BIN=<wallet built from this tree>
+
+$ testnet/up.sh --home ~/lez-test --port 3940 --block-time 5
+== using prebuilt binaries: ~/prebuilt/sequencer_service.rc3-walcap, ~/prebuilt/wallet.rc3-prove (no build)
+setup done: genesis new, block time 5s, home ~/lez-test/chain/home
+started pid 30413, height {"jsonrpc":"2.0","id":1,"result":1}
+  listens TCP 127.0.0.1:3941
+  listens TCP 127.0.0.1:3940
+
+LEZ 0.4 test network is up (a chain you run yourself; not the Logos testnet).
+  RPC          http://127.0.0.1:3940  (bound to 127.0.0.1:3940)
+  height       2, a block every 5s
+  operator     Public/Bpjkt3MjHesVfyNCmY8W77a2ykyGRUVb44suDZLqnp6C  balance 100000000000000  (genesis: new)
+  home         ~/lez-test
+  operator key in ~/lez-test/wallets/operator (mode 700; back up that folder and recovery-phrase.txt in it)
+
+Try it:
+  testnet/wallet.sh --home ~/lez-test account get --account-id Public/Bpjkt3MjHesVfyNCmY8W77a2ykyGRUVb44suDZLqnp6C
+  testnet/wallet.sh --home ~/lez-test account new public --label alice      # prints alice's account id and "pk <hex>"
+  testnet/wallet.sh --home ~/lez-test auth-transfer send --from Public/Bpjkt3MjHesVfyNCmY8W77a2ykyGRUVb44suDZLqnp6C --to-pk <alice's pk> --amount 1000000
+  curl -s -X POST http://127.0.0.1:3940/ -H 'Content-Type: application/json' -d '{"jsonrpc":"2.0","id":1,"method":"getLastBlockId","params":[]}'
+Status: testnet/status.sh --home ~/lez-test   Stop: testnet/down.sh --home ~/lez-test   Check everything: testnet/smoke.sh --home ~/lez-test
+[exit 0]
+
+$ testnet/status.sh --home ~/lez-test
+running, pid 30413, rss 81568 KB, open files 27
+  listens TCP 127.0.0.1:3941
+  listens TCP 127.0.0.1:3940
+height: {"jsonrpc":"2.0","id":1,"result":2}
+home: 3.7M; disk free there: 13Ti; memory free: 19%
+blocks: producing (2 -> 3 in 7 s)
+operator Public/Bpjkt3MjHesVfyNCmY8W77a2ykyGRUVb44suDZLqnp6C balance: 100000000000000
+RPC bind: 127.0.0.1:3940 (metrics 127.0.0.1:3941)
+[exit 0]
+
+$ testnet/smoke.sh --home ~/lez-test --no-deploy
+
+== 1. listeners (0 s)
+sequencer pid 30413 listens on: 127.0.0.1:3940 127.0.0.1:3941 
+PASS  every listener is loopback (RPC bind 127.0.0.1)
+
+== 2. blocks (0 s)
+PASS  height 3 -> 6 in 12 s
+
+== 3. account id formula (12 s)
+PASS  account_of_pk(operator pk) = Public/Bpjkt3MjHesVfyNCmY8W77a2ykyGRUVb44suDZLqnp6C
+
+== 4. fund a new account by its public key (12 s)
+operator balance 100000000000000
+A = Public/3bCjXFGd8u6BQGZ4DS6wfAS9SHMvWwGimLFwrQgDKeyj (pk 8b0949edca820202dbdb913a388f024f32e4e203a30b36f2e5b846028927c597)
+Transaction hash is d641590334362c6d025afa44c8e560400e71c4762d43deb790c960062d7c0a75
+Transaction is included in block 7
+PASS  A holds 100000000 (send rc=0)
+
+== 5. transfers between users (42 s)
+B = Public/2PTNgcWT3jJwo14GJtfmgA5Ei7PyvpA1aEWCxxEL3KuA
+Transaction hash is 083a9ae7c24b27586d7d2bbc509ebc3501ecb42cf34518a8082c4a28ef9b6c5a
+Transaction is included in block 13
+PASS  A -> B (--to-pk, never-used account): B holds 1000000
+A after paying 1000000 + fee: 98995648 (fee 4352)
+Transaction hash is f1fdc1a3c6c7f0cb6f0de01738b63799e627f3044c52c3049faf73bfeaf2a747
+Transaction is included in block 19
+PASS  B -> A (--to, used account): A holds 99395648
+B after paying 400000 + fee: 595912 (fee 4088)
+
+== 6-7. deploy and call (103 s)
+SKIP  --no-deploy
+
+smoke: ALL PASS in 103 s, height 24
+[exit 0]
+
+$ testnet/proxy/test-live.sh --home ~/lez-test
+proxy on 127.0.0.1:3945 -> 3940, pid 32239
+== refusals through the filter on 127.0.0.1:3945
+PASS  getLastBlockId                     200
+PASS  getChannelId                       200
+PASS  requeueCrossZoneDeadLetter         403
+PASS  getCrossZoneDeadLetters            403
+PASS  rpc.discover                       403
+PASS  batch of two                       400
+PASS  getBlockRange 0..99 (100)          200
+PASS  getBlockRange 0..100 (101)         400
+PASS  WebSocket upgrade                  400
+PASS  wrong content type                 415
+PASS  GET /                              405
+direct to the sequencer for comparison (no filter): batch 200, deadletters 200
+
+== the stock wallet through the filter (a throwaway wallet)
+PASS  wallet check-health through the filter
+throwaway Public/zbmRfYBfoHmPQMYXWBpooygPivLEJ2sXeayYL57tiLB funded by the operator: 50000000
+PASS  transfer sent through the filter: Transaction is included in block 31
+PASS  account read through the filter
+
+== rate limit: one client (CF-Connecting-IP 198.51.100.7), 120 calls back to back
+statuses: {200: 60, 429: 60}
+PASS  rate limit answers 429 past the burst
+healthz: {"ok": true, "height": 36, "counters": {"healthz 200": 1, "getLastBlockId 200": 62, "getChannelId 200": 1, "requeueCrossZoneDeadLetter 403": 1, "getCrossZoneDeadLetters 403": 1, "other 403": 1, "- 400": 2, "getBlockRange 200": 1, "getBlockRange 400": 1, "- 415": 1, "- 405": 1, "getProgramIds 200": 1, "getAccountView 200": 3, "getProofsAndRoot 200": 1, "getFeeState 200": 1, "sendTransaction 200": 1, "getTransaction 200": 12, "- 429": 60}}
+
+filter: ALL PASS
+[exit 0]

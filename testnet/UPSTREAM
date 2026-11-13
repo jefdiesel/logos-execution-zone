@@ -1,0 +1,6 @@
+# The upstream release this branch is built on. SYNC.md changes these three lines together.
+UPSTREAM_REPO=https://github.com/logos-blockchain/logos-execution-zone.git
+TAG=v0.4.0-rc3
+COMMIT=bafd07be0701398f9bc435f73ab05e9a7936c301
+# Files the patch series touches (space separated); upstream-watch reports dev commits to them.
+PATCHED_FILES="lez/sequencer/actors/storage/src/actor/db.rs"

@@ -1,0 +1,61 @@
+# UNTESTED ON OUR SIDE (no Docker where the kit was built). A kit chain in Docker, built with
+# upstream's own Dockerfiles (lez/docker/risc0-base.Dockerfile, lez/sequencer/service/Dockerfile)
+# with STANDALONE=true and the in-process prover. No wallet inside: use your own.
+#
+#   testnet/docker/make-config.sh <your public key hex>     # writes testnet/docker/genesis-config.json
+#   docker compose -f testnet/docker/docker-compose.yml up --build
+#   curl -s -X POST http://127.0.0.1:3040/ -H 'Content-Type: application/json' \
+#     -d '{"jsonrpc":"2.0","id":1,"method":"getLastBlockId","params":[]}'
+#   docker compose -f testnet/docker/docker-compose.yml down       # stop (data stays in the volume)
+#   docker compose -f testnet/docker/docker-compose.yml down -v    # reset: delete the chain
+#
+# Ports are published on 127.0.0.1 only. The first build takes as long as a native one.
+name: lez-testnet
+
+services:
+  risc0_base:
+    image: lez/risc0_base
+    build:
+      context: ../..
+      dockerfile: lez/docker/risc0-base.Dockerfile
+
+  # Creates the home (config + channel signing key) once; the funding key is unused standalone.
+  setup:
+    image: lez-testnet/sequencer_service
+    build:
+      context: ../..
+      dockerfile: lez/sequencer/service/Dockerfile
+      additional_contexts:
+        risc0_base: "service:risc0_base"
+      args:
+        STANDALONE: "true"
+        FEATURES: prove
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - test -f /var/lib/sequencer_service/sequencer_config.json || sequencer_service setup /var/lib/sequencer_service
+        --config /etc/lez/genesis-config.json
+        --funding-public-key 0101010101010101010101010101010101010101010101010101010101010100 --create-channel
+    volumes:
+      - ./genesis-config.json:/etc/lez/genesis-config.json:ro
+      - chain:/var/lib/sequencer_service
+
+  sequencer:
+    image: lez-testnet/sequencer_service
+    pull_policy: never
+    depends_on:
+      setup: { condition: service_completed_successfully }
+    restart: on-failure
+    ulimits:
+      nofile: { soft: 4096, hard: 10240 }
+    environment:
+      RUST_LOG: warn
+      SEQUENCER_RPC_LISTEN_ADDRESS: 0.0.0.0:3040
+      SEQUENCER_METRICS_LISTEN_ADDRESS: 0.0.0.0:9000
+    ports:
+      - "127.0.0.1:3040:3040"
+      - "127.0.0.1:3041:9000"
+    volumes:
+      - chain:/var/lib/sequencer_service
+
+volumes:
+  chain:
