@@ -111,7 +111,7 @@ else
     echo "header Public/$H, $nseg segment(s) for a $size-byte .bin"
     out=$(wallet program-loader deploy --elf "$HELLO_ELF" --header "Public/$H" --segments "${segs[@]}" --payer "Public/$OP" 2>&1); rc=$?
     want=$(echo "$out" | sed -n 's/.*splits into \([0-9]*\) segment.*/\1/p' | head -1)
-    [ -n "$want" ] && [ "$attempt" = 1 ] || break
+    if [ -z "$want" ] || [ "$attempt" != 1 ]; then break; fi
     echo "the wallet wants $want segment(s); again"; nseg=$want
   done
   echo "$out" | grep -v "^Transaction data" | tail -4
