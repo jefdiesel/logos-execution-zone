@@ -51,6 +51,7 @@ id_of() { grep -oE 'Public/[1-9A-HJ-NP-Za-km-z]{32,44}' | head -1 | cut -d/ -f2;
 pk_of() { grep -oiE '(with )?pk [0-9a-f]{64}' | head -1 | awk '{print $NF}'; }
 
 listeners_of() {  # every socket address the pid listens on, one per line
+  # lsof prints a wildcard bind as *:PORT; normalise it to 0.0.0.0:PORT.
   if command -v lsof >/dev/null 2>&1; then lsof -nP -a -p "$1" -i 2>/dev/null | tail -n +2 | awk '{print $9}'
-  else ss -ltnup 2>/dev/null | grep "pid=$1," | awk '{print $5}'; fi
+  else ss -ltnup 2>/dev/null | grep "pid=$1," | awk '{print $5}'; fi | sed 's/^\*:/0.0.0.0:/'
 }

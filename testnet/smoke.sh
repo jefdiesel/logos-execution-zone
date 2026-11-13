@@ -77,6 +77,13 @@ else
 fi
 if [ "$calc" = "$OP" ]; then pass "account_of_pk(operator pk) = Public/$OP"; else fail "formula gives $calc, wallet says $OP"; fi
 
+if [ "$GENESIS" = pubkey ]; then
+  echo
+  skip "4-7: this chain's genesis funds a key held outside the kit (--genesis-pubkey), so the kit wallet can't pay; fund an account from your own wallet and rerun on a chain started with --genesis-key new to check transfers and deploys"
+  echo; if [ "$FAILS" = 0 ]; then echo "smoke: ALL PASS (steps 1-3) in $(( $(date +%s) - T0 )) s, height $(height)"; else echo "smoke: $FAILS FAILED"; fi
+  [ "$FAILS" = 0 ]; exit
+fi
+
 step "4. fund a new account by its public key"
 opbal=$(balance "$OP"); echo "operator balance $opbal"
 read -r A APK <<< "$(new_account "smoke-a-$TAG")" || true
