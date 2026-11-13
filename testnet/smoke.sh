@@ -10,17 +10,21 @@
 #     account), and every balance adds up to the fees the chain reports
 #  6. deploy at a chosen header: `wallet program-loader deploy` of the example hello_world guest at
 #     a header account the wallet holds the key of
-#  7. call: the example runner deploys hello_world again and calls it; the account's state must
-#     read "Hola mundo!"
+#  7. call (only with --call): the example runner deploys hello_world again and calls it; the
+#     account's state must read "Hola mundo!". On v0.4.0-rc3 this FAILS: the example runners
+#     send no fee declaration and the sequencer refuses the call ("Incorrect fee: transaction fee
+#     classification failed"); upstream fixed the examples on dev after rc3. Without --call the
+#     step is reported as SKIP, never as a pass.
 # Steps 6-7 need the example programs: `testnet/up.sh --examples` (or sequencer/build.sh
-# --examples) builds them; --no-deploy skips them (reported as SKIP, never as a pass).
+# --examples) builds them; --no-deploy skips them (reported as SKIP).
 set -uo pipefail
 . "$(dirname "$0")/lib.sh"
-DEPLOY=1
+DEPLOY=1; CALL=0
 while [ $# -gt 0 ]; do
   case $1 in
     --home) P=$(cd "${2:?--home DIR}" && pwd); shift 2 ;;
     --no-deploy) DEPLOY=0; shift ;;
+    --call) CALL=1; shift ;;
     *) echo "unknown argument $1" >&2; exit 2 ;;
   esac
 done
@@ -119,6 +123,9 @@ else
   if [ "$rc" = 0 ] && echo "$acct" | grep -q '"result":{'; then pass "program deployed at header Public/$H"; else fail "deploy rc=$rc; header account: $(echo "$acct" | cut -c1-200)"; fi
 
   step "7. deploy + call through the example runner"
+  if [ "$CALL" = 0 ]; then
+    skip "--call not given (rc3's example runners send no fee declaration; see the comment at the top)"
+  else
   read -r C _ <<< "$(new_account "smoke-hello-$TAG")"
   out=$(LEE_WALLET_HOME_DIR=$P/wallets/operator LEE_WALLET_PASSWORD=${LEE_WALLET_PASSWORD:-} "$HELLO_RUNNER" "$HELLO_ELF" "$C" "$OP" 2>&1); rc=$?
   echo "$out" | grep -v "^Transaction data" | tail -3
@@ -130,6 +137,7 @@ else
   done
   if echo "$got" | grep -qi '486f6c61206d756e646f21'; then pass "Public/$C's hello_world state reads \"Hola mundo!\" (runner rc=$rc)"
   else fail "no greeting in Public/$C's state (runner rc=$rc): $(echo "$got" | tail -3)"; fi
+  fi
 fi
 
 echo

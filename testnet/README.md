@@ -37,7 +37,7 @@ new tag.
 git clone --branch testnet-0.4 https://github.com/jefdiesel/logos-execution-zone.git
 cd logos-execution-zone
 testnet/up.sh --examples      # build (once), create the chain, start it, print a funded account
-testnet/smoke.sh              # end-to-end check: blocks, funding, transfers, deploy + call
+testnet/smoke.sh              # end-to-end check: blocks, funding, transfers, a program deploy
 ```
 
 `up.sh` ends with something like this (a full run is in [EXAMPLE-RUN.txt](EXAMPLE-RUN.txt)):
@@ -149,14 +149,14 @@ loader records it; it is not enforced by the protocol). `program-loader update` 
 at the same header.
 
 **And call it.** The wallet has no generic "call" command: a program is called with a
-transaction built for it. `examples/program_deployment/src/bin/run_hello_world.rs` deploys
-`hello_world` and calls it; smoke.sh runs it:
-
-```sh
-LEE_WALLET_HOME_DIR=testnet/run/wallets/operator LEE_WALLET_PASSWORD= \
-  testnet/run/bin/run_hello_world testnet/run/bin/hello_world.bin <account id> <operator id>
-testnet/wallet.sh account get --raw --scope all --account-id Public/<account id>   # "Hola mundo!" in hex
-```
+transaction built for it (by your app or a small Rust runner using the `wallet` crate). The
+runners in `examples/program_deployment/src/bin` (for example `run_hello_world`, which deploys
+`hello_world` and calls it) **do not work on v0.4.0-rc3**: they send no fee declaration and the
+sequencer refuses the call with "Incorrect fee: transaction fee classification failed".
+Upstream fixed them on `dev` after rc3 (commits `41a75c5b`, `45bccb8b`, `c1fd3b01`); they don't
+apply cleanly to rc3, so this branch doesn't carry them. `smoke.sh --call` tries the runner and
+reports that failure; without `--call` the step is a SKIP. A runner of your own must set a
+`FeeDeclaration` (payer, gas limit, max fee) on its `Message`, as the wallet's own commands do.
 
 A deploy costs about 24 units per byte of program at base fees of 8 (rc3 meters the loader at
 1 gas per byte it reads, on top of the storage gas of each segment).
