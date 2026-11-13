@@ -7,8 +7,10 @@ Binaries: sequencer_service (--features standalone,prove) and wallet (--features
 built from this same source tree with the same cargo commands sequencer/build.sh runs, then passed
 in with SEQ_BIN/WALLET_BIN, because the build host's shared build queue was busy. The from-source
 path (build.sh inside up.sh) is run by the testnet-kit GitHub workflow on every push.
-Part 1 ran with the scripts as of the first push; parts 2 and 3 with the current ones (smoke.sh
-gained the segment-count retry and the opt-in --call between them).
+Part 1 ran with the scripts as of the first push; later parts with later ones (smoke.sh gained
+the segment-count retry, the opt-in --call and the --genesis-pubkey/default handling in between).
+Parts: 1 up, status, smoke, the filter; 2 deploy at a chosen header; 3 the faucet; 4 restart,
+reset and a new genesis for the same operator; 5 --genesis-pubkey; 6 --genesis-key default.
 
 $ git clone --branch testnet-0.4 https://github.com/jefdiesel/logos-execution-zone.git && cd logos-execution-zone
 $ export SEQ_BIN=<sequencer_service built from this tree> WALLET_BIN=<wallet built from this tree>
@@ -185,3 +187,218 @@ $ (balance of Public/6qHvPH6cLv3nVzG4EMg58jWUbNx2GaWYGmH8CAbBhefd)
 {"jsonrpc":"2.0","id":1,"result":100000000}
 $ (the same key again)
 {"error": "the faucet is busy sending; try again in a minute"}
+
+
+======== Part 4: stop, start again, reset, new genesis for the same operator
+(height before: {"jsonrpc":"2.0","id":1,"result":1410})
+
+$ testnet/down.sh --home ~/lez-test
+faucet stopped
+proxy stopped
+stopped
+[exit 0]
+
+$ testnet/up.sh --home ~/lez-test
+== using prebuilt binaries: ~/prebuilt/sequencer_service.rc3-walcap, ~/prebuilt/wallet.rc3-prove (no build)
+started pid 76925, height {"jsonrpc":"2.0","id":1,"result":1411}
+  listens TCP 127.0.0.1:3941
+  listens TCP 127.0.0.1:3940
+
+LEZ 0.4 test network is up (a chain you run yourself; not the Logos testnet).
+  RPC          http://127.0.0.1:3940  (bound to 127.0.0.1:3940)
+  height       1412, a block every 5s
+  operator     Public/Bpjkt3MjHesVfyNCmY8W77a2ykyGRUVb44suDZLqnp6C  balance 99989644186552  (genesis: new)
+  home         ~/lez-test
+  operator key in ~/lez-test/wallets/operator (mode 700; back up that folder and recovery-phrase.txt in it)
+
+Try it:
+  testnet/wallet.sh --home ~/lez-test account get --account-id Public/Bpjkt3MjHesVfyNCmY8W77a2ykyGRUVb44suDZLqnp6C
+  testnet/wallet.sh --home ~/lez-test account new public --label alice      # prints alice's account id and "pk <hex>"
+  testnet/wallet.sh --home ~/lez-test auth-transfer send --from Public/Bpjkt3MjHesVfyNCmY8W77a2ykyGRUVb44suDZLqnp6C --to-pk <alice's pk> --amount 1000000
+  curl -s -X POST http://127.0.0.1:3940/ -H 'Content-Type: application/json' -d '{"jsonrpc":"2.0","id":1,"method":"getLastBlockId","params":[]}'
+Status: testnet/status.sh --home ~/lez-test   Stop: testnet/down.sh --home ~/lez-test   Check everything: testnet/smoke.sh --home ~/lez-test
+[exit 0]
+(height after the restart: {"jsonrpc":"2.0","id":1,"result":1412})
+
+$ testnet/reset.sh --home ~/lez-test
+stopped
+chain data deleted
+next: testnet/up.sh --home ~/lez-test makes a new genesis for operator Public/Bpjkt3MjHesVfyNCmY8W77a2ykyGRUVb44suDZLqnp6C
+[exit 0]
+
+$ testnet/up.sh --home ~/lez-test
+== using prebuilt binaries: ~/prebuilt/sequencer_service.rc3-walcap, ~/prebuilt/wallet.rc3-prove (no build)
+setup done: genesis new, block time 5s, home ~/lez-test/chain/home
+started pid 78018, height {"jsonrpc":"2.0","id":1,"result":1}
+  listens TCP 127.0.0.1:3941
+  listens TCP 127.0.0.1:3940
+
+LEZ 0.4 test network is up (a chain you run yourself; not the Logos testnet).
+  RPC          http://127.0.0.1:3940  (bound to 127.0.0.1:3940)
+  height       2, a block every 5s
+  operator     Public/Bpjkt3MjHesVfyNCmY8W77a2ykyGRUVb44suDZLqnp6C  balance 100000000000000  (genesis: new)
+  home         ~/lez-test
+  operator key in ~/lez-test/wallets/operator (mode 700; back up that folder and recovery-phrase.txt in it)
+
+Try it:
+  testnet/wallet.sh --home ~/lez-test account get --account-id Public/Bpjkt3MjHesVfyNCmY8W77a2ykyGRUVb44suDZLqnp6C
+  testnet/wallet.sh --home ~/lez-test account new public --label alice      # prints alice's account id and "pk <hex>"
+  testnet/wallet.sh --home ~/lez-test auth-transfer send --from Public/Bpjkt3MjHesVfyNCmY8W77a2ykyGRUVb44suDZLqnp6C --to-pk <alice's pk> --amount 1000000
+  curl -s -X POST http://127.0.0.1:3940/ -H 'Content-Type: application/json' -d '{"jsonrpc":"2.0","id":1,"method":"getLastBlockId","params":[]}'
+Status: testnet/status.sh --home ~/lez-test   Stop: testnet/down.sh --home ~/lez-test   Check everything: testnet/smoke.sh --home ~/lez-test
+[exit 0]
+
+$ testnet/smoke.sh --home ~/lez-test --no-deploy
+
+== 1. listeners (0 s)
+sequencer pid 78018 listens on: 127.0.0.1:3940 127.0.0.1:3941 
+PASS  every listener is loopback (RPC bind 127.0.0.1)
+
+== 2. blocks (0 s)
+PASS  height 2 -> 4 in 12 s
+
+== 3. account id formula (12 s)
+PASS  account_of_pk(operator pk) = Public/Bpjkt3MjHesVfyNCmY8W77a2ykyGRUVb44suDZLqnp6C
+
+== 4. fund a new account by its public key (12 s)
+operator balance 100000000000000
+A = Public/EAHs5pqxxwi7tst9TUmwveMAjjbPvap9srch27rF1JBH (pk de82f115b6ec585e7a155b92b2a1cc02cf8b69859b403883bc9eff1349d15486)
+Transaction hash is cd2b67f455e3c22e6619e34cfd2663a1bef426e388a290af09a538d4cd32bbcd
+Transaction is included in block 5
+PASS  A holds 100000000 (send rc=0)
+
+== 5. transfers between users (44 s)
+B = Public/BNomLBVSc6E5qAXMgqMjwKVqHm1fuAyyNmzcrSMd2CGH
+Transaction hash is 7539f0f9c03429bb299e22662dea57199966d6294b0d8f39d63f7fe51c39942e
+Transaction is included in block 12
+PASS  A -> B (--to-pk, never-used account): B holds 1000000
+A after paying 1000000 + fee: 98995648 (fee 4352)
+Transaction hash is a707c05809078806cbbe4c915906bc8fff1bacccd4b2e6e14c088c356fdbcf5d
+Transaction is included in block 18
+PASS  B -> A (--to, used account): A holds 99395648
+B after paying 400000 + fee: 595912 (fee 4088)
+
+== 6-7. deploy and call (105 s)
+SKIP  --no-deploy
+
+smoke: ALL PASS in 105 s, height 23
+[exit 0]
+
+======== Part 5: --genesis-pubkey (a key held outside the kit)
+
+$ testnet/up.sh --home ~/lez-pk --port 3950 --block-time 5 --genesis-pubkey 54d4d092ea3d57055c56c49845123c07561ba7086fb1ceaa5a4bbdb00f086829
+== using prebuilt binaries: ~/prebuilt/sequencer_service.rc3-walcap, ~/prebuilt/wallet.rc3-prove (no build)
+setup done: genesis pubkey, block time 5s, home ~/lez-pk/chain/home
+started pid 81223, height {"jsonrpc":"2.0","id":1,"result":1}
+  listens TCP 127.0.0.1:3951
+  listens TCP 127.0.0.1:3950
+
+LEZ 0.4 test network is up (a chain you run yourself; not the Logos testnet).
+  RPC          http://127.0.0.1:3950  (bound to 127.0.0.1:3950)
+  height       2, a block every 5s
+  operator     Public/BfGtXDQuRXKycKajqKtkugR3ZA3kTiGP3zD2YrQhuqzD  balance 100000000000000  (genesis: pubkey)
+  home         ~/lez-pk
+  the operator key is yours; it is not in this machine's kit wallet
+
+Try it:
+  testnet/wallet.sh --home ~/lez-pk account get --account-id Public/BfGtXDQuRXKycKajqKtkugR3ZA3kTiGP3zD2YrQhuqzD
+  testnet/wallet.sh --home ~/lez-pk account new public --label alice      # prints alice's account id and "pk <hex>"
+  testnet/wallet.sh --home ~/lez-pk auth-transfer send --from Public/BfGtXDQuRXKycKajqKtkugR3ZA3kTiGP3zD2YrQhuqzD --to-pk <alice's pk> --amount 1000000
+  curl -s -X POST http://127.0.0.1:3950/ -H 'Content-Type: application/json' -d '{"jsonrpc":"2.0","id":1,"method":"getLastBlockId","params":[]}'
+Status: testnet/status.sh --home ~/lez-pk   Stop: testnet/down.sh --home ~/lez-pk   Check everything: testnet/smoke.sh --home ~/lez-pk
+[exit 0]
+
+$ testnet/smoke.sh --home ~/lez-pk
+
+== 1. listeners (0 s)
+sequencer pid 81223 listens on: 127.0.0.1:3950 127.0.0.1:3951 
+PASS  every listener is loopback (RPC bind 127.0.0.1)
+
+== 2. blocks (0 s)
+PASS  height 2 -> 4 in 12 s
+
+== 3. account id formula (12 s)
+PASS  account_of_pk(operator pk) = Public/BfGtXDQuRXKycKajqKtkugR3ZA3kTiGP3zD2YrQhuqzD
+
+SKIP  4-7: this chain's genesis funds a key held outside the kit (--genesis-pubkey), so the kit wallet can't pay; fund an account from your own wallet and rerun on a chain started with --genesis-key new to check transfers and deploys
+
+smoke: ALL PASS (steps 1-3) in 12 s, height 4
+[exit 0]
+
+$ testnet/down.sh --home ~/lez-pk
+stopped
+[exit 0]
+
+$ testnet/reset.sh --home ~/lez-pk --all --yes
+not running
+deleted ~/lez-pk
+[exit 0]
+
+======== Part 6: --genesis-key default (LEZ's published test keys)
+
+$ testnet/up.sh --home ~/lez-default --port 3960 --block-time 5 --genesis-key default
+== using prebuilt binaries: ~/prebuilt/sequencer_service.rc3-walcap, ~/prebuilt/wallet.rc3-prove (no build)
+setup done: genesis default, block time 5s, home ~/lez-default/chain/home
+started pid 85877, height {"jsonrpc":"2.0","id":1,"result":1}
+  listens TCP 127.0.0.1:3961
+  listens TCP 127.0.0.1:3960
+
+LEZ 0.4 test network is up (a chain you run yourself; not the Logos testnet).
+  RPC          http://127.0.0.1:3960  (bound to 127.0.0.1:3960)
+  height       2, a block every 5s
+  operator     Public/6iArKUXxhUJqS7kCaPNhwMWt3ro71PDyBj7jwAyE2VQV  balance 10000000000000  (genesis: default)
+  home         ~/lez-default
+  the operator key is LEZ's published test key: anyone can spend these funds
+
+Try it:
+  testnet/wallet.sh --home ~/lez-default account get --account-id Public/6iArKUXxhUJqS7kCaPNhwMWt3ro71PDyBj7jwAyE2VQV
+  testnet/wallet.sh --home ~/lez-default account new public --label alice      # prints alice's account id and "pk <hex>"
+  testnet/wallet.sh --home ~/lez-default auth-transfer send --from Public/6iArKUXxhUJqS7kCaPNhwMWt3ro71PDyBj7jwAyE2VQV --to-pk <alice's pk> --amount 1000000
+  curl -s -X POST http://127.0.0.1:3960/ -H 'Content-Type: application/json' -d '{"jsonrpc":"2.0","id":1,"method":"getLastBlockId","params":[]}'
+Status: testnet/status.sh --home ~/lez-default   Stop: testnet/down.sh --home ~/lez-default   Check everything: testnet/smoke.sh --home ~/lez-default
+[exit 0]
+
+$ testnet/smoke.sh --home ~/lez-default --no-deploy
+
+== 1. listeners (0 s)
+sequencer pid 85877 listens on: 127.0.0.1:3960 127.0.0.1:3961 
+PASS  every listener is loopback (RPC bind 127.0.0.1)
+
+== 2. blocks (0 s)
+PASS  height 2 -> 4 in 12 s
+
+== 3. account id formula (12 s)
+PASS  account_of_pk(operator pk) = Public/6iArKUXxhUJqS7kCaPNhwMWt3ro71PDyBj7jwAyE2VQV
+
+== 4. fund a new account by its public key (12 s)
+operator balance 10000000000000
+A = Public/G4sUPc5HSEyuYjP2LSoYzqDiFDk5jkQEZJnh5BJoo4qV (pk a2c460f95230629484c8f2c59d86bea0de059efcdf5c07f8938291d55461c305)
+Transaction hash is fbfc37a5041c80edcb68e873381cf8439cb7218be8f05c386d055a5b25bb5ed8
+Transaction is included in block 5
+PASS  A holds 100000000 (send rc=0)
+
+== 5. transfers between users (42 s)
+B = Public/8NXvFPeY9AowJJgYyfP89LK1fLN4FEhRWT2Jev2sFb4r
+Transaction hash is 3ab96c05fb51457e63f998c5d86b74139aa0d00d9e744a87cc911a2714179bca
+Transaction is included in block 11
+PASS  A -> B (--to-pk, never-used account): B holds 1000000
+A after paying 1000000 + fee: 98995648 (fee 4352)
+Transaction hash is e71867c9f2d206e8faf8bf52ab1c417c9fdd6695447196ca5032a8ffaf195ffd
+Transaction is included in block 17
+PASS  B -> A (--to, used account): A holds 99395648
+B after paying 400000 + fee: 595912 (fee 4088)
+
+== 6-7. deploy and call (103 s)
+SKIP  --no-deploy
+
+smoke: ALL PASS in 103 s, height 22
+[exit 0]
+
+$ testnet/down.sh --home ~/lez-default
+stopped
+[exit 0]
+
+$ testnet/reset.sh --home ~/lez-default --all --yes
+not running
+deleted ~/lez-default
+[exit 0]

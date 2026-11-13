@@ -10,7 +10,7 @@ one, it is dropped here at the next sync ([SYNC.md](SYNC.md)).
 
 | # | Patch | Why | Evidence | Applies to | Upstream | Status |
 |---|---|---|---|---|---|---|
-| 1 | `fix(sequencer): cap RocksDB WAL size and open files in the sequencer store` (`lez/sequencer/actors/storage/src/actor/db.rs`, +11 lines) | The store opens RocksDB with default options: `max_total_wal_size` 0 (a dynamic limit of several GB), every table file kept open, 1000 info logs. The column families get small writes each block and never fill a memtable, so write-ahead logs pile up until that limit; and under a low descriptor limit (macOS: 256) opens fail, compaction stops and each crash-restart leaves more files behind. | See below | `bafd07be` (v0.4.0-rc3): applies, built (`--features standalone,prove`) and run. Upstream `dev` (`cb075d57`): applies | not sent yet (branch `fix/rocksdb-wal-cap`) | carried |
+| 1 | `fix(sequencer): cap RocksDB WAL size and open files in the sequencer store` (`lez/sequencer/actors/storage/src/actor/db.rs`, +11 lines) | The store opens RocksDB with default options: `max_total_wal_size` 0 (a dynamic limit of several GB), every table file kept open, 1000 info logs. The column families get small writes each block and never fill a memtable, so write-ahead logs pile up until that limit; and under a low descriptor limit (macOS: 256) opens fail, compaction stops and each crash-restart leaves more files behind. | See below | `bafd07be` (v0.4.0-rc3): applies, built (`--features standalone,prove`) and run. Upstream `dev` (`cb075d57`): applies; `sequencer_storage_actor` builds, clippy `-D warnings` and fmt clean (the sequencer was not run on dev) | not sent yet; branch `fix/rocksdb-wal-cap` on this fork, based on `dev` | carried |
 | 2 | `fix: example deployer to count elf-only bytes like wallet` (`examples/program_deployment`, +8/-1, and its `Cargo.lock` line) | The example's `deploy_program` counts segments from the whole `.bin` while the wallet uploads only the user ELF, so `run_hello_world` fails ("splits into 3 segment(s) but 4 were supplied") for the `hello_world` guest. Needed for the runner to get past the deploy; on rc3 its call then fails for a separate reason (no fee declaration; README, Deploying a program) | the failure, seen on this kit's chain | backport of upstream `7b916154` | already on upstream `dev` | carried until the next tag includes it; drop at sync |
 
 ## 1. RocksDB WAL and open-file cap
@@ -25,8 +25,8 @@ Measured (all standalone sequencers, nothing deployed unless said):
 
   | Height | Unpatched home (WAL files) | Patched home (WAL files) |
   |---:|---:|---:|
-  | about 160 | 305 MB (6) | 285 MB (7), its peak |
-  | about 365 | 647 MB (21) | 77 MB (4) |
+  | 155-165 | 305 MB (6) at 165 | 285 MB (6) at 155, its peak |
+  | 363-365 | 647 MB (21) at 365 | 77 MB (4) at 363 |
   | about 450-536 | 965 MB (38) at 536, growing about 1.8 MB a block | 250 MB (13) at 454 |
 
   Unpatched, the write-ahead logs grow linearly with the height (each block writes about

@@ -53,7 +53,7 @@ build() {
   echo "  $name: built in $(( $(date +%s) - t0 )) s"
 }
 
-echo "== building from $SRC at ${COMMIT:0:12} (first build: 15-60 min, 15+ GB in $T)"
+echo "== building from $SRC at ${COMMIT:0:12} (first build: 15-60 min, about 5 GB in $T)"
 if [ -n "${SEQ_BIN:-}" ] && [ "$SEQ_BIN" != "$P/bin/sequencer_service" ]; then echo "  sequencer: prebuilt $SEQ_BIN"
 else build sequencer "$COMMIT $SEQ_FEATURES" sequencer_service -p sequencer_service --features "$SEQ_FEATURES" || exit 1; fi
 if [ -n "${WALLET_BIN:-}" ] && [ "$WALLET_BIN" != "$P/bin/wallet" ]; then echo "  wallet: prebuilt $WALLET_BIN"

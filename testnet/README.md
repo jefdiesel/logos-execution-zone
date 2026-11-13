@@ -28,7 +28,7 @@ new tag.
 | System packages, Fedora | `sudo dnf install clang clang-devel openssl-devel pkgconf pcsc-lite-devel` |
 | System packages, macOS | `xcode-select --install` and `brew install pkg-config openssl` |
 | risc0 (only for `--examples`) | `curl -L https://risczero.com/install \| bash`, then `rzup install rust` and `rzup install cargo-risczero 3.0.5`. This builds the example guest programs with risc0's Rust toolchain; no Docker. The kit's binaries don't need `r0vm` (see Build features) |
-| First build | about 20 GB of disk under `target/`, 8 GB of RAM or more, and 15-60 minutes |
+| First build | about 5 GB under `target/` (4.2 GB measured on macOS, examples included) plus about 1 GB of downloaded crates and the toolchains; 8 GB of RAM or more; 15-60 minutes (measured: about 40-55 min on a GitHub Ubuntu runner, about 40 min on an Apple M4 at `-j 4`) |
 | Running | about 200 MB of RAM, a few MB of disk at first |
 
 ## Quick start
@@ -68,7 +68,8 @@ Prebuilt binaries: `SEQ_BIN=... WALLET_BIN=... testnet/up.sh`.
 
 ## Funding: the genesis key
 
-The genesis block gives the whole supply (10^14 units) to one operator account. Which key that is:
+With `new` or `--genesis-pubkey`, the genesis block gives the whole supply (10^14 units) to one
+operator account. Which key that is:
 
 - `--genesis-key new` (default): `up.sh` creates a new wallet in `<home>/wallets/operator`
   (mode 700) and a new key in it. The wallet's recovery phrase goes to
@@ -80,7 +81,9 @@ The genesis block gives the whole supply (10^14 units) to one operator account. 
 - `--genesis-key default`: LEZ's published test genesis from
   `lez/sequencer/service/networks/local.json`. Its private keys are in the LEZ repository
   (`lez/testnet_initial_state`), so **everyone who uses this setting shares them** and anyone can
-  spend those funds. Fine on your laptop; never for a chain other people can reach.
+  spend those funds. It funds two public accounts (10^13 and 2x10^13) and two private ones; the
+  kit imports the first public one as the operator. Fine on your laptop; never for a chain other
+  people can reach.
 
 Each chain also gets a fresh random channel id, so two kit chains are never the same chain.
 
@@ -153,8 +156,9 @@ transaction built for it (by your app or a small Rust runner using the `wallet` 
 runners in `examples/program_deployment/src/bin` (for example `run_hello_world`, which deploys
 `hello_world` and calls it) **do not work on v0.4.0-rc3**: they send no fee declaration and the
 sequencer refuses the call with "Incorrect fee: transaction fee classification failed".
-Upstream fixed them on `dev` after rc3 (commits `41a75c5b`, `45bccb8b`, `c1fd3b01`); they don't
-apply cleanly to rc3, so this branch doesn't carry them. `smoke.sh --call` tries the runner and
+Upstream reworked them on `dev` after rc3 (commits `41a75c5b` "Fix fee param in deploying example
+programs", `45bccb8b`, `c1fd3b01`; not tried here); they don't apply cleanly to rc3, so this
+branch doesn't carry them. `smoke.sh --call` tries the runner and
 reports that failure; without `--call` the step is a SKIP. A runner of your own must set a
 `FeeDeclaration` (payer, gas limit, max fee) on its `Message`, as the wallet's own commands do.
 
@@ -165,7 +169,7 @@ A deploy costs about 24 units per byte of program at base fees of 8 (rc3 meters 
 
 | | Default | Bound to |
 |---|---|---|
-| RPC (JSON-RPC over HTTP; also WebSocket) | 3040 | 127.0.0.1 (`--public-bind`: 0.0.0.0) |
+| RPC (JSON-RPC over HTTP; also WebSocket) | 3040 | 127.0.0.1 (`--public-bind`: 0.0.0.0; that flag has not been run by us) |
 | Metrics (Prometheus) | 3041 | 127.0.0.1 always |
 | Filter (`proxy/start.sh`) | 3045 | 127.0.0.1 |
 | Faucet (`faucet/start.sh`) | 3046 | 127.0.0.1 |
@@ -187,8 +191,8 @@ it can't be rebuilt from anywhere else.
 
 - `standalone` replaces the Logos Blockchain client with a mock, so no node is needed.
 - `prove` makes risc0 run guests in-process. Without it, risc0 runs every guest through an
-  external `r0vm` binary (rzup's, version 3.0.5 for rc3), and the wallet needs it for every
-  simulation. Checked in CI (job `sequencer-without-prove`, Ubuntu 24.04): a sequencer built with
+  external `r0vm` binary (rzup's, version 3.0.5 for rc3); by the code, the wallet then needs it for
+  every simulation too (not run). Checked in CI (job `sequencer-without-prove`, Ubuntu 24.04): a sequencer built with
   `standalone` only **does not start without r0vm**; it panics executing the genesis
   ("Failed to execute genesis transaction: ProgramExecutionFailed(No such file or directory)").
   After `rzup install r0vm 3.0.5` the same binary starts and smoke.sh passes. So a sequencer that
