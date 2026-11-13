@@ -22,7 +22,7 @@ PY
   fw check-health > "$FW/recovery-phrase.txt" 2>&1 || true
   out=$(fw account new public --label faucet 2>&1)
   id=$(echo "$out" | id_of); pk=$(echo "$out" | pk_of)
-  [ -n "$id" ] && [ -n "$pk" ] || { echo "could not create the faucet account: $out"; exit 1; }
+  if [ -z "$id" ] || [ -z "$pk" ]; then echo "could not create the faucet account: $out"; exit 1; fi
   echo "$id" > "$FW/account"; echo "$pk" > "$FW/public_key"
   umask 022
 fi

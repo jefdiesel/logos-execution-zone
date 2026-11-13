@@ -146,7 +146,7 @@ PY
       if ! grep -q '^OP=' "$P/kit.env"; then
         out=$(wallet account new public --label operator 2>&1)
         OP=$(echo "$out" | id_of); OPK=$(echo "$out" | pk_of)
-        [ -n "$OP" ] && [ "${#OPK}" = 64 ] || { echo "could not create the operator account:"; echo "$out"; exit 1; }
+        if [ -z "$OP" ] || [ "${#OPK}" != 64 ]; then echo "could not create the operator account:"; echo "$out"; exit 1; fi
         printf 'OP=%s\nOPK=%s\n' "$OP" "$OPK" >> "$P/kit.env"
       fi ;;
     default)
