@@ -5,11 +5,13 @@ fix each, + the `testnet/` kit (and its workflows) on top. Each patch is also a 
 own, based on upstream `dev`, ready to be sent upstream as a pull request. When upstream merges
 one, it is dropped here at the next sync ([SYNC.md](SYNC.md)).
 
-`git log --oneline v0.4.0-rc3..testnet-0.4 -- . ':!testnet' ':!.github'` lists them.
+`git log --oneline v0.4.0-rc3..testnet-0.4 -- . ':!testnet' ':!.github' ':!README.md'` lists them
+(patch 2 came after the kit commits; the next sync puts every patch first).
 
 | # | Patch | Why | Evidence | Applies to | Upstream | Status |
 |---|---|---|---|---|---|---|
 | 1 | `fix(sequencer): cap RocksDB WAL size and open files in the sequencer store` (`lez/sequencer/actors/storage/src/actor/db.rs`, +11 lines) | The store opens RocksDB with default options: `max_total_wal_size` 0 (a dynamic limit of several GB), every table file kept open, 1000 info logs. The column families get small writes each block and never fill a memtable, so write-ahead logs pile up until that limit; and under a low descriptor limit (macOS: 256) opens fail, compaction stops and each crash-restart leaves more files behind. | See below | `bafd07be` (v0.4.0-rc3): applies, built (`--features standalone,prove`) and run. Upstream `dev` (`cb075d57`): applies | not sent yet (branch `fix/rocksdb-wal-cap`) | carried |
+| 2 | `fix: example deployer to count elf-only bytes like wallet` (`examples/program_deployment`, +8/-1, and its `Cargo.lock` line) | The example's `deploy_program` counts segments from the whole `.bin` while the wallet uploads only the user ELF, so `run_hello_world` fails ("splits into 3 segment(s) but 4 were supplied") for the `hello_world` guest; smoke.sh's call step needs it | the failure, seen on this kit's chain | backport of upstream `7b916154` | already on upstream `dev` | carried until the next tag includes it; drop at sync |
 
 ## 1. RocksDB WAL and open-file cap
 
