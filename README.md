@@ -1,5 +1,11 @@
 # Logos Execution Zone (LEZ)
 
+> **This is a fork, branch `testnet-0.4`:** upstream release candidate `v0.4.0-rc3` plus a few
+> fixes ([testnet/PATCHES.md](testnet/PATCHES.md), each also prepared as a pull request to upstream) and
+> [testnet/](testnet/README.md), a kit to run **a LEZ 0.4 test network yourself** with one command
+> (`testnet/up.sh`). It is not the Logos testnet and not run by Logos. The branch tracks upstream
+> release candidates ([testnet/SYNC.md](testnet/SYNC.md)). Everything below is upstream's README.
+
 Logos Execution Zone (LEZ) is a programmable blockchain that cleanly separates public and private state while keeping them fully interoperable. Developers can build apps that operate across transparent and privacy-preserving accounts without changing their logic. Privacy is enforced by the protocol itself through zero-knowledge proofs (ZKPs), so it is always available and automatic.
 
 ## Background
