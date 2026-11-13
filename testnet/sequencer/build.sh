@@ -32,7 +32,7 @@ mkdir -p "$P/bin" "$P/logs"
 COMMIT=$(git -C "$SRC" log -1 --format=%H -- . ':(exclude)testnet' ':(exclude).github' ':(exclude)README.md' 2>/dev/null)
 [ -n "$COMMIT" ] || COMMIT=unknown
 COMMIT=${LEZ_BUILD_KEY:-$COMMIT}   # CI passes a hash of the sources instead (shallow clones)
-DIRTY=$(git -C "$SRC" status --porcelain -- . ':(exclude)testnet' ':(exclude).github' ':(exclude)README.md' 2>/dev/null | head -1)
+DIRTY=$(git -C "$SRC" status --porcelain --untracked-files=no -- . ':(exclude)testnet' ':(exclude).github' ':(exclude)README.md' 2>/dev/null | head -1)
 [ -n "$DIRTY" ] && COMMIT="$COMMIT-dirty"
 
 # build NAME STAMP-KEY OUTPUT-BINARY CARGO-ARGS...

@@ -86,8 +86,8 @@ jobs:
         run: |
           op=$(sed -n 's/^OP=//p' testnet/run/kit.env)
           testnet/reset.sh
-          testnet/up.sh | tee up2.txt
-          grep -q "Public/$op" up2.txt
+          testnet/up.sh | tee "$RUNNER_TEMP/up2.txt"
+          grep -q "Public/$op" "$RUNNER_TEMP/up2.txt"
           testnet/smoke.sh --no-deploy
       - name: down.sh
         if: always()
