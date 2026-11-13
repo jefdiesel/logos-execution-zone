@@ -187,9 +187,12 @@ it can't be rebuilt from anywhere else.
 
 - `standalone` replaces the Logos Blockchain client with a mock, so no node is needed.
 - `prove` makes risc0 run guests in-process. Without it, risc0 runs every guest through an
-  external `r0vm` binary (rzup's, version 3.0.5 for rc3): the sequencer needs it for every public
-  transaction and the wallet for every simulation. With it, neither does. The CI job
-  `sequencer-without-prove` checks what a sequencer without `prove` does with and without r0vm.
+  external `r0vm` binary (rzup's, version 3.0.5 for rc3), and the wallet needs it for every
+  simulation. Checked in CI (job `sequencer-without-prove`, Ubuntu 24.04): a sequencer built with
+  `standalone` only **does not start without r0vm**; it panics executing the genesis
+  ("Failed to execute genesis transaction: ProgramExecutionFailed(No such file or directory)").
+  After `rzup install r0vm 3.0.5` the same binary starts and smoke.sh passes. So a sequencer that
+  orders only public transactions still needs either `prove` or r0vm; the kit uses `prove`.
 
 Override with `SEQ_FEATURES` / `WALLET_FEATURES`; `LEZ_BUILD_WRAP="nice -n 19"` prefixes every
 cargo call; `CARGO_TARGET_DIR` puts the 20 GB elsewhere.
