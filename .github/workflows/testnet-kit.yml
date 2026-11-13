@@ -1,0 +1,149 @@
+# The testnet/ kit proves itself: build from this checkout, bring a chain up, run smoke.sh and the
+# filter/faucet tests. Only on this fork's kit branches; upstream's workflows are untouched.
+name: testnet-kit
+
+on:
+  push:
+    branches: [testnet-0.4]
+  pull_request:
+    branches: [testnet-0.4]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck
+        run: shellcheck -x -P SCRIPTDIR -s bash testnet/*.sh testnet/*/*.sh
+      - name: filter and faucet tests (offline)
+        run: |
+          python3 testnet/proxy/test_proxy.py
+          python3 testnet/faucet/test_faucet.py
+
+  kit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    env:
+      # Binaries are cached per hash of the sources the kit builds, not per commit, so a kit-only
+      # change reuses them.
+      LEZ_BUILD_KEY: ${{ hashFiles('Cargo.lock', 'Cargo.toml', 'rust-toolchain.toml', 'lez/**', 'lee/**', 'examples/**', 'artifacts/**', 'test_programs/**', 'build_utils/**') }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Free disk (the first build needs about 20 GB)
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h / | tail -1
+      - name: System packages (as testnet/README.md lists them)
+        run: sudo apt-get update -q && sudo apt-get install -y -q build-essential clang libclang-dev libssl-dev pkg-config libpcsclite-dev
+      - name: risc0 (rzup; the example guests are built with its Rust toolchain)
+        run: |
+          curl -L https://risczero.com/install | bash
+          echo "$HOME/.risc0/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.risc0/bin:$PATH"
+          rzup install cargo-risczero 3.0.5
+          rzup install rust
+      - name: Restore built binaries
+        id: bin
+        uses: actions/cache/restore@v4
+        with:
+          path: testnet/run/bin
+          key: kit-bin-${{ env.LEZ_BUILD_KEY }}
+      - name: Build (testnet/sequencer/build.sh --examples)
+        env:
+          P: ${{ github.workspace }}/testnet/run
+        run: testnet/sequencer/build.sh --examples
+      # Saved at once, not at the end: a later failing step must not throw away an hour's build.
+      - name: Save built binaries
+        if: steps.bin.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: testnet/run/bin
+          key: kit-bin-${{ env.LEZ_BUILD_KEY }}
+      - name: up.sh (fresh chain, new operator key, 5 s blocks)
+        run: testnet/up.sh --examples --block-time 5
+      - name: status.sh
+        run: testnet/status.sh
+      - name: smoke.sh
+        run: testnet/smoke.sh
+      - name: the filter in front of the chain (proxy/test-live.sh)
+        run: testnet/proxy/test-live.sh
+      - name: restart keeps the chain (down.sh, up.sh)
+        run: |
+          h=$(curl -s -X POST http://127.0.0.1:3040/ -H 'Content-Type: application/json' -d '{"jsonrpc":"2.0","id":1,"method":"getLastBlockId","params":[]}' | python3 -c 'import json,sys;print(json.load(sys.stdin)["result"])')
+          testnet/down.sh
+          testnet/up.sh
+          h2=$(curl -s -X POST http://127.0.0.1:3040/ -H 'Content-Type: application/json' -d '{"jsonrpc":"2.0","id":1,"method":"getLastBlockId","params":[]}' | python3 -c 'import json,sys;print(json.load(sys.stdin)["result"])')
+          echo "height before $h, after restart $h2"; test "$h2" -ge "$h"
+      - name: reset.sh, then a new genesis for the same operator
+        run: |
+          op=$(sed -n 's/^OP=//p' testnet/run/kit.env)
+          testnet/reset.sh
+          testnet/up.sh | tee up2.txt
+          grep -q "Public/$op" up2.txt
+          testnet/smoke.sh --no-deploy
+      - name: down.sh
+        if: always()
+        run: testnet/down.sh || true
+      - name: Logs
+        if: always()
+        run: |
+          tail -60 testnet/run/logs/sequencer.log || true
+          for f in testnet/run/logs/build-*.log; do echo "== $f"; tail -15 "$f"; done || true
+
+  # Does a sequencer built WITHOUT the `prove` feature work? It runs every public transaction
+  # through an external r0vm, so it needs rzup's r0vm 3.0.5 at run time. The wallet keeps its
+  # in-process executor here, so this tests the sequencer alone.
+  sequencer-without-prove:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    env:
+      LEZ_BUILD_KEY: noprove-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'rust-toolchain.toml', 'lez/**', 'lee/**', 'artifacts/**') }}
+      SEQ_FEATURES: standalone
+    steps:
+      - uses: actions/checkout@v4
+      - name: Free disk
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+      - name: System packages
+        run: sudo apt-get update -q && sudo apt-get install -y -q build-essential clang libclang-dev libssl-dev pkg-config libpcsclite-dev
+      - name: Restore built binaries
+        id: bin
+        uses: actions/cache/restore@v4
+        with:
+          path: testnet/run/bin
+          key: kit-bin-${{ env.LEZ_BUILD_KEY }}
+      - name: Build (sequencer --features standalone only)
+        env:
+          P: ${{ github.workspace }}/testnet/run
+        run: testnet/sequencer/build.sh
+      - name: Save built binaries
+        if: steps.bin.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: testnet/run/bin
+          key: kit-bin-${{ env.LEZ_BUILD_KEY }}
+      - name: Without r0vm (expected to fail at the first public transaction)
+        run: |
+          if testnet/up.sh --block-time 5; then
+            if testnet/smoke.sh --no-deploy; then echo "NO-R0VM: smoke passed"; else echo "NO-R0VM: smoke failed"; fi
+          else echo "NO-R0VM: up.sh failed"; fi
+          grep -iE 'r0vm|panick|error' testnet/run/logs/sequencer.log | tail -8 || true
+          testnet/down.sh || true
+          mv testnet/run/bin "$RUNNER_TEMP/bin" && rm -rf testnet/run && mkdir -p testnet/run && mv "$RUNNER_TEMP/bin" testnet/run/bin
+      - name: With r0vm 3.0.5 from rzup
+        run: |
+          curl -L https://risczero.com/install | bash
+          export PATH="$HOME/.risc0/bin:$PATH"
+          rzup install r0vm 3.0.5
+          ls -la ~/.risc0/extensions/ ~/.risc0/bin/
+          testnet/up.sh --block-time 5
+          testnet/smoke.sh --no-deploy
+      - name: down.sh
+        if: always()
+        run: testnet/down.sh || true
+      - name: Logs
+        if: always()
+        run: tail -40 testnet/run/logs/sequencer.log || true

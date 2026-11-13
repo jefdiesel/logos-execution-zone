@@ -1,0 +1,159 @@
+# Watches upstream LEZ for a new v0.4 tag, or new `dev` commits touching the files our patches
+# change, and reports on ONE issue of this fork: whether the branch rebases cleanly onto the new
+# tag, and (for a new tag) whether the kit builds and smoke.sh passes. It never pushes anything
+# and never touches upstream. The cheap part runs daily; the build only when a tag is new.
+#
+# GitHub runs `schedule` only from the repository's default branch: this fires daily only while
+# the fork's default branch carries this file. `workflow_dispatch` works from any branch it is on
+# (`gh workflow run upstream-watch.yml --ref testnet-0.4`). Issues must be enabled on the fork.
+name: upstream-watch
+
+on:
+  schedule:
+    - cron: "23 5 * * *"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Report even if nothing changed since the last report"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: upstream-watch
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TITLE_PREFIX: "upstream moved"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: testnet-0.4
+          fetch-depth: 0
+      - name: What moved upstream
+        id: look
+        run: |
+          set -euo pipefail
+          . testnet/UPSTREAM
+          git remote add upstream "$UPSTREAM_REPO"
+          git fetch -q upstream dev --tags
+          NEW=$(git tag -l 'v0.4*' --sort=-v:refname | head -1)
+          NEW_SHA=$(git rev-parse "$NEW^{commit}")
+          # shellcheck disable=SC2086
+          DEV_TOUCH=$(git log --format='%h %s' "$COMMIT..upstream/dev" -- $PATCHED_FILES | head -20)
+          # shellcheck disable=SC2086
+          DEV_LAST=$(git log -1 --format=%H upstream/dev -- $PATCHED_FILES)
+          KEY="$NEW_SHA $DEV_LAST"
+          echo "pinned $TAG ($COMMIT); newest v0.4 tag $NEW ($NEW_SHA)"
+          echo "dev commits touching the patched files since the pin:"; echo "${DEV_TOUCH:-  none}"
+          ISSUE=$(gh issue list --state open --search "\"$TITLE_PREFIX\" in:title" --json number,body \
+            --jq '.[0] | select(. != null) | "\(.number)"' || true)
+          OLDKEY=""
+          [ -n "$ISSUE" ] && OLDKEY=$(gh issue view "$ISSUE" --json body --jq .body | sed -n 's/^<!-- key: \(.*\) -->$/\1/p')
+          CHANGED=1
+          if [ "$NEW_SHA" = "$COMMIT" ] && [ -z "$DEV_TOUCH" ]; then CHANGED=0; fi
+          if [ "$KEY" = "$OLDKEY" ]; then CHANGED=0; fi
+          [ "${{ inputs.force || false }}" = true ] && CHANGED=1
+          {
+            echo "new=$NEW"; echo "new_sha=$NEW_SHA"; echo "key=$KEY"; echo "issue=$ISSUE"; echo "changed=$CHANGED"
+            echo "new_tag=$([ "$NEW_SHA" != "$COMMIT" ] && echo 1 || echo 0)"
+          } >> "$GITHUB_OUTPUT"
+          { echo 'DEV_TOUCH<<EOF'; echo "${DEV_TOUCH:-none}"; echo EOF; } >> "$GITHUB_ENV"
+          echo "changed=$CHANGED"
+
+      - name: Try the rebase (local only; nothing is pushed)
+        id: rebase
+        if: steps.look.outputs.changed == '1'
+        run: |
+          set -uo pipefail
+          . testnet/UPSTREAM
+          git config user.name upstream-watch; git config user.email upstream-watch@users.noreply.github.com
+          NEW=${{ steps.look.outputs.new }}
+          PATCHES=$(git log --reverse --format='%h %s' "$TAG..HEAD" -- . ':(exclude)testnet' ':(exclude).github' ':(exclude)README.md')
+          { echo 'PATCHES<<EOF'; echo "$PATCHES"; echo EOF; } >> "$GITHUB_ENV"
+          # Each patch against upstream dev (is it still needed? does it still apply?)
+          DEVCHECK=""
+          git checkout -q --detach upstream/dev
+          for c in $(git log --reverse --format=%H "$TAG..HEAD" -- . ':(exclude)testnet' ':(exclude).github' ':(exclude)README.md'); do
+            if git format-patch -1 --stdout "$c" | git apply --check - 2>/dev/null; then r="applies to dev"
+            elif git format-patch -1 --stdout "$c" | git apply --check -R - 2>/dev/null; then r="already in dev"
+            else r="does not apply to dev"; fi
+            DEVCHECK="$DEVCHECK$(git log -1 --format='%h %s' "$c"): $r"$'\n'
+          done
+          git checkout -q testnet-0.4
+          { echo 'DEVCHECK<<EOF'; printf '%s' "$DEVCHECK"; echo EOF; } >> "$GITHUB_ENV"
+          git checkout -q -b watch-try HEAD
+          if git rebase -q --onto "$NEW" "$TAG" 2> rebase.err; then
+            echo "result=clean" >> "$GITHUB_OUTPUT"
+          else
+            FILES=$(git diff --name-only --diff-filter=U | tr '\n' ' ')
+            git rebase --abort || true
+            echo "result=conflicts in ${FILES:-(see log)}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build and smoke on the rebased tree (new tag, clean rebase only)
+        id: smoke
+        if: steps.look.outputs.new_tag == '1' && steps.rebase.outputs.result == 'clean'
+        run: |
+          set -uo pipefail
+          step() { echo "step=$1" > "$RUNNER_TEMP/step"; }
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          step "system packages"; sudo apt-get update -q && sudo apt-get install -y -q build-essential clang libclang-dev libssl-dev pkg-config libpcsclite-dev || exit 1
+          R0=$(sed -n 's/^risc0-zkvm = { version = "\([^"]*\)".*/\1/p' Cargo.toml)
+          step "rzup (risc0 $R0)"; curl -L https://risczero.com/install | bash && export PATH="$HOME/.risc0/bin:$PATH" && rzup install cargo-risczero "$R0" && rzup install rust || exit 1
+          step "build"; P=$PWD/testnet/run testnet/sequencer/build.sh --examples || exit 1
+          step "up.sh"; testnet/up.sh --examples --block-time 5 || exit 1
+          step "smoke.sh"; testnet/smoke.sh || exit 1
+          step "passed"
+        continue-on-error: true
+
+      - name: Report on the issue
+        if: steps.look.outputs.changed == '1'
+        run: |
+          set -uo pipefail
+          . testnet/UPSTREAM
+          NEW=${{ steps.look.outputs.new }}
+          REBASE="${{ steps.rebase.outputs.result }}"
+          if [ "${{ steps.look.outputs.new_tag }}" = 1 ]; then
+            if [ "$REBASE" = clean ]; then
+              S=$(sed -n 's/^step=//p' "$RUNNER_TEMP/step" 2>/dev/null || echo "not run")
+              if [ "$S" = passed ]; then SMOKE="build + up.sh + smoke.sh passed"; else SMOKE="failed at: $S"; fi
+            else SMOKE="not run (rebase not clean)"; fi
+          else SMOKE="not run (no new tag; dev changes only)"; fi
+          TITLE="$TITLE_PREFIX: $NEW — rebase $REBASE — smoke ${SMOKE%% (*}"
+          BODY=$(cat <<EOF
+          Pinned: \`$TAG\` (\`${COMMIT:0:8}\`). Newest upstream v0.4 tag: \`$NEW\` (\`${{ steps.look.outputs.new_sha }}\`).
+
+          **Rebase of testnet-0.4 onto $NEW:** $REBASE
+          **Kit on the rebased tree:** $SMOKE
+
+          Patch series:
+          \`\`\`
+          $PATCHES
+          \`\`\`
+          Each patch against upstream \`dev\`:
+          \`\`\`
+          $DEVCHECK
+          \`\`\`
+          Upstream \`dev\` commits touching the patched files since the pin:
+          \`\`\`
+          $DEV_TOUCH
+          \`\`\`
+          Next: follow testnet/SYNC.md. This workflow pushed nothing. Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          <!-- key: ${{ steps.look.outputs.key }} -->
+          EOF
+          )
+          if [ -n "${{ steps.look.outputs.issue }}" ]; then
+            gh issue edit "${{ steps.look.outputs.issue }}" --title "$TITLE" --body "$BODY"
+          else
+            gh issue create --title "$TITLE" --body "$BODY"
+          fi
