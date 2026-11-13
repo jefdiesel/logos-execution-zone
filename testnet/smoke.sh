@@ -69,13 +69,11 @@ h1=$(height); sleep $((BLOCK_TIME * 2 + 2)); h2=$(height)
 if [ -n "$h1" ] && [ -n "$h2" ] && [ "$h2" -gt "$h1" ]; then pass "height $h1 -> $h2 in $((BLOCK_TIME * 2 + 2)) s"; else fail "height did not grow: '$h1' -> '$h2'"; fi
 
 step "3. account id formula"
-if [ "$GENESIS" = default ]; then
-  # LEZ's published genesis key A (lez/sequencer/service/networks/local.json) and its account.
-  calc=$(account_of_pk 6aa4c365699b89d963ef85a59868b9612b6001f90750b4970662a62776332e81)
-else
-  calc=$(account_of_pk "$OPK")
-fi
-if [ "$calc" = "$OP" ]; then pass "account_of_pk(operator pk) = Public/$OP"; else fail "formula gives $calc, wallet says $OP"; fi
+pk=$OPK
+# --genesis-key default imports LEZ's test key; ask the wallet for its public key.
+[ -n "$pk" ] || pk=$(wallet account get --keys --account-id "Public/$OP" 2>&1 | pk_of)
+calc=$(account_of_pk "$pk")
+if [ -n "$pk" ] && [ "$calc" = "$OP" ]; then pass "account_of_pk(operator pk) = Public/$OP"; else fail "formula gives '$calc' for pk '$pk', the wallet says $OP"; fi
 
 if [ "$GENESIS" = pubkey ]; then
   echo

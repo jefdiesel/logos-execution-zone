@@ -1,9 +1,12 @@
 # Moving this branch to a new upstream release
 
 `testnet-0.4` is upstream's tag + our patch series + the kit. When upstream tags a new v0.4
-release candidate, the branch is rebuilt on it. The `upstream-watch` workflow does the first
-checks daily and reports on one issue of the fork ("upstream moved: ..."); a person does the
-rest. Nothing is ever force-pushed automatically.
+release candidate, the branch is rebuilt on it. The `upstream-watch` workflow is meant to do the first
+checks daily and report on one issue of the fork ("upstream moved: ..."); a person does the
+rest. Nothing is ever force-pushed automatically. It has **not run yet**: GitHub only schedules
+or dispatches a workflow that is on the repository's default branch, and Issues are off on the
+fork, so it needs the default branch changed to `testnet-0.4` (or the file copied there) and
+Issues enabled.
 
 The pin lives in `testnet/UPSTREAM` (tag, commit, patched files).
 

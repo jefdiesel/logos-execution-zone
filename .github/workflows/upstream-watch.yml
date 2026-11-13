@@ -3,9 +3,9 @@
 # tag, and (for a new tag) whether the kit builds and smoke.sh passes. It never pushes anything
 # and never touches upstream. The cheap part runs daily; the build only when a tag is new.
 #
-# GitHub runs `schedule` only from the repository's default branch: this fires daily only while
-# the fork's default branch carries this file. `workflow_dispatch` works from any branch it is on
-# (`gh workflow run upstream-watch.yml --ref testnet-0.4`). Issues must be enabled on the fork.
+# GitHub registers `schedule` and `workflow_dispatch` workflows only from the repository's default
+# branch: this does nothing until the fork's default branch carries this file (make testnet-0.4
+# the default branch, or copy the file there). Issues must be enabled on the fork. Never run yet.
 name: upstream-watch
 
 on:
@@ -80,10 +80,12 @@ jobs:
           NEW=${{ steps.look.outputs.new }}
           PATCHES=$(git log --reverse --format='%h %s' "$TAG..HEAD" -- . ':(exclude)testnet' ':(exclude).github' ':(exclude)README.md')
           { echo 'PATCHES<<EOF'; echo "$PATCHES"; echo EOF; } >> "$GITHUB_ENV"
-          # Each patch against upstream dev (is it still needed? does it still apply?)
+          # Each patch against upstream dev (is it still needed? does it still apply?). The list is
+          # taken before checking out dev.
+          LIST=$(git log --reverse --format=%H "$TAG..HEAD" -- . ':(exclude)testnet' ':(exclude).github' ':(exclude)README.md')
           DEVCHECK=""
           git checkout -q --detach upstream/dev
-          for c in $(git log --reverse --format=%H "$TAG..HEAD" -- . ':(exclude)testnet' ':(exclude).github' ':(exclude)README.md'); do
+          for c in $LIST; do
             if git format-patch -1 --stdout "$c" | git apply --check - 2>/dev/null; then r="applies to dev"
             elif git format-patch -1 --stdout "$c" | git apply --check -R - 2>/dev/null; then r="already in dev"
             else r="does not apply to dev"; fi
