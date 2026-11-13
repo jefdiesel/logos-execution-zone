@@ -101,12 +101,19 @@ elif [ ! -f "$HELLO_ELF" ] || [ ! -x "$HELLO_RUNNER" ]; then
   step "6-7. deploy and call"; fail "no example programs at $HELLO_ELF / $HELLO_RUNNER: run testnet/up.sh --examples (needs rzup), or pass --no-deploy"
 else
   step "6. deploy hello_world at a chosen header"
-  size=$(wc -c < "$HELLO_ELF" | tr -d ' '); nseg=$(( (size + 98303) / 98304 ))   # MAX_SEGMENT_DATA_LEN = 96 KiB
+  # One 96 KiB segment per chunk of the program's user ELF (the .bin also holds risc0's kernel,
+  # which is not uploaded). Start from the file size; the wallet names the exact count if it differs.
+  size=$(wc -c < "$HELLO_ELF" | tr -d ' '); nseg=$(( (size + 98303) / 98304 ))
   read -r H _ <<< "$(new_account "smoke-header-$TAG")"
-  segs=()
-  for i in $(seq 1 "$nseg"); do read -r s _ <<< "$(new_account "smoke-seg$i-$TAG")"; segs+=("Public/$s"); done
-  echo "header Public/$H, $nseg segment(s) for $size bytes"
-  out=$(wallet program-loader deploy --elf "$HELLO_ELF" --header "Public/$H" --segments "${segs[@]}" --payer "Public/$OP" 2>&1); rc=$?
+  for attempt in 1 2; do
+    segs=()
+    for i in $(seq 1 "$nseg"); do read -r s _ <<< "$(new_account "smoke-seg$i-$attempt-$TAG")"; segs+=("Public/$s"); done
+    echo "header Public/$H, $nseg segment(s) for a $size-byte .bin"
+    out=$(wallet program-loader deploy --elf "$HELLO_ELF" --header "Public/$H" --segments "${segs[@]}" --payer "Public/$OP" 2>&1); rc=$?
+    want=$(echo "$out" | sed -n 's/.*splits into \([0-9]*\) segment.*/\1/p' | head -1)
+    [ -n "$want" ] && [ "$attempt" = 1 ] || break
+    echo "the wallet wants $want segment(s); again"; nseg=$want
+  done
   echo "$out" | grep -v "^Transaction data" | tail -4
   acct=$(rpc_call getAccount "[\"$H\"]")
   if [ "$rc" = 0 ] && echo "$acct" | grep -q '"result":{'; then pass "program deployed at header Public/$H"; else fail "deploy rc=$rc; header account: $(echo "$acct" | cut -c1-200)"; fi

@@ -133,11 +133,15 @@ import that key and deploy there:
 ```sh
 W=testnet/wallet.sh
 $W account import public --private-key <hex>            # the header key; or `account new public`
-n=$(( ($(wc -c < program.bin) + 98303) / 98304 ))       # number of 96 KiB segments
+n=$(( ($(wc -c < program.bin) + 98303) / 98304 ))       # 96 KiB segments; an upper bound (see below)
 for i in $(seq 1 $n); do $W account new public --label seg$i; done
 $W program-loader deploy --elf program.bin --header Public/<header id> \
    --segments Public/<seg1> ... --payer Public/<operator>
 ```
+
+Only the program's user ELF is uploaded, not the risc0 kernel that the `.bin` also holds, so the
+real count can be one lower than the file size suggests; if it differs, the wallet stops before
+sending anything and says how many it needs ("splits into 3 segment(s) but 4 were supplied").
 
 `--private-key` puts the key in your shell history and the process list; type it in a private
 shell and clear the history afterwards. Add `--immutable` to declare the program immutable (the
