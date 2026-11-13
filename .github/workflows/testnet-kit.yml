@@ -27,12 +27,12 @@ jobs:
   kit:
     runs-on: ubuntu-24.04
     timeout-minutes: 300
-    env:
-      # Binaries are cached per hash of the sources the kit builds, not per commit, so a kit-only
-      # change reuses them.
-      LEZ_BUILD_KEY: ${{ hashFiles('Cargo.lock', 'Cargo.toml', 'rust-toolchain.toml', 'lez/**', 'lee/**', 'examples/**', 'artifacts/**', 'test_programs/**', 'build_utils/**') }}
     steps:
       - uses: actions/checkout@v4
+      # Binaries are cached per hash of the sources the kit builds, not per commit, so a kit-only
+      # change reuses them.
+      - name: Build key
+        run: echo "LEZ_BUILD_KEY=${{ hashFiles('Cargo.lock', 'Cargo.toml', 'rust-toolchain.toml', 'lez/**', 'lee/**', 'examples/**', 'artifacts/**', 'test_programs/**', 'build_utils/**') }}" >> "$GITHUB_ENV"
       - name: Free disk (the first build needs about 20 GB)
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
@@ -101,10 +101,11 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 300
     env:
-      LEZ_BUILD_KEY: noprove-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'rust-toolchain.toml', 'lez/**', 'lee/**', 'artifacts/**') }}
       SEQ_FEATURES: standalone
     steps:
       - uses: actions/checkout@v4
+      - name: Build key
+        run: echo "LEZ_BUILD_KEY=noprove-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'rust-toolchain.toml', 'lez/**', 'lee/**', 'artifacts/**') }}" >> "$GITHUB_ENV"
       - name: Free disk
         run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
       - name: System packages
