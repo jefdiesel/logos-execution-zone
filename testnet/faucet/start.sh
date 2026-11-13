@@ -30,7 +30,9 @@ FA=$(cat "$FW/account")
 bal=$(rpc_call getAccountBalance "[\"$FA\"]" | "$PY" -c 'import json,sys;print(json.load(sys.stdin).get("result") or 0)' 2>/dev/null)
 if [ "${bal:-0}" = 0 ]; then
   echo "the faucet account Public/$FA is empty. Fund it from the operator, then start again:"
-  echo "  $KIT/wallet.sh auth-transfer send --from Public/$OP --to-pk $(cat "$FW/public_key") --amount 10000000000"
+  K=$KIT; [ "$(pwd)/testnet" = "$KIT" ] && K=testnet
+  H=""; [ "$P" != "$KIT/run" ] && H=" --home $P"
+  echo "  $K/wallet.sh$H auth-transfer send --from Public/$OP --to-pk $(cat "$FW/public_key") --amount 10000000000"
   exit 1
 fi
 mkdir -p "$P/run" "$P/logs"
