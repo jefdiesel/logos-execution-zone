@@ -7,6 +7,8 @@ Binaries: sequencer_service (--features standalone,prove) and wallet (--features
 built from this same source tree with the same cargo commands sequencer/build.sh runs, then passed
 in with SEQ_BIN/WALLET_BIN, because the build host's shared build queue was busy. The from-source
 path (build.sh inside up.sh) is run by the testnet-kit GitHub workflow on every push.
+Part 1 ran with the scripts as of the first push; parts 2 and 3 with the current ones (smoke.sh
+gained the segment-count retry and the opt-in --call between them).
 
 $ git clone --branch testnet-0.4 https://github.com/jefdiesel/logos-execution-zone.git && cd logos-execution-zone
 $ export SEQ_BIN=<sequencer_service built from this tree> WALLET_BIN=<wallet built from this tree>
@@ -109,3 +111,77 @@ healthz: {"ok": true, "height": 36, "counters": {"healthz 200": 1, "getLastBlock
 
 filter: ALL PASS
 [exit 0]
+
+
+======== Part 2, same chain, later: the example program built, the full smoke.sh (deploy at a chosen header)
+$ export HELLO_ELF=<hello_world.bin from: cargo build --release -p example_program_deployment_methods> HELLO_RUNNER=<run_hello_world>
+
+$ testnet/smoke.sh --home ~/lez-test
+
+== 1. listeners (0 s)
+sequencer pid 30413 listens on: 127.0.0.1:3940 127.0.0.1:3941 
+PASS  every listener is loopback (RPC bind 127.0.0.1)
+
+== 2. blocks (0 s)
+PASS  height 1187 -> 1189 in 12 s
+
+== 3. account id formula (15 s)
+PASS  account_of_pk(operator pk) = Public/Bpjkt3MjHesVfyNCmY8W77a2ykyGRUVb44suDZLqnp6C
+
+== 4. fund a new account by its public key (15 s)
+operator balance 99989749983592
+A = Public/7ANMaizD2LCNZggwoLHNcKU6Tj2oPjezGqvAUXFhrsTz (pk 6d9d3bc884ad9c1221602aec9eb6fbf0b05f38d59c0db22afacf50203d7fdd3a)
+Transaction hash is 0e7dc8e7fb084ad731312f3af3463b412d828f2c8a1779f3b1c3436edcab9bc1
+Transaction is included in block 1191
+PASS  A holds 100000000 (send rc=0)
+
+== 5. transfers between users (49 s)
+B = Public/8sQxxMEEzsZa2LTKLtbZdVPxEvcTQAhQ2uPPU7MWmcwX
+Transaction hash is aec409fc25c48446e6c2a2d29a845cba48a4eb6184b65a2d04e5ecc2aadb146e
+Transaction is included in block 1197
+PASS  A -> B (--to-pk, never-used account): B holds 1000000
+A after paying 1000000 + fee: 98995648 (fee 4352)
+Transaction hash is e353862550b14b1c071fe16ae52782ca4ae6c3866f8bd860792e5393c27666ce
+Transaction is included in block 1203
+PASS  B -> A (--to, used account): A holds 99395648
+B after paying 400000 + fee: 595912 (fee 4088)
+
+== 6. deploy hello_world at a chosen header (114 s)
+header Public/ENHMBVS1HoyGtCmMhpXRKFkgVfMEaFkiWNeE4iGH4nLc, 4 segment(s) for a 305708-byte .bin
+the wallet wants 3 segment(s); again
+header Public/ENHMBVS1HoyGtCmMhpXRKFkgVfMEaFkiWNeE4iGH4nLc, 3 segment(s) for a 305708-byte .bin
+Transaction is included in block 1223
+Transaction hash is f49651d71b2dafade07b919ceb0c327cc2a0d3a79757fd7dc61f50cfb8324dea
+Transaction is included in block 1229
+Program deployed. Header account id: ENHMBVS1HoyGtCmMhpXRKFkgVfMEaFkiWNeE4iGH4nLc
+PASS  program deployed at header Public/ENHMBVS1HoyGtCmMhpXRKFkgVfMEaFkiWNeE4iGH4nLc
+
+== 7. deploy + call through the example runner (237 s)
+SKIP  --call not given (rc3's example runners send no fee declaration; see the comment at the top)
+
+smoke: ALL PASS in 237 s, height 1234
+[exit 0]
+
+
+======== Part 3, same chain: the faucet
+
+$ testnet/faucet/start.sh --home ~/lez-test
+the faucet account Public/BfGtXDQuRXKycKajqKtkugR3ZA3kTiGP3zD2YrQhuqzD is empty. Fund it from the operator, then start again:
+  testnet/wallet.sh --home ~/lez-test auth-transfer send --from Public/Bpjkt3MjHesVfyNCmY8W77a2ykyGRUVb44suDZLqnp6C --to-pk 54d4d092ea3d57055c56c49845123c07561ba7086fb1ceaa5a4bbdb00f086829 --amount 10000000000
+[exit 1]
+
+$ testnet/wallet.sh --home ~/lez-test auth-transfer send --from Public/Bpjkt3MjHesVfyNCmY8W77a2ykyGRUVb44suDZLqnp6C --to-pk 54d4d092ea3d57055c56c49845123c07561ba7086fb1ceaa5a4bbdb00f086829 --amount 10000000000
+Transaction hash is 94cddc04d1580da915ae37bd3986b85a9dae25d31623ba214ddf73afc7dfd510
+Transaction is included in block 73
+
+$ testnet/faucet/start.sh --home ~/lez-test
+faucet on 127.0.0.1:3946, pid 35921, paying from Public/BfGtXDQuRXKycKajqKtkugR3ZA3kTiGP3zD2YrQhuqzD (balance 10000000000)
+[exit 0]
+
+(a new user account Public/6qHvPH6cLv3nVzG4EMg58jWUbNx2GaWYGmH8CAbBhefd in another wallet, public key e5effde50afeb5857a7fcf35a5cc544ebb89a183355ccf3c3a7b55e675cdfecc)
+$ curl -s -X POST http://127.0.0.1:3946/faucet -H 'Content-Type: application/json' -d '{"public_key":"e5effde50afeb5857a7fcf35a5cc544ebb89a183355ccf3c3a7b55e675cdfecc"}'
+{"account": "Public/6qHvPH6cLv3nVzG4EMg58jWUbNx2GaWYGmH8CAbBhefd", "amount": "100000000", "tx": "5a1139f8557d7d44ced4b5463be30827b879419b8075b8c43dfa4055b4f10df0"}
+$ (balance of Public/6qHvPH6cLv3nVzG4EMg58jWUbNx2GaWYGmH8CAbBhefd)
+{"jsonrpc":"2.0","id":1,"result":100000000}
+$ (the same key again)
+{"error": "the faucet is busy sending; try again in a minute"}
