@@ -92,9 +92,9 @@ def wait_idle():
 
 class FaucetTest(unittest.TestCase):
     def test_account_id_formula(self):
-        # LEZ's published genesis key A and its account, as the kit's wallet reports them.
-        self.assertEqual(faucet.account_of("6aa4c365699b89d963ef85a59868b9612b6001f90750b4970662a62776332e81"),
-                         os.environ.get("EXPECT_ACCOUNT_A", faucet.account_of("6aa4c365699b89d963ef85a59868b9612b6001f90750b4970662a62776332e81")))
+        # A key and the account id the stock rc3 wallet printed for it (EXAMPLE-RUN.txt, part 3).
+        self.assertEqual(faucet.account_of("e5effde50afeb5857a7fcf35a5cc544ebb89a183355ccf3c3a7b55e675cdfecc"),
+                         "6qHvPH6cLv3nVzG4EMg58jWUbNx2GaWYGmH8CAbBhefd")
 
     def test_flow(self):
         status, out = post({"public_key": "xyz"})
