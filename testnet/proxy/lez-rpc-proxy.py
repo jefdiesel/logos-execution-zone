@@ -10,7 +10,10 @@ never to the sequencer.
 What it does, per request:
   - only `POST /` with `Content-Type: application/json` and a `Content-Length` (no chunked bodies,
     no Upgrade, no GET/OPTIONS except the loopback `GET /healthz`);
-  - one JSON-RPC 2.0 object per request (arrays/batches refused), method on the allowlist,
+  - one JSON-RPC 2.0 object per request, or a batch of at most MAX_BATCH of them (--max-batch;
+    0 refuses batches): every call checked as a single one would be (one bad call refuses the
+    whole batch), no empty batch, no nested arrays, and a batch of N counts as N requests in the
+    per-client bucket; method on the allowlist,
     `getBlockRange` span at most MAX_RANGE blocks (the stock wallet asks for 100);
   - body caps: SEND_MAX for `sendTransaction`, READ_MAX for everything else;
   - per-client token buckets keyed on the client-address header your front end sets
@@ -71,6 +74,7 @@ DEFAULTS = dict(
     READ_MAX=16 * 1024,
     RESP_MAX=12 * 1024 * 1024,  # the upstream caps responses at 10 MiB itself
     MAX_RANGE=100,
+    MAX_BATCH=20,  # calls per JSON-RPC batch; 0 refuses batches
     MAX_CONN=96,  # open client connections (threads)
     MAX_INFLIGHT=12,  # concurrent upstream calls
     UPSTREAM_TIMEOUT=30.0,
@@ -113,7 +117,7 @@ class Limits:
         with self.lock:
             self.counters[key] = self.counters.get(key, 0) + 1
 
-    def allow(self, ip, method=None):
+    def allow(self, ip, method=None, extra=0):
         """method None: the per-client and global buckets, checked before the body is read.
         A method name: only that method's own bucket, checked after the parse."""
         cfg = self.cfg
@@ -138,6 +142,10 @@ class Limits:
                     return "client"
                 if not self.global_bucket.take():
                     return "busy"
+            elif method == "*extra":
+                # The rest of a batch: n - 1 more requests from the client's own bucket.
+                if not entry["all"].take(extra):
+                    return "client"
             elif method == "sendTransaction" and not entry["send"].take():
                 return "client"
             elif method == "getBlockRange" and not entry["range"].take():
@@ -294,37 +302,78 @@ class Handler(BaseHTTPRequestHandler):
             req = json.loads(raw)
         except Exception:  # noqa: BLE001  ValueError, RecursionError (deep nesting), MemoryError
             return self.reply(400, rpc_error(-32700, "parse error"), started=started)
+        if isinstance(req, list):
+            return self.batch(req, length, started)
         if not isinstance(req, dict):
-            return self.reply(400, rpc_error(-32600, "batches are not served; send one request"), started=started)
+            return self.reply(400, rpc_error(-32600, "send one JSON-RPC request object or a batch"), started=started)
+        refused = self.check_call(req, length)
+        if refused is not None:
+            return self.reply(*refused, started=started)
+        rid, method, params = req.get("id"), req["method"], req.get("params", [])
+        if self.server.limits.allow(self.client_ip(), method) == "client":
+            return self.reply(429, rpc_error(-32005, "rate limited; slow down", rid), method, started, {"Retry-After": "10"})
+        body = json.dumps({"jsonrpc": "2.0", "id": rid, "method": method, "params": params}, separators=(",", ":")).encode()
+        return self.forward(body, rid, method, started)
+
+    def check_call(self, req, length):
+        """None if this one call may go upstream, else (status, body, label) for the refusal."""
+        cfg = self.server.cfg
+        if not isinstance(req, dict):
+            return 400, rpc_error(-32600, "a batch holds request objects only (no nested arrays)"), "-"
         rid, method, params = req.get("id"), req.get("method"), req.get("params", [])
         if not isinstance(rid, (int, str)) or isinstance(rid, bool) or (isinstance(rid, str) and len(rid) > 64):
-            return self.reply(400, rpc_error(-32600, "id must be a number or a short string"), started=started)
+            return 400, rpc_error(-32600, "id must be a number or a short string"), "-"
         if not isinstance(method, str) or method not in self.server.allowed:
             label = method if isinstance(method, str) and method in DENIED else "other"
-            return self.reply(403, rpc_error(-32601, "method not served here", rid), label, started)
+            return 403, rpc_error(-32601, "method not served here", rid), label
         if length > (cfg["SEND_MAX"] if method == "sendTransaction" else cfg["READ_MAX"]):
-            return self.reply(413, rpc_error(-32600, "request too large for " + method, rid), method, started)
+            return 413, rpc_error(-32600, "request too large for " + method, rid), method
         if not isinstance(params, (list, dict)):
-            return self.reply(400, rpc_error(-32602, "params must be a list or object", rid), method, started)
+            return 400, rpc_error(-32602, "params must be a list or object", rid), method
         if method == "getBlockRange":
             try:
                 a, b = (params[0], params[1]) if isinstance(params, list) else (params["start_block_id"], params["end_block_id"])
                 if not (isinstance(a, int) and isinstance(b, int) and 0 <= a <= b and b - a + 1 <= cfg["MAX_RANGE"]):
                     raise ValueError
             except (ValueError, KeyError, IndexError, TypeError):
-                return self.reply(400, rpc_error(-32602, "getBlockRange spans at most %d blocks" % cfg["MAX_RANGE"], rid), method, started)
-        if self.server.limits.allow(self.client_ip(), method) == "client":
-            return self.reply(429, rpc_error(-32005, "rate limited; slow down", rid), method, started, {"Retry-After": "10"})
+                return 400, rpc_error(-32602, "getBlockRange spans at most %d blocks" % cfg["MAX_RANGE"], rid), method
+        return None
+
+    def batch(self, reqs, length, started):
+        cfg = self.server.cfg
+        if cfg["MAX_BATCH"] <= 0:
+            return self.reply(400, rpc_error(-32600, "batches are not served; send one request"), "batch", started)
+        if not reqs:
+            return self.reply(400, rpc_error(-32600, "empty batch"), "batch", started)
+        if len(reqs) > cfg["MAX_BATCH"]:
+            return self.reply(400, rpc_error(-32600, "a batch holds at most %d calls" % cfg["MAX_BATCH"]), "batch", started)
+        # The whole batch is one body: it must fit the cap of its largest kind of call.
+        for req in reqs:
+            refused = self.check_call(req, length)
+            if refused is not None:
+                status, body, label = refused
+                return self.reply(status, body, "batch " + label, started)
+        ip = self.client_ip()
+        # One request was counted before the body was read; a batch of N counts N.
+        if len(reqs) > 1 and self.server.limits.allow(ip, "*extra", len(reqs) - 1) == "client":
+            return self.reply(429, rpc_error(-32005, "rate limited; slow down"), "batch", started, {"Retry-After": "10"})
+        for req in reqs:
+            if self.server.limits.allow(ip, req["method"]) == "client":
+                return self.reply(429, rpc_error(-32005, "rate limited; slow down"), "batch", started, {"Retry-After": "10"})
+        body = json.dumps([{"jsonrpc": "2.0", "id": r.get("id"), "method": r["method"], "params": r.get("params", [])} for r in reqs],
+                          separators=(",", ":")).encode()
+        return self.forward(body, None, "batch", started)
+
+    def forward(self, body, rid, label, started):
         if not self.server.limits.inflight.acquire(blocking=False):
-            return self.reply(503, rpc_error(-32005, "server busy; retry later", rid), method, started, {"Retry-After": "5"})
+            return self.reply(503, rpc_error(-32005, "server busy; retry later", rid), label, started, {"Retry-After": "5"})
         try:
-            body = json.dumps({"jsonrpc": "2.0", "id": rid, "method": method, "params": params}, separators=(",", ":")).encode()
             status, data = self.upstream_call(body)
         except (OSError, ValueError, http.client.HTTPException):
-            return self.reply(502, rpc_error(-32603, "sequencer unavailable", rid), method, started)
+            return self.reply(502, rpc_error(-32603, "sequencer unavailable", rid), label, started)
         finally:
             self.server.limits.inflight.release()
-        return self.reply(200 if status == 200 else 502, data, method, started)
+        return self.reply(200 if status == 200 else 502, data, label, started)
 
 
 def loopback_addr(text):
@@ -344,6 +393,8 @@ def main(argv=None):
                         "(X-Real-IP for nginx/Caddy setups); 'none' keys limits on the TCP peer")
     p.add_argument("--allow-method", action="append", default=[], metavar="NAME",
                    help="serve this JSON-RPC method too (repeatable)")
+    p.add_argument("--max-batch", type=int, default=None, metavar="N",
+                   help="calls allowed in one JSON-RPC batch (default %d; 0 refuses batches)" % DEFAULTS["MAX_BATCH"])
     p.add_argument("--log-requests", help="append one line per request (ip method status bytes ms) to this file")
     p.add_argument("--set", action="append", default=[], metavar="NAME=VALUE",
                    help="override a limit, e.g. --set IP_ALL=10,150 --set SEND_MAX=786432")
@@ -354,6 +405,10 @@ def main(argv=None):
         if name not in cfg:
             p.error("unknown limit " + name)
         cfg[name] = tuple(float(x) for x in value.split(",")) if isinstance(cfg[name], tuple) else type(cfg[name])(value)
+    if args.max_batch is not None:
+        if args.max_batch < 0:
+            p.error("--max-batch must be 0 or more")
+        cfg["MAX_BATCH"] = args.max_batch
     log = None
     if args.log_requests:
         log = logging.getLogger("requests")

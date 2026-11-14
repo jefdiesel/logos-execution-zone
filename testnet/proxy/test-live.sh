@@ -23,7 +23,14 @@ t getChannelId 200 -d '{"jsonrpc":"2.0","id":2,"method":"getChannelId","params":
 t requeueCrossZoneDeadLetter 403 -d '{"jsonrpc":"2.0","id":3,"method":"requeueCrossZoneDeadLetter","params":["00"]}'
 t getCrossZoneDeadLetters 403 -d '{"jsonrpc":"2.0","id":4,"method":"getCrossZoneDeadLetters","params":[]}'
 t rpc.discover 403 -d '{"jsonrpc":"2.0","id":5,"method":"rpc.discover","params":[]}'
-t "batch of two" 400 -d '[{"jsonrpc":"2.0","id":6,"method":"getLastBlockId","params":[]},{"jsonrpc":"2.0","id":7,"method":"getLastBlockId","params":[]}]'
+t "batch of two" 200 -d '[{"jsonrpc":"2.0","id":6,"method":"getLastBlockId","params":[]},{"jsonrpc":"2.0","id":7,"method":"getChannelId","params":[]}]'
+t "batch with an operator call" 403 -d '[{"jsonrpc":"2.0","id":6,"method":"getLastBlockId","params":[]},{"jsonrpc":"2.0","id":7,"method":"getCrossZoneDeadLetters","params":[]}]'
+t "empty batch" 400 -d '[]'
+t "nested batch" 400 -d '[[{"jsonrpc":"2.0","id":6,"method":"getLastBlockId","params":[]}]]'
+big=$("$PY" -c 'import json;print(json.dumps([{"jsonrpc":"2.0","id":i,"method":"getLastBlockId","params":[]} for i in range(21)]))')
+t "batch of 21 (cap 20)" 400 -d "$big"
+answers=$(curl -s -m 20 -X POST "http://127.0.0.1:$PP/" -H 'Content-Type: application/json' -d '[{"jsonrpc":"2.0","id":6,"method":"getLastBlockId","params":[]},{"jsonrpc":"2.0","id":7,"method":"getChannelId","params":[]}]' | "$PY" -c 'import json,sys;d=json.load(sys.stdin);print(len(d) if isinstance(d,list) else "not a list")' 2>&1)
+if [ "$answers" = 2 ]; then echo "PASS  batch of two answers two results"; else echo "FAIL  batch answer: $answers"; FAILS=$((FAILS + 1)); fi
 t "getBlockRange 0..99 (100)" 200 -d '{"jsonrpc":"2.0","id":8,"method":"getBlockRange","params":[0,99]}'
 t "getBlockRange 0..100 (101)" 400 -d '{"jsonrpc":"2.0","id":9,"method":"getBlockRange","params":[0,100]}'
 t "WebSocket upgrade" 400 -H 'Upgrade: websocket' -d '{}'

@@ -28,7 +28,8 @@ class FakeSequencer(BaseHTTPRequestHandler):
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         FakeSequencer.seen.append(body)
-        out = json.dumps({"jsonrpc": "2.0", "id": body.get("id"), "result": body.get("method")}).encode()
+        answer = lambda b: {"jsonrpc": "2.0", "id": b.get("id"), "result": b.get("method")}  # noqa: E731
+        out = json.dumps([answer(b) for b in body] if isinstance(body, list) else answer(body)).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(out)))
@@ -93,9 +94,49 @@ class ProxyTest(unittest.TestCase):
             self.assertEqual(self.call(m)[0], 403, m)
         self.assertEqual(FakeSequencer.seen, [])
 
-    def test_batch_refused(self):
-        status, _ = self.post([{"jsonrpc": "2.0", "id": 1, "method": "getLastBlockId", "params": []}])
-        self.assertEqual(status, 400)
+    @staticmethod
+    def calls(n, method="getAccount"):
+        return [{"jsonrpc": "2.0", "id": i, "method": method, "params": ["A"]} for i in range(n)]
+
+    def test_batch_forwarded(self):
+        status, out = self.post(self.calls(2) + [{"jsonrpc": "2.0", "id": "x", "method": "getLastBlockId", "params": [], "extra": 1}])
+        self.assertEqual(status, 200)
+        self.assertEqual([r["result"] for r in json.loads(out)], ["getAccount", "getAccount", "getLastBlockId"])
+        self.assertEqual(FakeSequencer.seen[-1][2], {"jsonrpc": "2.0", "id": "x", "method": "getLastBlockId", "params": []})
+
+    def test_batch_refusals(self):
+        self.assertEqual(self.post([])[0], 400)                                    # empty
+        self.assertEqual(self.post(self.calls(proxy.DEFAULTS["MAX_BATCH"]))[0], 200)
+        self.assertEqual(self.post(self.calls(proxy.DEFAULTS["MAX_BATCH"] + 1))[0], 400)  # too many
+        self.assertEqual(self.post([self.calls(1)])[0], 400)                       # nested array
+        self.assertEqual(self.post(self.calls(2) + [7])[0], 400)                   # not an object
+        bad = self.calls(2) + [{"jsonrpc": "2.0", "id": 9, "method": "requeueCrossZoneDeadLetter", "params": []}]
+        self.assertEqual(self.post(bad)[0], 403)                                   # one bad call refuses all
+        wide = self.calls(1) + [{"jsonrpc": "2.0", "id": 9, "method": "getBlockRange", "params": [0, 100]}]
+        self.assertEqual(self.post(wide)[0], 400)
+        n = len(FakeSequencer.seen)
+        self.assertEqual(self.post([{"jsonrpc": "2.0", "id": 1, "method": "getAccount", "params": ["A" * 9000]}] * 2)[0], 413)  # whole body over the read cap
+        self.assertEqual(len(FakeSequencer.seen), n)                               # nothing refused went upstream
+
+    def test_batch_counts_as_n_requests(self):
+        ip = {"CF-Connecting-IP": "198.51.100.20"}
+        statuses = [self.post(self.calls(20), headers=ip)[0] for _ in range(4)]
+        self.assertEqual(statuses[:3], [200, 200, 200])   # 3 x 20 = the burst of 60
+        self.assertEqual(statuses[3], 429)
+
+
+class NoBatchTest(ProxyTest):
+    def setUp(self):
+        super().setUp(MAX_BATCH=0)
+
+    def test_batch_forwarded(self):
+        self.assertEqual(self.post(self.calls(2))[0], 400)
+
+    def test_batch_refusals(self):
+        self.assertEqual(self.post(self.calls(1))[0], 400)
+
+    def test_batch_counts_as_n_requests(self):
+        pass
 
     def test_block_range_span(self):
         self.assertEqual(self.call("getBlockRange", [0, 99])[0], 200)
@@ -143,6 +184,12 @@ class AllowMethodTest(ProxyTest):
     def test_operator_and_unknown_methods_refused(self):
         self.assertEqual(self.call("getCrossZoneDeadLetters")[0], 200)
         self.assertEqual(self.call("requeueCrossZoneDeadLetter")[0], 403)
+
+
+class MainArgsTest(unittest.TestCase):
+    def test_max_batch_flag(self):
+        with self.assertRaises(SystemExit):
+            proxy.main(["--max-batch", "-1"])
 
 
 class ListenTest(unittest.TestCase):

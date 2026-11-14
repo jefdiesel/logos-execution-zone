@@ -47,7 +47,13 @@ What it lets through:
 
 - only `POST /` with `Content-Type: application/json` and a `Content-Length`; no chunked bodies,
   no `Upgrade`, no GET (except `GET /healthz` from loopback without the client header);
-- one JSON-RPC object per request: batches get 400;
+- one JSON-RPC object per request, or a batch of at most 20 (`--max-batch N`; `--max-batch 0`
+  refuses every batch with 400). Each call in a batch is checked exactly as a single request
+  would be, and one refused call refuses the whole batch (nothing is forwarded); an empty batch,
+  a nested array or more than N calls gets 400. The whole batch is one body and must fit the body
+  cap below (16 KiB unless it carries a `sendTransaction`). A batch of N counts as N requests in
+  the per-client bucket, so batching never multiplies a client's rate. Tools that list or search
+  (for example `lezreg list`) use batches;
 - methods on the allowlist only (403 otherwise). The default list is every method of the
   sequencer's RPC except the two operator calls: `sendTransaction`, `getFeeState`,
   `checkHealth`, `getBlock`, `getBlockRange`, `getLastBlockId`, `getAccountBalance`,
@@ -102,7 +108,8 @@ Pick one:
   `--client-ip-header X-Real-IP`, and rate-limit there too.
 
 Check from another machine: `POST /` with `getLastBlockId` gives a height; `GET /` is refused; a
-batch gives 400; `getCrossZoneDeadLetters` gives 403.
+batch of two allowed calls gives two results and a batch of 21 gives 400; `getCrossZoneDeadLetters`
+gives 403.
 
 ## 3. What not to expose
 
