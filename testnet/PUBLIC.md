@@ -170,3 +170,14 @@ listens on loopback only.
 | Reset | every balance and program gone | announce it; keep the old home (`reset.sh --keep-old`) |
 | Default genesis key | anyone can spend those funds | never expose a `--genesis-key default` chain |
 | Faucet drained | users can't pay fees | per-account, per-address and daily caps; its own wallet |
+
+## A live network running this kit (bridge test network)
+
+Names Wallet runs a public LEZ v0.4.0-rc3 network from this kit: upstream `bafd07be` plus patch 1 (the RocksDB WAL cap, tag `bridge-testnet-rc3` = `314eaaa4`, offered upstream as logos-blockchain/logos-execution-zone#1127).
+
+- Explorer, with a free test-LEZ faucet: https://nameswallet.app/explorer/
+- RPC: `https://lez.nameswallet.app/` (JSON-RPC over HTTPS POST)
+- For builders and AI agents: https://nameswallet.app/explorer/agents.md
+- LNS names on it, from the browser: https://nameswallet.app/lns/
+
+Testnet only: the coins have no value, and the network is reset now and then.
